@@ -1,0 +1,634 @@
+{
+	"info": {
+		"_postman_id": "ragflow-assessment-api",
+		"name": "RAGFlow Assessment API",
+		"description": "Postman collection for the RAGFlow Assessment API.\n\nThis API wraps RAGFlow's HTTP APIs to verify assessment questions (from an Excel file) against evidence documents. It supports three workflows:\n\n1. **Single-call** – Upload everything at once\n2. **From existing dataset(s)** – Use already-parsed RAGFlow datasets\n3. **Two-phase** – Create session → upload docs incrementally → start\n\n## Setup\n\n1. Set the `base_url` variable to your Assessment API address (e.g. `http://localhost:8000`)\n2. If using a subpath, set `base_path` (e.g. `/assessment`)\n3. If JWT auth is enabled, set `jwt_token` to a valid token\n4. Update `task_id`, `dataset_id`, etc. as you use the API",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "base_url",
+			"value": "http://localhost:8000",
+			"description": "Assessment API base URL (host + port)"
+		},
+		{
+			"key": "base_path",
+			"value": "",
+			"description": "Optional subpath prefix (e.g. /assessment). Leave empty if not configured."
+		},
+		{
+			"key": "jwt_token",
+			"value": "",
+			"description": "JWT bearer token for authentication. Leave empty if auth is disabled."
+		},
+		{
+			"key": "task_id",
+			"value": "",
+			"description": "Assessment task ID (populated after creating an assessment)"
+		},
+		{
+			"key": "dataset_id",
+			"value": "",
+			"description": "RAGFlow dataset ID (populated after creating a session or for from-dataset workflow)"
+		},
+		{
+			"key": "dataset_ids",
+			"value": "",
+			"description": "Comma-separated RAGFlow dataset IDs for multi-dataset assessments"
+		},
+		{
+			"key": "image_id",
+			"value": "",
+			"description": "RAGFlow chunk image ID (from reference results)"
+		},
+		{
+			"key": "document_id",
+			"value": "",
+			"description": "RAGFlow document ID (from reference results)"
+		}
+	],
+	"auth": {
+		"type": "bearer",
+		"bearer": [
+			{
+				"key": "token",
+				"value": "{{jwt_token}}",
+				"type": "string"
+			}
+		]
+	},
+	"item": [
+		{
+			"name": "Health",
+			"item": [
+				{
+					"name": "Health Check",
+					"request": {
+						"auth": {
+							"type": "noauth"
+						},
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{base_path}}/health",
+							"host": ["{{base_url}}{{base_path}}"],
+							"path": ["health"]
+						},
+						"description": "Health check endpoint. Not behind authentication.\n\nReturns server status, RAGFlow URL, base path, and whether auth is enabled."
+					},
+					"response": [
+						{
+							"name": "Healthy",
+							"originalRequest": {
+								"method": "GET",
+								"url": {
+									"raw": "{{base_url}}{{base_path}}/health",
+									"host": ["{{base_url}}{{base_path}}"],
+									"path": ["health"]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"status\": \"ok\",\n  \"ragflow_url\": \"http://localhost:9380\",\n  \"base_path\": \"/\",\n  \"auth_enabled\": false\n}"
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "Option A: Single-call Workflow",
+			"description": "Upload questions Excel and all evidence documents in one request. Best for small assessments where all docs are ready.",
+			"item": [
+				{
+					"name": "Start Assessment (all docs at once)",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"if (pm.response.code === 202) {",
+									"    var jsonData = pm.response.json();",
+									"    pm.collectionVariables.set('task_id', jsonData.task_id);",
+									"    console.log('task_id saved:', jsonData.task_id);",
+									"}"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "formdata",
+							"formdata": [
+								{
+									"key": "questions_file",
+									"description": "Excel file with columns A = Question_Serial_No, B = Question",
+									"type": "file",
+									"src": ""
+								},
+								{
+									"key": "evidence_files",
+									"description": "Evidence documents (PDF, PPTX, XLSX, DOCX, etc.). Add multiple entries for multiple files.",
+									"type": "file",
+									"src": ""
+								},
+								{
+									"key": "dataset_name",
+									"value": "",
+									"description": "(Optional) Custom RAGFlow dataset name",
+									"type": "text",
+									"disabled": true
+								},
+								{
+									"key": "chat_name",
+									"value": "",
+									"description": "(Optional) Custom chat assistant name",
+									"type": "text",
+									"disabled": true
+								}
+							]
+						},
+						"url": {
+							"raw": "{{base_url}}{{base_path}}/api/v1/assessments",
+							"host": ["{{base_url}}{{base_path}}"],
+							"path": ["api", "v1", "assessments"]
+						},
+						"description": "Upload a questions Excel file and all evidence documents in one request.\n\nReturns immediately with a `task_id` (202 Accepted). Poll `GET /assessments/{task_id}` for progress.\n\nThe `task_id` is automatically saved to collection variables."
+					},
+					"response": [
+						{
+							"name": "Assessment Started",
+							"originalRequest": {
+								"method": "POST",
+								"url": {
+									"raw": "{{base_url}}{{base_path}}/api/v1/assessments",
+									"host": ["{{base_url}}{{base_path}}"],
+									"path": ["api", "v1", "assessments"]
+								}
+							},
+							"status": "Accepted",
+							"code": 202,
+							"body": "{\n  \"task_id\": \"abc123def456\",\n  \"state\": \"pending\",\n  \"pipeline_stage\": \"idle\",\n  \"total_questions\": 25,\n  \"questions_processed\": 0\n}"
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "Option B: From Existing Dataset(s)",
+			"description": "Run assessment against dataset(s) already uploaded and parsed in RAGFlow. Skips dataset creation, document upload, and parsing entirely — significantly faster.",
+			"item": [
+				{
+					"name": "Start Assessment from Dataset(s)",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"if (pm.response.code === 202) {",
+									"    var jsonData = pm.response.json();",
+									"    pm.collectionVariables.set('task_id', jsonData.task_id);",
+									"    console.log('task_id saved:', jsonData.task_id);",
+									"}"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "formdata",
+							"formdata": [
+								{
+									"key": "questions_file",
+									"description": "Excel file with columns A = Question_Serial_No, B = Question",
+									"type": "file",
+									"src": ""
+								},
+								{
+									"key": "dataset_ids",
+									"value": "{{dataset_ids}}",
+									"description": "One or more existing RAGFlow dataset IDs (comma-separated, e.g. id1,id2,id3). Documents must already be uploaded & parsed.",
+									"type": "text"
+								},
+								{
+									"key": "chat_name",
+									"value": "",
+									"description": "(Optional) Custom chat assistant name",
+									"type": "text",
+									"disabled": true
+								}
+							]
+						},
+						"url": {
+							"raw": "{{base_url}}{{base_path}}/api/v1/assessments/from-dataset",
+							"host": ["{{base_url}}{{base_path}}"],
+							"path": ["api", "v1", "assessments", "from-dataset"]
+						},
+						"description": "Run an assessment against one or more existing RAGFlow datasets.\n\nSkips dataset creation, document upload, and parsing entirely. The datasets must already contain uploaded and parsed evidence documents.\n\nPass multiple dataset IDs as a comma-separated string (e.g. `id1,id2,id3`).\n\nThe `task_id` is automatically saved to collection variables."
+					},
+					"response": [
+						{
+							"name": "Assessment Started",
+							"originalRequest": {
+								"method": "POST",
+								"url": {
+									"raw": "{{base_url}}{{base_path}}/api/v1/assessments/from-dataset",
+									"host": ["{{base_url}}{{base_path}}"],
+									"path": ["api", "v1", "assessments", "from-dataset"]
+								}
+							},
+							"status": "Accepted",
+							"code": 202,
+							"body": "{\n  \"task_id\": \"abc123def456\",\n  \"state\": \"pending\",\n  \"pipeline_stage\": \"idle\",\n  \"total_questions\": 25,\n  \"questions_processed\": 0\n}"
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "Option C: Two-phase Workflow",
+			"description": "Create a session, upload evidence documents incrementally (repeat as needed), then start the assessment. Best for large/incremental uploads or unreliable networks.",
+			"item": [
+				{
+					"name": "Phase 1: Create Session",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"if (pm.response.code === 201) {",
+									"    var jsonData = pm.response.json();",
+									"    pm.collectionVariables.set('task_id', jsonData.task_id);",
+									"    pm.collectionVariables.set('dataset_id', jsonData.dataset_id);",
+									"    console.log('task_id saved:', jsonData.task_id);",
+									"    console.log('dataset_id saved:', jsonData.dataset_id);",
+									"}"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "formdata",
+							"formdata": [
+								{
+									"key": "questions_file",
+									"description": "Excel file with columns A = Question_Serial_No, B = Question",
+									"type": "file",
+									"src": ""
+								},
+								{
+									"key": "dataset_name",
+									"value": "",
+									"description": "(Optional) Custom RAGFlow dataset name",
+									"type": "text",
+									"disabled": true
+								}
+							]
+						},
+						"url": {
+							"raw": "{{base_url}}{{base_path}}/api/v1/assessments/sessions",
+							"host": ["{{base_url}}{{base_path}}"],
+							"path": ["api", "v1", "assessments", "sessions"]
+						},
+						"description": "Phase 1 – Create an assessment session.\n\nUploads the questions Excel and creates a RAGFlow dataset. Returns a `task_id` and `dataset_id`.\n\nEvidence documents can then be uploaded incrementally via Phase 2.\n\nBoth `task_id` and `dataset_id` are automatically saved to collection variables."
+					},
+					"response": [
+						{
+							"name": "Session Created",
+							"originalRequest": {
+								"method": "POST",
+								"url": {
+									"raw": "{{base_url}}{{base_path}}/api/v1/assessments/sessions",
+									"host": ["{{base_url}}{{base_path}}"],
+									"path": ["api", "v1", "assessments", "sessions"]
+								}
+							},
+							"status": "Created",
+							"code": 201,
+							"body": "{\n  \"task_id\": \"abc123def456\",\n  \"dataset_id\": \"ds_789\",\n  \"state\": \"awaiting_documents\",\n  \"message\": \"Session created. Upload evidence documents then start the assessment.\"\n}"
+						}
+					]
+				},
+				{
+					"name": "Phase 2: Upload Documents (repeatable)",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "formdata",
+							"formdata": [
+								{
+									"key": "files",
+									"description": "Evidence documents to add (PDF, PPTX, XLSX, DOCX, etc.). Add multiple entries for multiple files.",
+									"type": "file",
+									"src": ""
+								}
+							]
+						},
+						"url": {
+							"raw": "{{base_url}}{{base_path}}/api/v1/assessments/sessions/{{task_id}}/documents",
+							"host": ["{{base_url}}{{base_path}}"],
+							"path": ["api", "v1", "assessments", "sessions", "{{task_id}}", "documents"]
+						},
+						"description": "Phase 2 (repeatable) – Upload one or more evidence documents to the session's dataset.\n\nCan be called **multiple times** before starting the assessment. Each call adds documents to the same dataset."
+					},
+					"response": [
+						{
+							"name": "Documents Uploaded",
+							"originalRequest": {
+								"method": "POST",
+								"url": {
+									"raw": "{{base_url}}{{base_path}}/api/v1/assessments/sessions/{{task_id}}/documents",
+									"host": ["{{base_url}}{{base_path}}"],
+									"path": ["api", "v1", "assessments", "sessions", "{{task_id}}", "documents"]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"task_id\": \"abc123def456\",\n  \"dataset_id\": \"ds_789\",\n  \"uploaded_document_ids\": [\"doc_1\", \"doc_2\"],\n  \"total_documents\": 5,\n  \"message\": \"Uploaded 2 document(s). Total: 5.\"\n}"
+						}
+					]
+				},
+				{
+					"name": "Phase 3: Start Assessment",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "formdata",
+							"formdata": [
+								{
+									"key": "chat_name",
+									"value": "",
+									"description": "(Optional) Custom chat assistant name",
+									"type": "text",
+									"disabled": true
+								}
+							]
+						},
+						"url": {
+							"raw": "{{base_url}}{{base_path}}/api/v1/assessments/sessions/{{task_id}}/start",
+							"host": ["{{base_url}}{{base_path}}"],
+							"path": ["api", "v1", "assessments", "sessions", "{{task_id}}", "start"]
+						},
+						"description": "Phase 3 – Trigger the assessment pipeline.\n\nAll evidence documents must already be uploaded. The pipeline will parse documents, create a chat assistant, and process every question.\n\nReturns immediately (202 Accepted). Poll `GET /assessments/{task_id}` for progress."
+					},
+					"response": [
+						{
+							"name": "Assessment Started",
+							"originalRequest": {
+								"method": "POST",
+								"url": {
+									"raw": "{{base_url}}{{base_path}}/api/v1/assessments/sessions/{{task_id}}/start",
+									"host": ["{{base_url}}{{base_path}}"],
+									"path": ["api", "v1", "assessments", "sessions", "{{task_id}}", "start"]
+								}
+							},
+							"status": "Accepted",
+							"code": 202,
+							"body": "{\n  \"task_id\": \"abc123def456\",\n  \"state\": \"awaiting_documents\",\n  \"pipeline_stage\": \"idle\",\n  \"total_questions\": 25,\n  \"questions_processed\": 0\n}"
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "Task Status & Results",
+			"description": "Monitor task progress and retrieve results (JSON or Excel).",
+			"item": [
+				{
+					"name": "List All Tasks",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{base_path}}/api/v1/assessments",
+							"host": ["{{base_url}}{{base_path}}"],
+							"path": ["api", "v1", "assessments"]
+						},
+						"description": "Return status of all assessment tasks."
+					},
+					"response": [
+						{
+							"name": "Task List",
+							"originalRequest": {
+								"method": "GET",
+								"url": {
+									"raw": "{{base_url}}{{base_path}}/api/v1/assessments",
+									"host": ["{{base_url}}{{base_path}}"],
+									"path": ["api", "v1", "assessments"]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"body": "[\n  {\n    \"task_id\": \"abc123def456\",\n    \"state\": \"completed\",\n    \"pipeline_stage\": \"finalizing\",\n    \"progress_message\": \"Assessment completed\",\n    \"total_questions\": 25,\n    \"questions_processed\": 25\n  }\n]"
+						}
+					]
+				},
+				{
+					"name": "Get Task Status",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}",
+							"host": ["{{base_url}}{{base_path}}"],
+							"path": ["api", "v1", "assessments", "{{task_id}}"]
+						},
+						"description": "Return current status and progress of a specific assessment task.\n\n**Pipeline stages:** idle → document_upload → document_parsing → chat_processing → finalizing\n\n**Task states:** pending → uploading → parsing → processing → completed (or failed)"
+					},
+					"response": [
+						{
+							"name": "Task In Progress",
+							"originalRequest": {
+								"method": "GET",
+								"url": {
+									"raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}",
+									"host": ["{{base_url}}{{base_path}}"],
+									"path": ["api", "v1", "assessments", "{{task_id}}"]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"task_id\": \"abc123def456\",\n  \"state\": \"processing\",\n  \"pipeline_stage\": \"chat_processing\",\n  \"progress_message\": \"Processed 10/25 questions\",\n  \"total_questions\": 25,\n  \"questions_processed\": 10,\n  \"created_at\": \"2026-02-13T11:00:00.000000\",\n  \"updated_at\": \"2026-02-13T11:05:00.000000\",\n  \"error\": null\n}"
+						},
+						{
+							"name": "Task Completed",
+							"originalRequest": {
+								"method": "GET",
+								"url": {
+									"raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}",
+									"host": ["{{base_url}}{{base_path}}"],
+									"path": ["api", "v1", "assessments", "{{task_id}}"]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"task_id\": \"abc123def456\",\n  \"state\": \"completed\",\n  \"pipeline_stage\": \"finalizing\",\n  \"progress_message\": \"Assessment completed\",\n  \"total_questions\": 25,\n  \"questions_processed\": 25,\n  \"created_at\": \"2026-02-13T11:00:00.000000\",\n  \"updated_at\": \"2026-02-13T11:10:00.000000\",\n  \"error\": null\n}"
+						}
+					]
+				},
+				{
+					"name": "Get Results (JSON, Paginated)",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}/results?page=1&page_size=50",
+							"host": ["{{base_url}}{{base_path}}"],
+							"path": ["api", "v1", "assessments", "{{task_id}}", "results"],
+							"query": [
+								{
+									"key": "page",
+									"value": "1",
+									"description": "Page number (default: 1)"
+								},
+								{
+									"key": "page_size",
+									"value": "50",
+									"description": "Results per page (default: 50, max: 500)"
+								}
+							]
+						},
+						"description": "Retrieve assessment results in JSON with pagination.\n\nAvailable even while the task is still processing (returns partial results)."
+					},
+					"response": [
+						{
+							"name": "Results Page",
+							"originalRequest": {
+								"method": "GET",
+								"url": {
+									"raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}/results?page=1&page_size=50",
+									"host": ["{{base_url}}{{base_path}}"],
+									"path": ["api", "v1", "assessments", "{{task_id}}", "results"],
+									"query": [
+										{ "key": "page", "value": "1" },
+										{ "key": "page_size", "value": "50" }
+									]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+       "body": "{\n  \"task_id\": \"abc123def456\",\n  \"state\": \"completed\",\n  \"total_questions\": 25,\n  \"questions_processed\": 25,\n  \"results\": [\n    {\n      \"question_serial_no\": 1,\n      \"question\": \"Does the organization have a data privacy policy?\",\n      \"ai_response\": \"Yes\",\n      \"details\": \"The evidence document contains a comprehensive data privacy policy covering data collection, storage, and processing practices.\",\n      \"references\": [\n        {\n          \"document_name\": \"privacy_policy.pdf\",\n          \"document_type\": \"pdf\",\n          \"page_number\": 3,\n          \"chunk_index\": null,\n          \"coordinates\": [120.5, 450.2, 80.0, 620.8],\n          \"snippet\": \"Section 2.1 defines the organization's approach to data privacy...\",\n          \"document_url\": \"/api/v1/proxy/document/doc123#page=3\",\n          \"image_url\": \"/api/v1/proxy/image/img456\"\n        },\n        {\n          \"document_name\": \"Evidence_List.xlsx\",\n          \"document_type\": \"excel\",\n          \"page_number\": null,\n          \"chunk_index\": 36,\n          \"coordinates\": null,\n          \"snippet\": \"P07: Physical \\u2013 Access Controls ...\",\n          \"document_url\": \"/api/v1/proxy/document/doc789\",\n          \"image_url\": null\n        }\n      ]\n    }\n  ],\n  \"page\": 1,\n  \"page_size\": 50,\n  \"total_pages\": 1\n}"
+						}
+					]
+				},
+				{
+					"name": "Download Results as Excel",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}/results/excel",
+							"host": ["{{base_url}}{{base_path}}"],
+							"path": ["api", "v1", "assessments", "{{task_id}}", "results", "excel"]
+						},
+						"description": "Download the assessment results as an Excel (.xlsx) file.\n\nColumns: Question_Serial_No, Question, AI_Response, Details, References.\n\nOnly available when the task state is `completed` or `processing`."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Proxy (RAGFlow Resources)",
+			"description": "Proxy endpoints that forward requests to RAGFlow so clients never see raw RAGFlow URLs. Reference results include these proxy URLs automatically.",
+			"item": [
+				{
+					"name": "Proxy: Get Image",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{base_path}}/api/v1/proxy/image/{{image_id}}",
+							"host": ["{{base_url}}{{base_path}}"],
+							"path": ["api", "v1", "proxy", "image", "{{image_id}}"]
+						},
+						"description": "Proxy a RAGFlow chunk image.\n\nThe `image_id` comes from the `image_url` field in reference results. Streams the response directly from RAGFlow with caching headers."
+					},
+					"response": []
+				},
+				{
+					"name": "Proxy: Get Document",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}{{base_path}}/api/v1/proxy/document/{{document_id}}",
+							"host": ["{{base_url}}{{base_path}}"],
+							"path": ["api", "v1", "proxy", "document", "{{document_id}}"]
+						},
+						"description": "Proxy a RAGFlow document download.\n\nThe `document_id` comes from the `document_url` field in reference results. Forwards content-type and content-disposition headers from RAGFlow."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Documents (Standalone)",
+			"description": "Upload documents to an existing RAGFlow dataset outside of an assessment session.",
+			"item": [
+				{
+					"name": "Upload Documents to Dataset",
+					"request": {
+						"method": "POST",
+						"header": [],
+						"body": {
+							"mode": "formdata",
+							"formdata": [
+								{
+									"key": "dataset_id",
+									"value": "{{dataset_id}}",
+									"description": "Existing RAGFlow dataset ID",
+									"type": "text"
+								},
+								{
+									"key": "files",
+									"description": "Documents to upload (PDF, PPTX, XLSX, DOCX, etc.)",
+									"type": "file",
+									"src": ""
+								},
+								{
+									"key": "parse",
+									"value": "true",
+									"description": "Trigger parsing after upload (default: true)",
+									"type": "text"
+								}
+							]
+						},
+						"url": {
+							"raw": "{{base_url}}{{base_path}}/api/v1/documents/upload",
+							"host": ["{{base_url}}{{base_path}}"],
+							"path": ["api", "v1", "documents", "upload"]
+						},
+						"description": "Upload one or more documents to an existing RAGFlow dataset (not tied to an assessment session).\n\nOptionally triggers parsing immediately."
+					},
+					"response": [
+						{
+							"name": "Documents Uploaded",
+							"originalRequest": {
+								"method": "POST",
+								"url": {
+									"raw": "{{base_url}}{{base_path}}/api/v1/documents/upload",
+									"host": ["{{base_url}}{{base_path}}"],
+									"path": ["api", "v1", "documents", "upload"]
+								}
+							},
+							"status": "OK",
+							"code": 200,
+							"body": "{\n  \"dataset_id\": \"ds_789\",\n  \"document_ids\": [\"doc_1\", \"doc_2\"],\n  \"parsing_triggered\": true\n}"
+						}
+					]
+				}
+			]
+		}
+	]
+}
