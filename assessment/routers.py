@@ -15,6 +15,7 @@ Two-phase workflow:
   POST   /api/v1/assessments/sessions/{task_id}/start     - Trigger assessment
 
 Proxy (RAGFlow resource passthrough):
+  *      /api/v1/ragflow/{path}                          - Direct official RAGFlow API passthrough
   GET    /api/v1/proxy/image/{image_id}                   - Proxy RAGFlow chunk image
   GET    /api/v1/proxy/document/{document_id}             - Proxy RAGFlow document
 
@@ -29,11 +30,11 @@ Common:
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from .auth import verify_jwt
@@ -69,6 +70,152 @@ router = APIRouter(
     tags=["assessment"],
     dependencies=[Depends(verify_jwt)],
 )
+
+_RAGFLOW_BASE_API = "/api/v1"
+_PASSTHROUGH_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
+_HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+    "content-length",
+}
+
+
+def _extract_error_detail(resp: httpx.Response) -> str:
+    """Best-effort extraction of an error message from a RAGFlow response."""
+    try:
+        body = resp.json()
+    except Exception:
+        text = resp.text.strip()
+        return text[:500] if text else "RAGFlow request failed"
+
+    if isinstance(body, dict):
+        msg = body.get("message") or body.get("detail")
+        if isinstance(msg, str) and msg.strip():
+            return msg.strip()
+    return str(body)[:500]
+
+
+def _parse_ragflow_json_or_raise(resp: httpx.Response) -> dict[str, Any]:
+    """Parse JSON body and enforce official RAGFlow success semantics."""
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=_extract_error_detail(resp))
+
+    try:
+        payload = resp.json()
+    except Exception:
+        raise HTTPException(
+            status_code=502,
+            detail="RAGFlow returned a non-JSON response.",
+        )
+
+    if isinstance(payload, dict):
+        code = payload.get("code")
+        if code not in (None, 0):
+            raise HTTPException(status_code=502, detail=str(payload.get("message") or payload))
+        return payload
+
+    raise HTTPException(status_code=502, detail="RAGFlow returned an unexpected JSON payload.")
+
+
+def _copy_passthrough_headers(headers: httpx.Headers) -> dict[str, str]:
+    """Return downstream headers safe to relay to client."""
+    forwarded: dict[str, str] = {}
+    for key, value in headers.items():
+        lowered = key.lower()
+        if lowered in _HOP_BY_HOP_HEADERS or lowered == "content-type":
+            continue
+        forwarded[key] = value
+    return forwarded
+
+
+async def _request_ragflow_official(
+    method: str,
+    official_subpath: str,
+    *,
+    params: Any = None,
+    content: bytes | None = None,
+    json_body: Any = None,
+    files: Any = None,
+    extra_headers: dict[str, str] | None = None,
+    timeout: float = 120.0,
+) -> httpx.Response:
+    """Send an authenticated request to RAGFlow official `/api/v1/*` APIs."""
+    method = method.upper()
+    clean_path = official_subpath.strip("/")
+    url = f"{settings.ragflow_base_url.rstrip('/')}{_RAGFLOW_BASE_API}/{clean_path}"
+
+    headers = {"Authorization": f"Bearer {settings.ragflow_api_key}"}
+    if extra_headers:
+        headers.update(extra_headers)
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            verify=RagflowClient._ssl_verify(),
+        ) as client:
+            return await client.request(
+                method,
+                url,
+                headers=headers,
+                params=params,
+                content=content,
+                json=json_body,
+                files=files,
+            )
+    except httpx.ConnectError:
+        raise HTTPException(status_code=502, detail="Cannot connect to RAGFlow server")
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="RAGFlow server timed out")
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Error communicating with RAGFlow: {exc}")
+
+
+@router.api_route(
+    "/ragflow/{ragflow_path:path}",
+    methods=_PASSTHROUGH_METHODS,
+)
+async def ragflow_official_passthrough(ragflow_path: str, request: Request):
+    """
+    Direct passthrough to official RAGFlow `/api/v1/*` endpoints.
+
+    Example:
+      GET /api/v1/ragflow/datasets?page=1&page_size=20
+      -> GET {ragflow_base_url}/api/v1/datasets?page=1&page_size=20
+    """
+    method = request.method.upper()
+    body = await request.body()
+
+    # Keep caller content negotiation headers, but always use configured
+    # RAGFlow API key for upstream authentication.
+    extra_headers: dict[str, str] = {}
+    for header_name in ("content-type", "accept"):
+        if header_name in request.headers:
+            extra_headers[header_name] = request.headers[header_name]
+
+    resp = await _request_ragflow_official(
+        method,
+        ragflow_path,
+        params=list(request.query_params.multi_items()),
+        content=body,
+        extra_headers=extra_headers,
+        timeout=300.0,
+    )
+
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        headers={
+            **_copy_passthrough_headers(resp.headers),
+            "Content-Type": resp.headers.get("content-type", "application/octet-stream"),
+        },
+    )
 
 
 # ===========================================================================
@@ -612,30 +759,45 @@ async def upload_documents(
     Optionally triggers parsing immediately.
     """
     import asyncio
-    from .ragflow_client import RagflowClient
     from .config import settings as _settings
 
-    client = RagflowClient()
     try:
         upload_sem = asyncio.Semaphore(_settings.max_concurrent_questions)
 
         async def _upload_one(f: UploadFile) -> str:
             fbytes = await f.read()
             async with upload_sem:
-                return await client.upload_document(dataset_id, f.filename or "file", fbytes)
+                resp = await _request_ragflow_official(
+                    "POST",
+                    f"datasets/{dataset_id}/documents",
+                    files={"file": (f.filename or "file", fbytes)},
+                )
+                payload = _parse_ragflow_json_or_raise(resp)
+                docs = payload.get("data") or []
+                if not docs:
+                    raise HTTPException(status_code=502, detail="RAGFlow upload succeeded but no document returned")
+                doc_id = str(docs[0].get("id", "")).strip()
+                if not doc_id:
+                    raise HTTPException(status_code=502, detail="RAGFlow upload returned an empty document id")
+                return doc_id
 
         doc_ids = list(await asyncio.gather(*(_upload_one(f) for f in files)))
         if parse and doc_ids:
-            await client.start_parsing(dataset_id, doc_ids)
+            parse_resp = await _request_ragflow_official(
+                "POST",
+                f"datasets/{dataset_id}/chunks",
+                json_body={"document_ids": doc_ids},
+            )
+            _parse_ragflow_json_or_raise(parse_resp)
         return {
             "dataset_id": dataset_id,
             "document_ids": doc_ids,
             "parsing_triggered": parse,
         }
-    except RuntimeError as exc:
+    except HTTPException:
+        raise
+    except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
-    finally:
-        await client.close()
 
 
 # ===========================================================================
@@ -656,20 +818,50 @@ async def list_datasets(
     page_size: int = Query(100, ge=1),
     name: Optional[str] = Query(None),
 ):
-    async with RagflowClient() as client:
-        res = await client.list_datasets_page(name=name, page=page, page_size=page_size)
-        return {
-            "items": res["items"],
-            "total": res.get("total"),
-            "page": page,
-            "page_size": page_size,
-        }
+    params: dict[str, Any] = {"page": page, "page_size": page_size}
+    if name:
+        params["name"] = name
+
+    resp = await _request_ragflow_official("GET", "datasets", params=params)
+
+    # Preserve existing behavior from RagflowClient: when searching by name,
+    # some RAGFlow versions return a permission error for a non-existing name.
+    if name and resp.status_code >= 400:
+        detail = _extract_error_detail(resp).lower()
+        if "lacks permission" in detail:
+            return {
+                "items": [],
+                "total": 0,
+                "page": page,
+                "page_size": page_size,
+            }
+
+    payload = _parse_ragflow_json_or_raise(resp)
+
+    data = payload.get("data", [])
+    if isinstance(data, list):
+        items = data
+        total = None
+    elif isinstance(data, dict):
+        inner = data.get("data")
+        items = inner if isinstance(inner, list) else []
+        total = data.get("total")
+    else:
+        items = []
+        total = 0
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 
 @router.delete("/datasets")
 async def delete_datasets(req: DeleteDatasetsRequest):
-    async with RagflowClient() as client:
-        await client.delete_datasets(req.ids)
+    resp = await _request_ragflow_official("DELETE", "datasets", json_body={"ids": req.ids})
+    _parse_ragflow_json_or_raise(resp)
     return {"message": "Datasets deleted"}
 
 
@@ -679,18 +871,51 @@ async def list_documents(
     page: int = Query(1, ge=1),
     page_size: int = Query(100, ge=1),
 ):
-    async with RagflowClient() as client:
-        res = await client.list_documents_page(dataset_id, page=page, page_size=page_size)
-        return {
-            "items": res["items"],
-            "total": res.get("total"),
-            "page": page,
-            "page_size": page_size,
-        }
+    resp = await _request_ragflow_official(
+        "GET",
+        f"datasets/{dataset_id}/documents",
+        params={"page": page, "page_size": page_size},
+    )
+    payload = _parse_ragflow_json_or_raise(resp)
+
+    data = payload.get("data", {})
+    if isinstance(data, dict):
+        items = data.get("docs", [])
+        total = data.get("total")
+    elif isinstance(data, list):
+        items = data
+        total = None
+    else:
+        items = []
+        total = 0
+
+    for doc in items:
+        doc.pop("words", None)
+        run = str(doc.get("run", ""))
+        progress = float(doc.get("progress", 0))
+        status = "pending"
+        if run in ("FAIL", "2"):
+            status = "failed"
+        elif progress >= 0.999:
+            status = "success"
+        elif progress > 0:
+            status = "running"
+        doc["status"] = status
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 
 @router.delete("/datasets/{dataset_id}/documents")
 async def delete_documents(dataset_id: str, req: DeleteDocumentsRequest):
-    async with RagflowClient() as client:
-        await client.delete_documents(dataset_id, req.ids)
+    resp = await _request_ragflow_official(
+        "DELETE",
+        f"datasets/{dataset_id}/documents",
+        json_body={"ids": req.ids},
+    )
+    _parse_ragflow_json_or_raise(resp)
     return {"message": "Documents deleted"}
