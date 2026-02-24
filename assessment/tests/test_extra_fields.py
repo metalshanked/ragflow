@@ -1,145 +1,125 @@
-"""Quick smoke test for extra-fields support and env-configurable defaults."""
-from unittest.mock import patch
+"""Tests for passthrough of user-supplied dataset/chat option fields."""
 
-from assessment.models import ChatLLMOptions, ChatOptions, ChatPromptOptions, DatasetOptions, ParserConfig
-from assessment.services import _apply_default_chat_options, _apply_default_dataset_options
+from __future__ import annotations
 
+import asyncio
+from unittest.mock import AsyncMock, patch
 
-# ---------------------------------------------------------------------------
-# Model extra-fields pass-through
-# ---------------------------------------------------------------------------
-
-def test_parser_config_extra_fields():
-    p = ParserConfig(enable_metadata=True, some_extra="val")
-    d = p.model_dump(exclude_none=True)
-    assert d == {"enable_metadata": True, "some_extra": "val"}
+from assessment.models import RagflowContext, TaskRecord, TaskState, TaskStatus
+from assessment.services import run_assessment, run_assessment_from_dataset
 
 
-def test_dataset_options_extra_fields():
-    o = DatasetOptions(parser_config=ParserConfig(enable_metadata=True), pagerank=5)
-    d = o.model_dump(exclude_none=True)
-    assert d["parser_config"]["enable_metadata"] is True
-    assert d["pagerank"] == 5
+def _run(coro):
+    return asyncio.run(coro)
 
 
-def test_chat_llm_options_extra_fields():
-    llm = ChatLLMOptions(temperature=0.7, custom_llm_field="abc")
-    d = llm.model_dump(exclude_none=True)
-    assert d["temperature"] == 0.7
-    assert d["custom_llm_field"] == "abc"
-
-
-def test_chat_prompt_options_extra_fields():
-    p = ChatPromptOptions(top_n=5, highlight=True)
-    d = p.model_dump(exclude_none=True)
-    assert d["top_n"] == 5
-    assert d["highlight"] is True
-
-
-def test_chat_options_extra_fields():
-    opts = ChatOptions(
-        llm=ChatLLMOptions(temperature=0.5),
-        prompt=ChatPromptOptions(top_n=10, custom_prompt_field="x"),
-        some_top_level_extra=42,
+def _make_record(task_id: str = "task-extra-001") -> TaskRecord:
+    return TaskRecord(
+        task_id=task_id,
+        status=TaskStatus(
+            task_id=task_id,
+            state=TaskState.PENDING,
+            total_questions=1,
+        ),
+        ragflow=RagflowContext(),
+        questions=[{"serial_no": 1, "question": "Is there evidence?"}],
     )
-    d = opts.model_dump(exclude_none=True)
-    assert d["llm"]["temperature"] == 0.5
-    assert d["prompt"]["top_n"] == 10
-    assert d["prompt"]["custom_prompt_field"] == "x"
-    assert d["some_top_level_extra"] == 42
 
 
-# ---------------------------------------------------------------------------
-# Env-configurable default parser config
-# ---------------------------------------------------------------------------
+@patch("assessment.services._process_questions", new_callable=AsyncMock)
+@patch("assessment.services._update_status", new_callable=AsyncMock)
+@patch("assessment.services.get_task", new_callable=AsyncMock)
+@patch("assessment.services.RagflowClient")
+def test_run_assessment_passes_dataset_and_chat_extra_options(
+    MockClient,
+    mock_get_task,
+    mock_update_status,
+    mock_process_questions,
+):
+    del mock_update_status  # status persistence not part of this assertion
+    mock_process_questions.return_value = 0
 
-def test_apply_default_dataset_options_uses_env():
-    """Default parser_config comes from the ASSESSMENT_DEFAULT_PARSER_CONFIG setting."""
-    with patch("assessment.services.settings") as mock_settings:
-        mock_settings.default_parser_config = '{"enable_metadata": true, "chunk_token_num": 256}'
-        result = _apply_default_dataset_options(None)
-        assert result["parser_config"]["enable_metadata"] is True
-        assert result["parser_config"]["chunk_token_num"] == 256
+    record = _make_record("task-extra-001")
+    mock_get_task.return_value = record
 
+    mock_client = AsyncMock()
+    mock_client.ensure_dataset = AsyncMock(return_value="ds-1")
+    mock_client.upload_document = AsyncMock(return_value="doc-1")
+    mock_client.start_parsing = AsyncMock()
+    mock_client.wait_for_parsing = AsyncMock(return_value=[
+        {
+            "document_id": "doc-1",
+            "document_name": "evidence.pdf",
+            "status": "success",
+            "progress": 1.0,
+            "message": "ok",
+        }
+    ])
+    mock_client.ensure_chat = AsyncMock(return_value="chat-1")
+    mock_client.create_session = AsyncMock(return_value="sess-1")
+    mock_client.close = AsyncMock()
+    MockClient.return_value = mock_client
 
-def test_apply_default_dataset_options_user_overrides():
-    """User-supplied values take precedence over env defaults."""
-    with patch("assessment.services.settings") as mock_settings:
-        mock_settings.default_parser_config = '{"enable_metadata": true, "chunk_token_num": 256}'
-        user_opts = {"parser_config": {"chunk_token_num": 1024, "delimiter": "\\n"}}
-        result = _apply_default_dataset_options(user_opts)
-        assert result["parser_config"]["enable_metadata"] is True  # from default
-        assert result["parser_config"]["chunk_token_num"] == 1024  # user override
-        assert result["parser_config"]["delimiter"] == "\\n"  # user-only
+    dataset_opts = {"permission": "team", "custom_dataset_flag": True}
+    chat_opts = {
+        "llm": {"temperature": 0.2},
+        "custom_chat_flag": "yes",
+    }
 
+    _run(
+        run_assessment(
+            task_id="task-extra-001",
+            questions=record.questions,
+            evidence_files=[("evidence.pdf", b"file-bytes")],
+            dataset_opts=dataset_opts,
+            chat_opts=chat_opts,
+        )
+    )
 
-def test_apply_default_dataset_options_empty_env():
-    """When env default is empty JSON, no parser_config key is injected."""
-    with patch("assessment.services.settings") as mock_settings:
-        mock_settings.default_parser_config = '{}'
-        result = _apply_default_dataset_options(None)
-        assert "parser_config" not in result or result.get("parser_config") == {}
+    _, dataset_kwargs = mock_client.ensure_dataset.await_args
+    assert dataset_kwargs["permission"] == "team"
+    assert dataset_kwargs["custom_dataset_flag"] is True
 
-
-def test_apply_default_dataset_options_invalid_json():
-    """Invalid JSON in env is gracefully ignored."""
-    with patch("assessment.services.settings") as mock_settings:
-        mock_settings.default_parser_config = 'NOT JSON'
-        result = _apply_default_dataset_options(None)
-        assert result.get("parser_config") is None or result.get("parser_config") == {}
-
-
-# ---------------------------------------------------------------------------
-# Env-configurable default chat config
-# ---------------------------------------------------------------------------
-
-def test_apply_default_chat_options_uses_env():
-    """Default chat config comes from the ASSESSMENT_DEFAULT_CHAT_CONFIG setting."""
-    with patch("assessment.services.settings") as mock_settings:
-        mock_settings.default_chat_config = '{"llm": {"temperature": 0.3}, "prompt": {"top_n": 15}}'
-        result = _apply_default_chat_options(None)
-        assert result["llm"]["temperature"] == 0.3
-        assert result["prompt"]["top_n"] == 15
-
-
-def test_apply_default_chat_options_user_overrides():
-    """User-supplied values take precedence; nested dicts are shallow-merged."""
-    with patch("assessment.services.settings") as mock_settings:
-        mock_settings.default_chat_config = '{"llm": {"temperature": 0.3, "max_tokens": 512}}'
-        user_opts = {"llm": {"temperature": 0.9}}
-        result = _apply_default_chat_options(user_opts)
-        assert result["llm"]["temperature"] == 0.9  # user override
-        assert result["llm"]["max_tokens"] == 512  # from default
+    _, chat_kwargs = mock_client.ensure_chat.await_args
+    assert chat_kwargs["llm"] == {"temperature": 0.2}
+    assert chat_kwargs["custom_chat_flag"] == "yes"
 
 
-def test_apply_default_chat_options_empty_env():
-    """When env default is empty, chat_options are returned as-is."""
-    with patch("assessment.services.settings") as mock_settings:
-        mock_settings.default_chat_config = '{}'
-        result = _apply_default_chat_options({"llm": {"temperature": 0.5}})
-        assert result == {"llm": {"temperature": 0.5}}
+@patch("assessment.services._process_questions", new_callable=AsyncMock)
+@patch("assessment.services._update_status", new_callable=AsyncMock)
+@patch("assessment.services.get_task", new_callable=AsyncMock)
+@patch("assessment.services.RagflowClient")
+def test_run_assessment_from_dataset_passes_chat_extra_options(
+    MockClient,
+    mock_get_task,
+    mock_update_status,
+    mock_process_questions,
+):
+    del mock_update_status
+    mock_process_questions.return_value = 0
 
+    record = _make_record("task-extra-002")
+    mock_get_task.return_value = record
 
-def test_apply_default_chat_options_none_input():
-    """When no user opts and no env default, returns empty dict."""
-    with patch("assessment.services.settings") as mock_settings:
-        mock_settings.default_chat_config = '{}'
-        result = _apply_default_chat_options(None)
-        assert result == {}
+    mock_client = AsyncMock()
+    mock_client.ensure_chat = AsyncMock(return_value="chat-ds")
+    mock_client.create_session = AsyncMock(return_value="sess-ds")
+    mock_client.close = AsyncMock()
+    MockClient.return_value = mock_client
 
+    chat_opts = {"prompt": {"top_n": 12}, "custom_chat": 123}
+    dataset_ids = ["ds-a", "ds-b"]
 
-if __name__ == "__main__":
-    test_parser_config_extra_fields()
-    test_dataset_options_extra_fields()
-    test_chat_llm_options_extra_fields()
-    test_chat_prompt_options_extra_fields()
-    test_chat_options_extra_fields()
-    test_apply_default_dataset_options_uses_env()
-    test_apply_default_dataset_options_user_overrides()
-    test_apply_default_dataset_options_empty_env()
-    test_apply_default_dataset_options_invalid_json()
-    test_apply_default_chat_options_uses_env()
-    test_apply_default_chat_options_user_overrides()
-    test_apply_default_chat_options_empty_env()
-    test_apply_default_chat_options_none_input()
-    print("OK")
+    _run(
+        run_assessment_from_dataset(
+            task_id="task-extra-002",
+            dataset_ids=dataset_ids,
+            chat_opts=chat_opts,
+        )
+    )
+
+    args, kwargs = mock_client.ensure_chat.await_args
+    assert list(args[1]) == dataset_ids
+    assert kwargs["prompt"] == {"top_n": 12}
+    assert kwargs["custom_chat"] == 123
+

@@ -110,8 +110,13 @@ export ASSESSMENT_RAGFLOW_API_KEY=ragflow-your-api-key-here
 # Optional: serve under a subpath (e.g. behind a reverse proxy)
 export ASSESSMENT_API_BASE_PATH=/assessment
 
-# Optional: enable JWT authentication
+# Optional: enable JWT auth signing key (required for LDAP login/token mode)
 export ASSESSMENT_JWT_SECRET_KEY=my-super-secret-key
+
+# Optional: LDAP / Active Directory login mode
+export ASSESSMENT_LDAP_SERVER_URI=ldap://dc1.example.local:389
+export ASSESSMENT_LDAP_USER_BASE_DN="OU=Users,DC=example,DC=local"
+export ASSESSMENT_LDAP_GROUP_ROLE_MAPPING_JSON='{"viewer":["RGF-Readers"],"operator":["RGF-Operators"],"admin":["RGF-Admins"]}'
 
 # Optional: SSL / TLS settings for RAGFlow connection
 export ASSESSMENT_VERIFY_SSL=false                   # disable SSL verification (e.g. self-signed certs)
@@ -138,12 +143,88 @@ All settings (see `config.py`):
 | `ASSESSMENT_HOST` | `0.0.0.0` | Server bind host |
 | `ASSESSMENT_PORT` | `8000` | Server bind port |
 | `ASSESSMENT_API_BASE_PATH` | (empty) | Subpath prefix, e.g. `/assessment` |
-| `ASSESSMENT_JWT_SECRET_KEY` | (empty) | JWT secret key; empty = auth disabled |
+| `ASSESSMENT_JWT_SECRET_KEY` | (empty) | JWT signing key; empty = auth disabled |
+| `ASSESSMENT_JWT_ALGORITHM` | `HS256` | JWT algorithm for access/refresh tokens |
+| `ASSESSMENT_JWT_ACCESS_TOKEN_TTL_MINUTES` | `30` | Access token TTL in minutes |
+| `ASSESSMENT_JWT_REFRESH_TOKEN_TTL_MINUTES` | `10080` | Refresh token TTL in minutes |
+| `ASSESSMENT_LDAP_SERVER_URI` | (empty) | LDAP/AD server URI (set to enable LDAP login endpoints) |
+| `ASSESSMENT_LDAP_USE_SSL` | `false` | Use LDAPS (`ldaps://`) |
+| `ASSESSMENT_LDAP_START_TLS` | `false` | Upgrade LDAP connection with StartTLS |
+| `ASSESSMENT_LDAP_VERIFY_SSL` | `true` | Verify LDAP TLS certificates |
+| `ASSESSMENT_LDAP_CA_CERT` | (empty) | Custom CA cert path for LDAP TLS |
+| `ASSESSMENT_LDAP_USER_DN_TEMPLATE` | (empty) | Direct-bind template, e.g. `user@domain.local` |
+| `ASSESSMENT_LDAP_BIND_DN` | (empty) | Service-account bind DN for LDAP search mode |
+| `ASSESSMENT_LDAP_BIND_PASSWORD` | (empty) | Service-account bind password |
+| `ASSESSMENT_LDAP_USER_BASE_DN` | (empty) | User search base DN |
+| `ASSESSMENT_LDAP_USER_FILTER` | `(|(sAMAccountName={username})(uid={username})(cn={username}))` | User search LDAP filter |
+| `ASSESSMENT_LDAP_GROUP_MEMBER_ATTRIBUTE` | `memberOf` | Group membership attribute on user object |
+| `ASSESSMENT_LDAP_GROUP_SEARCH_BASE_DN` | (empty) | Optional group search base DN |
+| `ASSESSMENT_LDAP_GROUP_SEARCH_FILTER` | `(|(member={user_dn})(memberUid={username}))` | Optional group search filter |
+| `ASSESSMENT_LDAP_GROUP_NAME_ATTRIBUTE` | `cn` | Group name attribute used for mapping |
+| `ASSESSMENT_LDAP_GROUP_ROLE_MAPPING_JSON` | `{"viewer":[],"operator":[],"admin":[]}` | LDAP group-to-role mapping JSON |
+| `ASSESSMENT_LDAP_REQUIRE_MAPPED_ROLES` | `true` | Require at least one mapped role after LDAP auth |
 | `ASSESSMENT_DATABASE_URL` | `sqlite+aiosqlite:///./assessment.db` | Database URL (SQLite default; see [Database Persistence](#database-persistence) for PostgreSQL) |
+| `ASSESSMENT_DATABASE_BOOTSTRAP_MODE` | `create` | `create` = create missing tables only; `recreate` = drop and recreate all assessment tables at startup |
+| `ASSESSMENT_DATABASE_ALLOW_DESTRUCTIVE_RECREATE` | `false` | Required to allow destructive `recreate` bootstrap on PostgreSQL |
 | `ASSESSMENT_VERIFY_SSL` | `true` | Set `false` to skip SSL certificate verification |
 | `ASSESSMENT_SSL_CA_CERT` | (empty) | Path to a custom CA bundle or self-signed certificate (PEM) |
 | `ASSESSMENT_TASK_RETENTION_DAYS` | `0` | Auto-delete task rows older than this many days; `0` = disabled (kept forever) |
 | `ASSESSMENT_TASK_CLEANUP_INTERVAL_HOURS` | `24.0` | How often the cleanup job runs (in hours) |
+| `ASSESSMENT_LOG_LEVEL` | `INFO` | Log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `ASSESSMENT_LOG_JSON` | `true` | Emit JSON-formatted logs |
+| `ASSESSMENT_LOG_TO_CONSOLE` | `true` | Write logs to stdout/stderr |
+| `ASSESSMENT_LOG_FILE_ENABLED` | `true` | Enable local file logging |
+| `ASSESSMENT_LOG_DIR` | `./logs` | Directory for local log files |
+| `ASSESSMENT_LOG_FILE_NAME` | `assessment.log` | Active log file name |
+| `ASSESSMENT_LOG_MAX_BYTES` | `20971520` | Rotate log file after this size in bytes |
+| `ASSESSMENT_LOG_BACKUP_COUNT` | `30` | Number of rotated files to retain |
+| `ASSESSMENT_OTEL_ENABLED` | `false` | Enable OpenTelemetry initialization/instrumentation |
+| `ASSESSMENT_OTEL_EXPORTER_OTLP_ENDPOINT` | (empty) | Base OTLP HTTP endpoint, e.g. `http://otel-collector:4318` |
+| `ASSESSMENT_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | (empty) | Optional full traces endpoint override |
+| `ASSESSMENT_OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | (empty) | Optional full logs endpoint override |
+| `ASSESSMENT_OTEL_EXPORTER_OTLP_HEADERS` | (empty) | OTLP headers (JSON object or comma `k=v` list) |
+| `ASSESSMENT_OTEL_SERVICE_NAME` | `assessment-api` | OTel service name |
+| `ASSESSMENT_OTEL_SERVICE_VERSION` | `1.0.0` | OTel service version |
+| `ASSESSMENT_OTEL_RESOURCE_ATTRIBUTES_JSON` | `{}` | Extra resource attributes JSON |
+| `ASSESSMENT_OTEL_SAMPLE_RATIO` | `1.0` | Trace sampling ratio (0.0-1.0) |
+| `ASSESSMENT_OTEL_EXPORT_TRACES` | `true` | Export traces to OTLP |
+| `ASSESSMENT_OTEL_EXPORT_LOGS` | `true` | Export logs to OTLP |
+| `ASSESSMENT_OTEL_ENABLE_CONSOLE_EXPORTER` | `false` | Also export traces/logs to console exporter |
+| `ASSESSMENT_OTEL_INSTRUMENT_FASTAPI` | `true` | Enable FastAPI auto instrumentation |
+| `ASSESSMENT_OTEL_INSTRUMENT_HTTPX` | `true` | Enable HTTPX auto instrumentation |
+| `ASSESSMENT_OTEL_INSTRUMENT_SQLALCHEMY` | `true` | Enable SQLAlchemy auto instrumentation |
+| `ASSESSMENT_OPENINFERENCE_ENABLED` | `true` | Add OpenInference semantic attributes/context |
+
+### Observability (OpenTelemetry + OpenInference)
+
+The Assessment API supports end-to-end tracing and log export via OpenTelemetry:
+
+- Incoming API spans (FastAPI)
+- Outbound RAGFlow HTTP spans (HTTPX)
+- Database spans (SQLAlchemy)
+- Application-level pipeline spans (`run_assessment`, per-question processing, etc.)
+- OpenInference semantic span attributes for Phoenix-compatible LLM workflow analysis
+
+Enable and export to an OTLP collector:
+
+```bash
+export ASSESSMENT_OTEL_ENABLED=true
+export ASSESSMENT_OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+export ASSESSMENT_OTEL_SERVICE_NAME=assessment-api
+export ASSESSMENT_OTEL_SERVICE_VERSION=1.0.0
+```
+
+For Arize Phoenix (OTLP ingest), point the endpoint to your Phoenix OTLP collector URL.
+
+### Log Rotation
+
+File logging uses built-in rotating handlers:
+
+- Active file: `${ASSESSMENT_LOG_DIR}/${ASSESSMENT_LOG_FILE_NAME}`
+- Rotation trigger: `ASSESSMENT_LOG_MAX_BYTES`
+- Retention count: `ASSESSMENT_LOG_BACKUP_COUNT`
+
+This keeps logs self-contained for long-running deployments while still allowing OTLP export to external backends.
 
 ### Database Persistence
 
@@ -151,6 +232,20 @@ By default the assessment API stores task state (IDs, status, metadata, results)
 This is suitable for single-instance deployments and can be mounted on a Docker volume or Kubernetes PersistentVolume.
 
 **SQLite** requires no external setup — the database file and tables are created automatically on first startup.
+
+To avoid schema migration tooling in controlled environments, you can opt into destructive bootstrap:
+
+```bash
+export ASSESSMENT_DATABASE_BOOTSTRAP_MODE=recreate
+```
+
+`recreate` drops and recreates all assessment tables at startup. Use only when data loss is acceptable.
+
+For PostgreSQL, destructive recreate is blocked by default. To allow it intentionally:
+
+```bash
+export ASSESSMENT_DATABASE_ALLOW_DESTRUCTIVE_RECREATE=true
+```
 
 #### Using PostgreSQL
 
@@ -195,7 +290,7 @@ volumes:
 
 #### Automatic Cleanup of Old Records
 
-Set `ASSESSMENT_TASK_RETENTION_DAYS` to automatically purge task rows (and their results) older than the specified number of days. A background job runs on a configurable interval (`ASSESSMENT_TASK_CLEANUP_INTERVAL_HOURS`, default 24 h).
+Set `ASSESSMENT_TASK_RETENTION_DAYS` to automatically purge task rows (and their results) and old task-event audit rows older than the specified number of days. A background job runs on a configurable interval (`ASSESSMENT_TASK_CLEANUP_INTERVAL_HOURS`, default 24 h).
 
 ```bash
 # Delete tasks older than 30 days, check every 12 hours
@@ -255,11 +350,11 @@ The UI is a single-page app served directly from FastAPI — no extra dependenci
 | **Document upload** | Upload documents to an existing RAGFlow dataset |
 | **Data Management** | List, paginate, and delete datasets and documents directly from the dashboard |
 | **Health check** | View API and RAGFlow connection status |
-| **JWT authentication** | Paste and save a JWT token (persisted in browser localStorage) |
+| **LDAP login / token refresh** | Sign in with LDAP username/password, refresh tokens, verify token status, and logout from the dashboard |
 | **Retry panel** | Upload replacement documents and re-start failed assessments directly from the task detail view |
 
 > **Note:** The UI endpoint (`/ui`) is **not** behind JWT authentication — it is a static HTML page.
-> All API calls made *from* the UI include the JWT token if one is configured in the token bar.
+> All API calls made *from* the UI include the bearer token when authenticated via the login bar.
 
 ## Authentication
 
@@ -269,7 +364,25 @@ When `ASSESSMENT_JWT_SECRET_KEY` is set, **all** API endpoints require a valid J
 Authorization: Bearer <token>
 ```
 
-Generate a token using PyJWT:
+### LDAP / AD Token Endpoints
+
+If `ASSESSMENT_LDAP_SERVER_URI` is configured, use these endpoints:
+
+- `POST /api/v1/auth/token` with `{ "username": "...", "password": "..." }` to authenticate against LDAP and receive access/refresh JWTs.
+- `POST /api/v1/auth/refresh` with `{ "refresh_token": "..." }` to rotate/refresh session tokens.
+- `GET /api/v1/auth/verify` with bearer access token to validate token and return identity/roles/groups.
+
+LDAP group mapping supports users in multiple groups. Matched groups are merged into role grants (`viewer`, `operator`, `admin`).
+
+Role permissions:
+
+- `viewer`: read-only API usage (`GET`/`HEAD`/`OPTIONS`)
+- `operator`: everything in `viewer` plus write/execute flows (`POST`/`PUT`/`PATCH`) for assessment operations
+- `admin`: full access, including destructive endpoints (`DELETE`) and direct RAGFlow passthrough (`/api/v1/ragflow/*`)
+
+### Legacy Manual JWT
+
+If LDAP mode is not enabled, you can still generate JWTs manually:
 
 ```python
 import jwt
@@ -478,6 +591,20 @@ Possible per-document statuses:
 > documents via the two-phase upload endpoint and re-start the assessment. The existing dataset and
 > previously uploaded documents are preserved. See [Error Handling & Retry](#error-handling--retry).
 
+#### Get Task Events (Audit Trail)
+
+Retrieve task lifecycle/audit events (newest first).
+
+**Query Parameters:**
+- `page` (int, default 1): Page number.
+- `page_size` (int, default 100): Events per page.
+
+```
+GET /api/v1/assessments/{task_id}/events?page=1&page_size=100
+```
+
+Use this endpoint to troubleshoot pipeline transitions (`task_created`, `status_update`, errors, etc.).
+
 #### Get Results (JSON, Paginated)
 
 Retrieve assessment results in JSON format.
@@ -560,7 +687,7 @@ Proxies document downloads from RAGFlow. Reference `document_url` fields point h
 #### Upload Documents (Standalone)
 
 ```
-POST /api/v1/documents/upload
+POST /api/v1/assessments/documents/upload
 Content-Type: multipart/form-data
 ```
 
@@ -971,7 +1098,7 @@ The assessment pipeline is optimized for throughput at every stage:
 | **Question processing** | Concurrent question processing with semaphore-controlled parallelism |
 | **Progress persistence** | Batched DB writes — progress is persisted every 5 questions (and always on the final question), reducing DB round-trips by ~80% while still providing timely updates |
 | **Resource cleanup** | When stale datasets or chat assistants need deletion (e.g. `ensure_dataset`, `ensure_chat`), deletions run concurrently via `asyncio.gather` |
-| **Standalone uploads** | The `POST /documents/upload` endpoint also uploads files concurrently |
+| **Standalone uploads** | The `POST /assessments/documents/upload` endpoint also uploads files concurrently |
 
 ## Scaling Considerations
 
@@ -1000,7 +1127,7 @@ If you continue to see permission errors, please verify:
 ```
 assessment/
 ├── __init__.py          # Package marker
-├── auth.py              # JWT bearer token authentication
+├── auth.py              # LDAP/JWT auth endpoints + role-based authorization
 ├── config.py            # Settings via environment variables
 ├── db.py                # Async database layer (SQLite / PostgreSQL)
 ├── Dockerfile           # Container image definition

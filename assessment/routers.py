@@ -24,7 +24,7 @@ Common:
   GET    /api/v1/assessments/{task_id}                    - Get task status
   GET    /api/v1/assessments/{task_id}/results             - Get results (JSON, paginated)
   GET    /api/v1/assessments/{task_id}/results/excel       - Download results as Excel
-  POST   /api/v1/documents/upload                         - Upload documents (standalone)
+    POST   /api/v1/assessments/documents/upload            - Upload documents (standalone)
 """
 
 from __future__ import annotations
@@ -43,24 +43,39 @@ import json
 from .models import (
     DocumentUploadResponse,
     SessionCreateResponse,
+    TaskEventListResponse,
     TaskListResponse,
     TaskResultResponse,
     TaskState,
     TaskStatus,
 )
 from .ragflow_client import RagflowClient
+
+
+class DocumentLookupResponse(BaseModel):
+    class Match(BaseModel):
+        task_id: str
+        document_id: str
+        dataset_id: Optional[str] = None
+
+    matches: list[Match] = []
+    total: int = 0
 from .services import (
     add_documents_to_session,
     build_results_excel,
+    claim_session_start,
     create_session,
     create_task,
     get_paginated_results,
     get_task,
+    list_task_events,
     list_tasks,
     parse_questions_excel,
     run_assessment,
     run_assessment_for_session,
     run_assessment_from_dataset,
+    find_tasks_by_dataset_id,
+    find_document_by_hash,
 )
 
 logger = logging.getLogger(__name__)
@@ -553,20 +568,15 @@ async def start_session_assessment(
 
     Returns immediately; poll ``GET /assessments/{task_id}`` for progress.
     """
-    record = await get_task(task_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="Task not found")
-    if record.status.state not in (TaskState.AWAITING_DOCUMENTS, TaskState.FAILED):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot start assessment in state '{record.status.state.value}'. "
-            f"Task must be in 'awaiting_documents' or 'failed' state.",
-        )
-    if not record.ragflow.document_ids:
-        raise HTTPException(
-            status_code=400,
-            detail="No evidence documents uploaded. Upload at least one document first.",
-        )
+    try:
+        record = await claim_session_start(task_id)
+    except ValueError as exc:
+        msg = str(exc)
+        if "not found" in msg.lower():
+            raise HTTPException(status_code=404, detail=msg)
+        if "no evidence documents uploaded" in msg.lower():
+            raise HTTPException(status_code=400, detail=msg)
+        raise HTTPException(status_code=409, detail=msg)
 
     dataset_opts = {}
     if dataset_options:
@@ -617,6 +627,20 @@ async def list_all_tasks(
     )
 
 
+@router.get("/assessments/by-dataset/{dataset_id}", response_model=TaskListResponse)
+async def get_tasks_by_dataset(dataset_id: str):
+    """Return all tasks that reference the given RAGFlow dataset ID."""
+    tasks = await find_tasks_by_dataset_id(dataset_id)
+    total = len(tasks)
+    return TaskListResponse(
+        tasks=tasks,
+        total=total,
+        page=1,
+        page_size=total or 1,
+        total_pages=1,
+    )
+
+
 # ---------------------------------------------------------------------------
 # GET /assessments/{task_id}  –  Task status
 # ---------------------------------------------------------------------------
@@ -628,6 +652,34 @@ async def get_task_status(task_id: str):
     if not record:
         raise HTTPException(status_code=404, detail="Task not found")
     return record.status
+
+
+# ---------------------------------------------------------------------------
+# GET /assessments/{task_id}/events  –  Task events
+# ---------------------------------------------------------------------------
+
+@router.get("/assessments/{task_id}/events", response_model=TaskEventListResponse)
+async def get_task_event_history(
+    task_id: str,
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(100, ge=1, le=1000, description="Events per page"),
+):
+    """Return task event history for audit/debugging (paginated, newest-first)."""
+    record = await get_task(task_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Task not found")
+    events, total = await list_task_events(task_id, page, page_size)
+    import math
+
+    total_pages = max(1, math.ceil(total / page_size))
+    return TaskEventListResponse(
+        task_id=task_id,
+        events=events,
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -674,6 +726,17 @@ async def download_results_excel(task_id: str):
             "Content-Disposition": f'attachment; filename="assessment_{task_id[:8]}.xlsx"'
         },
     )
+
+
+@router.get("/assessments/documents/by-hash/{file_hash}", response_model=DocumentLookupResponse)
+async def get_document_by_hash(file_hash: str):
+    """Locate existing uploaded document(s) by their content hash.
+
+    Useful to avoid re-uploading the same file across tasks/datasets.
+    """
+    rows = await find_document_by_hash(file_hash)
+    matches = [DocumentLookupResponse.Match(**r) for r in rows]
+    return DocumentLookupResponse(matches=matches, total=len(matches))
 
 
 # ===========================================================================
@@ -744,10 +807,10 @@ async def proxy_document(document_id: str):
 
 
 # ---------------------------------------------------------------------------
-# POST /documents/upload  –  Standalone document upload
+# POST /assessments/documents/upload  –  Standalone document upload
 # ---------------------------------------------------------------------------
 
-@router.post("/documents/upload")
+@router.post("/assessments/documents/upload")
 async def upload_documents(
     dataset_id: str = Form(..., description="Existing RAGFlow dataset ID"),
     files: list[UploadFile] = File(..., description="Documents to upload"),
@@ -812,7 +875,7 @@ class DeleteDocumentsRequest(BaseModel):
     ids: list[str]
 
 
-@router.get("/datasets")
+@router.get("/datasets", tags=["ragflow-passthrough"])
 async def list_datasets(
     page: int = Query(1, ge=1),
     page_size: int = Query(100, ge=1),
@@ -858,14 +921,14 @@ async def list_datasets(
     }
 
 
-@router.delete("/datasets")
+@router.delete("/datasets", tags=["ragflow-passthrough"])
 async def delete_datasets(req: DeleteDatasetsRequest):
     resp = await _request_ragflow_official("DELETE", "datasets", json_body={"ids": req.ids})
     _parse_ragflow_json_or_raise(resp)
     return {"message": "Datasets deleted"}
 
 
-@router.get("/datasets/{dataset_id}/documents")
+@router.get("/datasets/{dataset_id}/documents", tags=["ragflow-passthrough"])
 async def list_documents(
     dataset_id: str,
     page: int = Query(1, ge=1),
@@ -910,7 +973,7 @@ async def list_documents(
     }
 
 
-@router.delete("/datasets/{dataset_id}/documents")
+@router.delete("/datasets/{dataset_id}/documents", tags=["ragflow-passthrough"])
 async def delete_documents(dataset_id: str, req: DeleteDocumentsRequest):
     resp = await _request_ragflow_official(
         "DELETE",

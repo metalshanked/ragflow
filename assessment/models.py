@@ -84,6 +84,7 @@ class TaskStatus(BaseModel):
 
     # RAGFlow resource IDs (populated as the pipeline progresses)
     dataset_id: Optional[str] = None
+    dataset_ids: list[str] = Field(default_factory=list)
     chat_id: Optional[str] = None
     session_id: Optional[str] = None
     document_ids: list[str] = Field(default_factory=list)
@@ -112,12 +113,34 @@ class TaskResultResponse(BaseModel):
 
     # RAGFlow resource IDs
     dataset_id: Optional[str] = None
+    dataset_ids: list[str] = Field(default_factory=list)
     chat_id: Optional[str] = None
     session_id: Optional[str] = None
     document_ids: list[str] = Field(default_factory=list)
 
     # Per-document parsing status
     document_statuses: list[DocumentStatus] = Field(default_factory=list)
+
+
+class TaskEvent(BaseModel):
+    id: int
+    task_id: str
+    event_type: str
+    state: Optional[TaskState] = None
+    pipeline_stage: Optional[PipelineStage] = None
+    message: str = ""
+    error: Optional[str] = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class TaskEventListResponse(BaseModel):
+    task_id: str
+    events: list[TaskEvent] = Field(default_factory=list)
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +184,7 @@ class DocumentUploadResponse(BaseModel):
 class RagflowContext(BaseModel):
     """Tracks RAGFlow resource IDs created for one assessment task."""
     dataset_id: str = ""
+    dataset_ids: list[str] = Field(default_factory=list)
     document_ids: list[str] = Field(default_factory=list)
     file_hashes: dict[str, str] = Field(default_factory=dict)  # Maps file hash -> document_id
     chat_id: str = ""

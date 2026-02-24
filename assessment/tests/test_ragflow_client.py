@@ -52,7 +52,7 @@ with patch.dict("sys.modules", {"assessment.config": MagicMock(settings=_fake_se
 
 def _run(coro):
     """Helper to run a coroutine in tests."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 class TestListDocuments(unittest.TestCase):

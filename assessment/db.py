@@ -11,8 +11,10 @@ it does not already exist — no manual ``CREATE DATABASE`` step is needed.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import urlparse
@@ -67,6 +69,22 @@ class TaskRow(Base):
     document_statuses_json = Column(Text, nullable=False, default="[]")
 
 
+class TaskEventRow(Base):
+    """Append-only task event/audit trail."""
+
+    __tablename__ = "task_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String(64), nullable=False, index=True)
+    event_type = Column(String(64), nullable=False, default="status_update")
+    state = Column(String(32), nullable=True)
+    pipeline_stage = Column(String(32), nullable=True)
+    message = Column(Text, nullable=False, default="")
+    error = Column(Text, nullable=True)
+    payload_json = Column(Text, nullable=False, default="{}")
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+
 # ---------------------------------------------------------------------------
 # Engine / session factory
 # ---------------------------------------------------------------------------
@@ -79,6 +97,50 @@ _engine = create_async_engine(
 )
 
 async_session_factory = async_sessionmaker(_engine, expire_on_commit=False)
+
+
+def _is_postgres() -> bool:
+    return settings.database_url.startswith("postgresql")
+
+
+def _task_lock_key(task_id: str) -> int:
+    """Return a stable positive bigint key for per-task advisory locks."""
+    digest = hashlib.sha256(task_id.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=False) & 0x7FFF_FFFF_FFFF_FFFF
+
+
+def _cleanup_lock_id() -> int:
+    """Internally derived, stable advisory lock ID for cleanup coordination.
+
+    We avoid configuration by hashing a fixed namespace string to a
+    positive 63-bit integer, suitable for PostgreSQL advisory locks.
+    """
+    ns = b"assessment:task_cleanup_v1"
+    d = hashlib.sha256(ns).digest()
+    return int.from_bytes(d[:8], byteorder="big", signed=False) & 0x7FFF_FFFF_FFFF_FFFF
+
+
+@asynccontextmanager
+async def db_task_lock(task_id: str):
+    """Cross-pod per-task lock.
+
+    Uses PostgreSQL session-level advisory locks when running against PG.
+    For SQLite and other engines this is a no-op.
+    """
+    if not _is_postgres():
+        yield
+        return
+
+    lock_key = _task_lock_key(task_id)
+    conn = await _engine.connect()
+    try:
+        await conn.execute(text("SELECT pg_advisory_lock(:id)"), {"id": lock_key})
+        yield
+    finally:
+        try:
+            await conn.execute(text("SELECT pg_advisory_unlock(:id)"), {"id": lock_key})
+        finally:
+            await conn.close()
 
 
 async def _ensure_pg_database() -> None:
@@ -122,7 +184,29 @@ async def init_db() -> None:
     if settings.database_url.startswith("postgresql"):
         await _ensure_pg_database()
 
+    bootstrap_mode = settings.database_bootstrap_mode.strip().lower()
+    if bootstrap_mode not in {"create", "recreate"}:
+        raise ValueError(
+            "Invalid ASSESSMENT_DATABASE_BOOTSTRAP_MODE. "
+            "Expected 'create' or 'recreate'."
+        )
+    is_pg = settings.database_url.startswith("postgresql")
+    if (
+        is_pg
+        and bootstrap_mode == "recreate"
+        and not settings.database_allow_destructive_recreate
+    ):
+        raise ValueError(
+            "Refusing destructive bootstrap on PostgreSQL. "
+            "Set ASSESSMENT_DATABASE_ALLOW_DESTRUCTIVE_RECREATE=true only for controlled teardown scenarios."
+        )
+
     async with _engine.begin() as conn:
+        if bootstrap_mode == "recreate":
+            logger.warning(
+                "Database bootstrap mode is 'recreate': dropping and recreating all assessment tables."
+            )
+            await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
     logger.info("Database tables ensured at %s", settings.database_url)
 
@@ -149,6 +233,7 @@ def _task_record_from_row(row: TaskRow) -> TaskRecord:
     doc_statuses = [DocumentStatus(**ds) for ds in json.loads(row.document_statuses_json or "[]")]
     # Sync RAGFlow resource IDs into the status so API responses include them
     status.dataset_id = ragflow.dataset_id or None
+    status.dataset_ids = ragflow.dataset_ids or ([ragflow.dataset_id] if ragflow.dataset_id else [])
     status.chat_id = ragflow.chat_id or None
     status.session_id = ragflow.session_id or None
     status.document_ids = ragflow.document_ids or []
@@ -230,10 +315,69 @@ async def db_list_tasks(page: int = 1, page_size: int = 50) -> tuple[list[TaskSt
         return [_task_record_from_row(r).status for r in rows], total
 
 
-# Advisory-lock ID used by PostgreSQL to ensure only one pod runs the
-# cleanup job at a time.  The value is arbitrary but must be consistent
-# across all instances.
-_CLEANUP_ADVISORY_LOCK_ID = 738_291_046  # arbitrary 32-bit constant
+async def db_add_task_event(
+    task_id: str,
+    *,
+    event_type: str = "status_update",
+    state: TaskState | None = None,
+    pipeline_stage: PipelineStage | None = None,
+    message: str = "",
+    error: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    """Append a task event row."""
+    row = TaskEventRow(
+        task_id=task_id,
+        event_type=event_type,
+        state=state.value if state else None,
+        pipeline_stage=pipeline_stage.value if pipeline_stage else None,
+        message=message or "",
+        error=error,
+        payload_json=json.dumps(payload or {}, default=str),
+    )
+    async with async_session_factory() as session:
+        async with session.begin():
+            session.add(row)
+
+
+async def db_list_task_events(
+    task_id: str,
+    page: int = 1,
+    page_size: int = 100,
+) -> tuple[list[dict[str, Any]], int]:
+    """Return paginated task events ordered newest-first."""
+    from sqlalchemy import func, select
+
+    async with async_session_factory() as session:
+        count_stmt = select(func.count()).select_from(TaskEventRow).where(TaskEventRow.task_id == task_id)
+        total = (await session.execute(count_stmt)).scalar() or 0
+
+        stmt = (
+            select(TaskEventRow)
+            .where(TaskEventRow.task_id == task_id)
+            .order_by(TaskEventRow.created_at.desc(), TaskEventRow.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        result = await session.execute(stmt)
+        rows = result.scalars().all()
+
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            events.append(
+                {
+                    "id": row.id,
+                    "task_id": row.task_id,
+                    "event_type": row.event_type,
+                    "state": TaskState(row.state) if row.state else None,
+                    "pipeline_stage": PipelineStage(row.pipeline_stage) if row.pipeline_stage else None,
+                    "message": row.message or "",
+                    "error": row.error,
+                    "payload": json.loads(row.payload_json or "{}"),
+                    "created_at": row.created_at,
+                }
+            )
+        return events, total
 
 
 async def db_purge_old_tasks(retention_days: int) -> int:
@@ -262,7 +406,7 @@ async def db_purge_old_tasks(retention_days: int) -> int:
             if is_pg:
                 lock_result = await session.execute(
                     text("SELECT pg_try_advisory_xact_lock(:id)"),
-                    {"id": _CLEANUP_ADVISORY_LOCK_ID},
+                    {"id": _cleanup_lock_id()},
                 )
                 acquired = lock_result.scalar()
                 if not acquired:
@@ -271,6 +415,10 @@ async def db_purge_old_tasks(retention_days: int) -> int:
                     )
                     return 0
 
+            # Purge event rows first (safe even without FK constraints).
+            await session.execute(
+                delete(TaskEventRow).where(TaskEventRow.created_at < cutoff)
+            )
             result = await session.execute(
                 delete(TaskRow).where(TaskRow.created_at < cutoff)
             )
@@ -278,3 +426,61 @@ async def db_purge_old_tasks(retention_days: int) -> int:
     if deleted:
         logger.info("Purged %d task(s) older than %d day(s)", deleted, retention_days)
     return deleted
+
+
+# ---------------------------------------------------------------------------
+# Query helpers for existing data lookups
+# ---------------------------------------------------------------------------
+
+async def db_find_tasks_by_dataset_id(dataset_id: str) -> list[TaskStatus]:
+    """Find tasks that reference the given RAGFlow ``dataset_id``.
+
+    Implementation detail: we perform a coarse SQL LIKE filter on the
+    JSON blob and then confirm matches by parsing JSON to avoid false
+    positives. Works on both SQLite and PostgreSQL.
+    """
+    from sqlalchemy import select
+
+    needle = f"%{dataset_id}%"
+    matches: list[TaskStatus] = []
+    async with async_session_factory() as session:
+        stmt = select(TaskRow).where(TaskRow.ragflow_json.like(needle))
+        result = await session.execute(stmt)
+        rows = result.scalars().all()
+        for row in rows:
+            try:
+                rag = RagflowContext(**json.loads(row.ragflow_json or "{}"))
+            except Exception:
+                continue
+            if rag.dataset_id == dataset_id or (dataset_id in (rag.dataset_ids or [])):
+                matches.append(_task_record_from_row(row).status)
+    return matches
+
+
+async def db_find_document_by_hash(file_hash: str) -> list[dict[str, Any]]:
+    """Find documents by their content hash across tasks.
+
+    Returns list of dicts: {"task_id", "document_id", "dataset_id"}
+    for each occurrence where ``ragflow.file_hashes[hash] == document_id``.
+    """
+    from sqlalchemy import select
+
+    needle = f"%{file_hash}%"
+    found: list[dict[str, Any]] = []
+    async with async_session_factory() as session:
+        stmt = select(TaskRow).where(TaskRow.ragflow_json.like(needle))
+        result = await session.execute(stmt)
+        rows = result.scalars().all()
+        for row in rows:
+            try:
+                rag = RagflowContext(**json.loads(row.ragflow_json or "{}"))
+            except Exception:
+                continue
+            doc_id = (rag.file_hashes or {}).get(file_hash)
+            if doc_id:
+                found.append({
+                    "task_id": row.task_id,
+                    "document_id": doc_id,
+                    "dataset_id": rag.dataset_id or (rag.dataset_ids[0] if rag.dataset_ids else None),
+                })
+    return found

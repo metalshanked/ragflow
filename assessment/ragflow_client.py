@@ -15,6 +15,7 @@ from typing import Any, Optional
 import httpx
 
 from .config import settings
+from .observability import openinference_attributes, set_span_attributes, start_span
 
 logger = logging.getLogger(__name__)
 
@@ -82,52 +83,92 @@ class RagflowClient:
         params: dict | None = None,
     ) -> dict:
         url = f"{self.base_url}{path}"
-        try:
-            client = await self._get_client()
-            headers = dict(self.headers)
-            if json is not None:
-                headers["Content-Type"] = "application/json"
+        with start_span(
+            "ragflow.http.request",
+            span_kind="TOOL",
+            attributes={
+                "http.method": method.upper(),
+                "url.full": url,
+                "ragflow.path": path,
+            },
+        ) as span:
+            with openinference_attributes(
+                metadata={
+                    "tool.name": "ragflow-http-api",
+                    "tool.path": path,
+                }
+            ):
+                try:
+                    client = await self._get_client()
+                    headers = dict(self.headers)
+                    if json is not None:
+                        headers["Content-Type"] = "application/json"
 
-            resp = await client.request(
-                method,
-                url,
-                headers=headers,
-                json=json,
-                data=data,
-                files=files,
-                params=params,
-            )
-            resp.raise_for_status()
-        except httpx.ConnectError as exc:
-            raise RuntimeError(
-                f"Cannot connect to RAGFlow at {self.base_url}: {exc}"
-            ) from exc
-        except httpx.TimeoutException as exc:
-            raise RuntimeError(
-                f"Request to RAGFlow timed out ({method} {url}): {exc}"
-            ) from exc
-        except httpx.HTTPStatusError as exc:
-            detail = ""
-            try:
-                detail = exc.response.text[:500]
-            except Exception:
-                pass
-            raise RuntimeError(
-                f"RAGFlow returned HTTP {exc.response.status_code} "
-                f"for {method} {path}: {detail}"
-            ) from exc
+                    resp = await client.request(
+                        method,
+                        url,
+                        headers=headers,
+                        json=json,
+                        data=data,
+                        files=files,
+                        params=params,
+                    )
+                    set_span_attributes(
+                        span,
+                        {
+                            "http.status_code": resp.status_code,
+                        },
+                    )
+                    resp.raise_for_status()
+                except httpx.ConnectError as exc:
+                    set_span_attributes(span, {"error.type": "connect_error", "error.message": str(exc)})
+                    raise RuntimeError(
+                        f"Cannot connect to RAGFlow at {self.base_url}: {exc}"
+                    ) from exc
+                except httpx.TimeoutException as exc:
+                    set_span_attributes(span, {"error.type": "timeout", "error.message": str(exc)})
+                    raise RuntimeError(
+                        f"Request to RAGFlow timed out ({method} {url}): {exc}"
+                    ) from exc
+                except httpx.HTTPStatusError as exc:
+                    detail = ""
+                    try:
+                        detail = exc.response.text[:500]
+                    except Exception:
+                        pass
+                    set_span_attributes(
+                        span,
+                        {
+                            "http.status_code": exc.response.status_code,
+                            "error.type": "http_status_error",
+                            "error.message": detail,
+                        },
+                    )
+                    raise RuntimeError(
+                        f"RAGFlow returned HTTP {exc.response.status_code} "
+                        f"for {method} {path}: {detail}"
+                    ) from exc
 
-        try:
-            body = resp.json()
-        except Exception as exc:
-            raise RuntimeError(
-                f"RAGFlow returned non-JSON response for {method} {path}: "
-                f"{resp.text[:300]}"
-            ) from exc
+                try:
+                    body = resp.json()
+                except Exception as exc:
+                    set_span_attributes(span, {"error.type": "invalid_json", "error.message": resp.text[:300]})
+                    raise RuntimeError(
+                        f"RAGFlow returned non-JSON response for {method} {path}: "
+                        f"{resp.text[:300]}"
+                    ) from exc
 
-        if body.get("code") not in (0, None):
-            raise RuntimeError(f"RAGFlow error: {body.get('message', body)}")
-        return body
+                if body.get("code") not in (0, None):
+                    set_span_attributes(
+                        span,
+                        {
+                            "error.type": "ragflow_error",
+                            "error.message": str(body.get("message", body)),
+                            "ragflow.code": body.get("code"),
+                        },
+                    )
+                    raise RuntimeError(f"RAGFlow error: {body.get('message', body)}")
+                return body
 
     # ------------------------------------------------------------------
     # Dataset

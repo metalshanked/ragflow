@@ -40,7 +40,7 @@ header .info{font-size:.85rem;opacity:.85}
 .panel{display:none;background:var(--card);border-radius:0 var(--radius) var(--radius) var(--radius);padding:1.5rem;box-shadow:0 1px 3px rgba(0,0,0,.08)}
 .panel.active{display:block}
 label{display:block;font-weight:500;margin:.6rem 0 .25rem;font-size:.9rem}
-input[type=text],input[type=file],select,textarea{width:100%;padding:.5rem .7rem;border:1px solid var(--border);border-radius:var(--radius);font-size:.9rem}
+input[type=text],input[type=password],input[type=file],select,textarea{width:100%;padding:.5rem .7rem;border:1px solid var(--border);border-radius:var(--radius);font-size:.9rem}
 textarea{resize:vertical;min-height:60px}
 .row{display:flex;gap:1rem;flex-wrap:wrap}
 .row>*{flex:1;min-width:200px}
@@ -63,8 +63,10 @@ th{background:var(--bg);font-weight:600;position:sticky;top:0}
 .toast{position:fixed;bottom:1.5rem;right:1.5rem;padding:.8rem 1.2rem;border-radius:var(--radius);color:#fff;font-size:.9rem;z-index:999;opacity:0;transition:opacity .3s}
 .toast.show{opacity:1}
 .toast-ok{background:var(--success)}.toast-err{background:var(--danger)}
-#jwt-bar{display:flex;gap:.5rem;align-items:center;margin-bottom:1rem;flex-wrap:wrap}
-#jwt-bar input{max-width:400px}
+#auth-bar{display:flex;gap:1rem;align-items:flex-end;margin-bottom:1rem;flex-wrap:wrap;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:.8rem}
+#auth-bar .field{display:flex;flex-direction:column;gap:.25rem;min-width:180px}
+#auth-bar .field input{max-width:320px}
+#auth-status{font-size:.82rem;color:var(--muted);margin-left:auto}
 .detail-grid{display:grid;grid-template-columns:160px 1fr;gap:.3rem .8rem;font-size:.9rem;margin:.8rem 0}
 .detail-grid dt{font-weight:600;color:var(--muted)}
 .detail-grid dd{word-break:break-all}
@@ -108,12 +110,23 @@ th{background:var(--bg);font-weight:600;position:sticky;top:0}
 </header>
 
 <div class="container">
-  <!-- JWT Token Bar -->
-  <div id="jwt-bar">
-    <label style="margin:0;white-space:nowrap">JWT Token:</label>
-    <input type="text" id="jwt-input" placeholder="Paste JWT token (leave empty if auth disabled)"/>
-    <button class="btn btn-outline btn-sm" onclick="saveJwt()">Save</button>
-    <span id="jwt-status" style="font-size:.82rem"></span>
+  <!-- Auth Bar -->
+  <div id="auth-bar">
+    <div class="field">
+      <label style="margin:0">LDAP Username</label>
+      <input type="text" id="auth-username" placeholder="username"/>
+    </div>
+    <div class="field">
+      <label style="margin:0">LDAP Password</label>
+      <input type="password" id="auth-password" placeholder="password"/>
+    </div>
+    <div style="display:flex;gap:.5rem;flex-wrap:wrap">
+      <button class="btn btn-primary btn-sm" id="btn-login" onclick="loginLdap()">Login</button>
+      <button class="btn btn-outline btn-sm" id="btn-refresh-token" onclick="refreshSessionToken()">Refresh Token</button>
+      <button class="btn btn-outline btn-sm" onclick="verifySessionToken()">Verify</button>
+      <button class="btn btn-danger btn-sm" onclick="logout()">Logout</button>
+    </div>
+    <span id="auth-status"></span>
   </div>
 
   <!-- Tabs -->
@@ -360,13 +373,114 @@ const HEALTH_URL = (function(){
   return uiIdx > 0 ? path.substring(0, uiIdx) + '/health' : '/health';
 })();
 
-let JWT = localStorage.getItem('assessment_jwt') || '';
-document.getElementById('jwt-input').value = JWT;
-updateJwtStatus();
+let ACCESS_TOKEN = localStorage.getItem('assessment_access_token') || '';
+let REFRESH_TOKEN = localStorage.getItem('assessment_refresh_token') || '';
+let AUTH_USERNAME = localStorage.getItem('assessment_auth_username') || '';
+let AUTH_ROLES = (localStorage.getItem('assessment_auth_roles') || '').split(',').filter(Boolean);
 
-function headers(){const h={};if(JWT)h['Authorization']='Bearer '+JWT;return h;}
-function saveJwt(){JWT=document.getElementById('jwt-input').value.trim();localStorage.setItem('assessment_jwt',JWT);updateJwtStatus();toast('JWT saved','ok');}
-function updateJwtStatus(){document.getElementById('jwt-status').textContent=JWT?'\u2714 Token set':'No token (auth disabled?)';}
+document.getElementById('auth-username').value = AUTH_USERNAME;
+updateAuthStatus();
+
+function headers(){const h={};if(ACCESS_TOKEN)h['Authorization']='Bearer '+ACCESS_TOKEN;return h;}
+
+function _storeSession(data){
+  ACCESS_TOKEN = data.access_token || ACCESS_TOKEN;
+  REFRESH_TOKEN = data.refresh_token || REFRESH_TOKEN;
+  AUTH_USERNAME = data.username || AUTH_USERNAME || '';
+  AUTH_ROLES = Array.isArray(data.roles) ? data.roles : AUTH_ROLES;
+  if(ACCESS_TOKEN){localStorage.setItem('assessment_access_token', ACCESS_TOKEN);}else{localStorage.removeItem('assessment_access_token');}
+  if(REFRESH_TOKEN){localStorage.setItem('assessment_refresh_token', REFRESH_TOKEN);}else{localStorage.removeItem('assessment_refresh_token');}
+  if(AUTH_USERNAME){localStorage.setItem('assessment_auth_username', AUTH_USERNAME);}else{localStorage.removeItem('assessment_auth_username');}
+  localStorage.setItem('assessment_auth_roles', AUTH_ROLES.join(','));
+  updateAuthStatus();
+}
+
+function updateAuthStatus(){
+  const statusEl=document.getElementById('auth-status');
+  if(!statusEl)return;
+  if(ACCESS_TOKEN){
+    const roleText = AUTH_ROLES.length ? ' ['+AUTH_ROLES.join(', ')+']' : '';
+    statusEl.textContent='Authenticated as '+(AUTH_USERNAME||'user')+roleText;
+  }else{
+    statusEl.textContent='Not authenticated';
+  }
+}
+
+async function loginLdap(){
+  const username=document.getElementById('auth-username').value.trim();
+  const password=document.getElementById('auth-password').value;
+  if(!username || !password){toast('Enter LDAP username and password','err');return;}
+  btnLoading('btn-login','Logging in\u2026');
+  try{
+    const r=await fetch(API+'/auth/token',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({username,password}),
+    });
+    const data=await r.json().catch(()=>({detail:'Invalid server response'}));
+    if(!r.ok)throw new Error(data.detail||('Login failed ('+r.status+')'));
+    _storeSession(data);
+    document.getElementById('auth-password').value='';
+    toast('Login successful','ok');
+  }catch(e){
+    toast(e.message,'err');
+  }finally{
+    btnReset('btn-login');
+  }
+}
+
+async function refreshSessionToken(){
+  if(!REFRESH_TOKEN){toast('No refresh token available','err');return;}
+  btnLoading('btn-refresh-token','Refreshing\u2026');
+  try{
+    const r=await fetch(API+'/auth/refresh',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({refresh_token:REFRESH_TOKEN}),
+    });
+    const data=await r.json().catch(()=>({detail:'Invalid server response'}));
+    if(!r.ok)throw new Error(data.detail||('Refresh failed ('+r.status+')'));
+    _storeSession(data);
+    toast('Token refreshed','ok');
+  }catch(e){
+    toast(e.message,'err');
+  }finally{
+    btnReset('btn-refresh-token');
+  }
+}
+
+async function verifySessionToken(){
+  try{
+    const r=await fetch(API+'/auth/verify',{headers:headers()});
+    const data=await r.json().catch(()=>({detail:'Invalid server response'}));
+    if(!r.ok)throw new Error(data.detail||('Verify failed ('+r.status+')'));
+    if(data && data.valid){
+      AUTH_USERNAME = data.username || AUTH_USERNAME;
+      AUTH_ROLES = Array.isArray(data.roles) ? data.roles : AUTH_ROLES;
+      localStorage.setItem('assessment_auth_username', AUTH_USERNAME || '');
+      localStorage.setItem('assessment_auth_roles', AUTH_ROLES.join(','));
+      updateAuthStatus();
+      toast('Token is valid','ok');
+    }else{
+      toast('Token is invalid','err');
+    }
+  }catch(e){
+    toast(e.message,'err');
+  }
+}
+
+function logout(){
+  ACCESS_TOKEN='';
+  REFRESH_TOKEN='';
+  AUTH_USERNAME='';
+  AUTH_ROLES=[];
+  localStorage.removeItem('assessment_access_token');
+  localStorage.removeItem('assessment_refresh_token');
+  localStorage.removeItem('assessment_auth_username');
+  localStorage.removeItem('assessment_auth_roles');
+  updateAuthStatus();
+  toast('Logged out','ok');
+}
 
 function toast(msg,type){const t=document.getElementById('toast');t.textContent=msg;t.className='toast show toast-'+(type||'ok');setTimeout(()=>t.className='toast',3000);}
 
@@ -679,7 +793,7 @@ function buildRefCard(ref){
 function downloadExcel(){
   if(!_detailTaskId)return;
   const url=API+'/assessments/'+_detailTaskId+'/results/excel';
-  if(JWT){
+  if(ACCESS_TOKEN){
     fetch(url,{headers:headers()}).then(r=>{
       if(!r.ok){
         return r.text().then(txt=>{throw new Error('Download failed ('+r.status+'): '+(txt.substring(0,200)||r.statusText));});
@@ -841,7 +955,15 @@ async function checkHealth(){
     }
     const d=await r.json();
     el.textContent=JSON.stringify(d,null,2);
-    document.getElementById('hdr-info').textContent='RAGFlow: '+d.ragflow_url+' | Auth: '+(d.auth_enabled?'ON':'OFF');
+    const authType=(d.auth_type|| (d.auth_enabled ? 'jwt' : 'disabled'));
+    document.getElementById('hdr-info').textContent='RAGFlow: '+d.ragflow_url+' | Auth: '+authType;
+    const authBar=document.getElementById('auth-bar');
+    if(authBar){
+      authBar.style.display = d.auth_enabled ? 'flex' : 'none';
+      if(!d.auth_enabled){
+        document.getElementById('auth-status').textContent='Authentication disabled';
+      }
+    }
   }catch(e){el.textContent='Error: '+e.message;}
   finally{btn.disabled=false;}
 }
@@ -896,6 +1018,9 @@ function escAttr(s){return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').
 
 // Auto-check health on load
 checkHealth();
+if(ACCESS_TOKEN){
+  verifySessionToken();
+}
 /* ------------------------------------------------------------------ */
 /* Manage Data                                                         */
 /* ------------------------------------------------------------------ */

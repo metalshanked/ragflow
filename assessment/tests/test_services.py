@@ -7,68 +7,88 @@ from __future__ import annotations
 import asyncio
 import io
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import openpyxl
 
-# Mock the database layer and config before importing services
-_fake_settings = MagicMock()
-_fake_settings.ragflow_base_url = "http://test:9380"
-_fake_settings.ragflow_api_key = "test-key"
-_fake_settings.verify_ssl = True
-_fake_settings.ssl_ca_cert = ""
-_fake_settings.polling_interval_seconds = 0.01
-_fake_settings.document_parse_timeout_seconds = 0.1
-_fake_settings.max_concurrent_questions = 2
-_fake_settings.default_chat_name_prefix = "test"
-_fake_settings.default_similarity_threshold = 0.1
-_fake_settings.default_top_n = 8
-_fake_settings.question_id_column = "A"
-_fake_settings.question_column = "B"
-_fake_settings.vendor_response_column = "C"
-_fake_settings.vendor_comment_column = "D"
-_fake_settings.process_vendor_response = False
-_fake_settings.only_cited_references = True
-_fake_settings.database_url = "sqlite+aiosqlite:///./test.db"
-_fake_settings.task_retention_days = 0
-_fake_settings.task_cleanup_interval_hours = 24.0
+import assessment.services as _services_mod
+from assessment.models import (
+    DocumentStatus,
+    PipelineStage,
+    QuestionResult,
+    RagflowContext,
+    Reference,
+    TaskRecord,
+    TaskState,
+    TaskStatus,
+)
+from assessment.services import (
+    _process_questions,
+    add_documents_to_session,
+    build_results_excel,
+    create_task,
+    get_paginated_results,
+    parse_questions_excel,
+    run_assessment_for_session,
+)
 
 _mock_db_save = AsyncMock()
 _mock_db_get = AsyncMock(return_value=None)
 _mock_db_list = AsyncMock(return_value=([], 0))
+_mock_db_add_event = AsyncMock()
+_mock_db_list_events = AsyncMock(return_value=([], 0))
+_TEST_SETTINGS = {
+    "ragflow_base_url": "http://test:9380",
+    "ragflow_api_key": "test-key",
+    "verify_ssl": True,
+    "ssl_ca_cert": "",
+    "polling_interval_seconds": 0.01,
+    "document_parse_timeout_seconds": 0.1,
+    "max_concurrent_questions": 2,
+    "default_chat_name_prefix": "test",
+    "default_similarity_threshold": 0.1,
+    "default_top_n": 8,
+    "question_id_column": "A",
+    "question_column": "B",
+    "vendor_response_column": "C",
+    "vendor_comment_column": "D",
+    "process_vendor_response": False,
+    "only_cited_references": True,
+}
+_ORIGINAL_DB_FUNCS = (
+    _services_mod.db_save_task,
+    _services_mod.db_get_task,
+    _services_mod.db_list_tasks,
+    _services_mod.db_add_task_event,
+    _services_mod.db_list_task_events,
+)
+_ORIGINAL_SETTINGS = {k: getattr(_services_mod.settings, k) for k in _TEST_SETTINGS}
 
-with patch.dict("sys.modules", {
-    "assessment.config": MagicMock(settings=_fake_settings),
-    "assessment.db": MagicMock(
-        db_save_task=_mock_db_save,
-        db_get_task=_mock_db_get,
-        db_list_tasks=_mock_db_list,
-    ),
-}):
-    import assessment.services as _services_mod
-    from assessment.services import (
-        _process_questions,
-        add_documents_to_session,
-        build_results_excel,
-        create_task,
-        get_paginated_results,
-        parse_questions_excel,
-        run_assessment_for_session,
-    )
-    from assessment.models import (
-        DocumentStatus,
-        PipelineStage,
-        QuestionResult,
-        RagflowContext,
-        Reference,
-        TaskRecord,
-        TaskState,
-        TaskStatus,
-    )
+
+def setUpModule():
+    _services_mod.db_save_task = _mock_db_save
+    _services_mod.db_get_task = _mock_db_get
+    _services_mod.db_list_tasks = _mock_db_list
+    _services_mod.db_add_task_event = _mock_db_add_event
+    _services_mod.db_list_task_events = _mock_db_list_events
+    for key, value in _TEST_SETTINGS.items():
+        setattr(_services_mod.settings, key, value)
+
+
+def tearDownModule():
+    (
+        _services_mod.db_save_task,
+        _services_mod.db_get_task,
+        _services_mod.db_list_tasks,
+        _services_mod.db_add_task_event,
+        _services_mod.db_list_task_events,
+    ) = _ORIGINAL_DB_FUNCS
+    for key, value in _ORIGINAL_SETTINGS.items():
+        setattr(_services_mod.settings, key, value)
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 def _make_excel(rows: list[tuple]) -> bytes:
@@ -249,6 +269,7 @@ class TestCreateTask(unittest.TestCase):
 
     def test_creates_record(self):
         _mock_db_save.reset_mock()
+        _mock_db_add_event.reset_mock()
         questions = [{"serial_no": 1, "question": "Test?"}]
         record = _run(create_task(questions))
         self.assertIsInstance(record, TaskRecord)
@@ -257,11 +278,14 @@ class TestCreateTask(unittest.TestCase):
         self.assertEqual(record.status.total_questions, 1)
         self.assertEqual(record.questions, questions)
         _mock_db_save.assert_called_once()
+        _mock_db_add_event.assert_called_once()
 
     def test_creates_with_custom_state(self):
         _mock_db_save.reset_mock()
+        _mock_db_add_event.reset_mock()
         record = _run(create_task([], state=TaskState.AWAITING_DOCUMENTS))
         self.assertEqual(record.status.state, TaskState.AWAITING_DOCUMENTS)
+        _mock_db_add_event.assert_called_once()
 
 
 class TestGetPaginatedResults(unittest.TestCase):
@@ -630,6 +654,16 @@ class TestListTasks(unittest.TestCase):
         _mock_db_list.return_value = ([], 0)
         _run(_services_mod.list_tasks())
         _mock_db_list.assert_called_with(1, 50)
+
+
+class TestListTaskEvents(unittest.TestCase):
+    """list_task_events should propagate pagination params to DB layer."""
+
+    def test_propagates_params(self):
+        _mock_db_list_events.reset_mock()
+        _mock_db_list_events.return_value = ([], 0)
+        _run(_services_mod.list_task_events("task-1", page=2, page_size=25))
+        _mock_db_list_events.assert_called_with("task-1", 2, 25)
 
 
 if __name__ == "__main__":

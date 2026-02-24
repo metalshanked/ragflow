@@ -14,13 +14,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .config import settings
+from .auth import auth_router
+from .observability import configure_logging, init_telemetry, shutdown_telemetry
 from .routers import router
 from .ui import router as ui_router
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-)
+configure_logging()
 
 # Normalise base path: strip trailing slash, ensure leading slash if set
 _raw_base = settings.api_base_path.strip().rstrip("/")
@@ -49,7 +48,9 @@ app.add_middleware(
 )
 
 app.include_router(router)
+app.include_router(auth_router)
 app.include_router(ui_router)
+init_telemetry(app)
 
 
 @app.exception_handler(Exception)
@@ -89,6 +90,11 @@ async def _startup() -> None:
         asyncio.create_task(_cleanup_loop())
 
 
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    shutdown_telemetry()
+
+
 @app.get("/health")
 async def health():
     return {
@@ -96,6 +102,12 @@ async def health():
         "ragflow_url": settings.ragflow_base_url,
         "base_path": _raw_base or "/",
         "auth_enabled": bool(settings.jwt_secret_key),
+        "ldap_enabled": bool(settings.ldap_server_uri),
+        "auth_type": "ldap" if settings.ldap_server_uri else ("jwt" if settings.jwt_secret_key else "disabled"),
+        "otel_enabled": settings.otel_enabled,
+        "otel_endpoint": settings.otel_exporter_otlp_endpoint or settings.otel_exporter_otlp_traces_endpoint,
+        "log_file_enabled": settings.log_file_enabled,
+        "log_dir": settings.log_dir if settings.log_file_enabled else None,
     }
 
 
