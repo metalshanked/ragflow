@@ -605,9 +605,9 @@
 							]
 						},
 						"url": {
-							"raw": "{{base_url}}{{base_path}}/api/v1/documents/upload",
+							"raw": "{{base_url}}{{base_path}}/api/v1/ragflow/documents/upload",
 							"host": ["{{base_url}}{{base_path}}"],
-							"path": ["api", "v1", "documents", "upload"]
+							"path": ["api", "v1", "ragflow", "documents", "upload"]
 						},
 						"description": "Upload one or more documents to an existing RAGFlow dataset (not tied to an assessment session).\n\nOptionally triggers parsing immediately."
 					},
@@ -617,9 +617,9 @@
 							"originalRequest": {
 								"method": "POST",
 								"url": {
-									"raw": "{{base_url}}{{base_path}}/api/v1/documents/upload",
+									"raw": "{{base_url}}{{base_path}}/api/v1/ragflow/documents/upload",
 									"host": ["{{base_url}}{{base_path}}"],
-									"path": ["api", "v1", "documents", "upload"]
+									"path": ["api", "v1", "ragflow", "documents", "upload"]
 								}
 							},
 							"status": "OK",

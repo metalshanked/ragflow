@@ -16,6 +16,11 @@ Two-phase workflow:
 
 Proxy (RAGFlow resource passthrough):
   *      /api/v1/ragflow/{path}                          - Direct official RAGFlow API passthrough
+  POST   /api/v1/ragflow/documents/upload                - Upload documents to an existing dataset
+  GET    /api/v1/ragflow/datasets                        - List datasets
+  DELETE /api/v1/ragflow/datasets                        - Delete datasets
+  GET    /api/v1/ragflow/datasets/{dataset_id}/documents - List dataset documents
+  DELETE /api/v1/ragflow/datasets/{dataset_id}/documents - Delete dataset documents
   GET    /api/v1/proxy/image/{image_id}                   - Proxy RAGFlow chunk image
   GET    /api/v1/proxy/document/{document_id}             - Proxy RAGFlow document
 
@@ -24,7 +29,6 @@ Common:
   GET    /api/v1/assessments/{task_id}                    - Get task status
   GET    /api/v1/assessments/{task_id}/results             - Get results (JSON, paginated)
   GET    /api/v1/assessments/{task_id}/results/excel       - Download results as Excel
-    POST   /api/v1/assessments/documents/upload            - Upload documents (standalone)
 """
 
 from __future__ import annotations
@@ -190,47 +194,6 @@ async def _request_ragflow_official(
         raise HTTPException(status_code=504, detail="RAGFlow server timed out")
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Error communicating with RAGFlow: {exc}")
-
-
-@router.api_route(
-    "/ragflow/{ragflow_path:path}",
-    methods=_PASSTHROUGH_METHODS,
-)
-async def ragflow_official_passthrough(ragflow_path: str, request: Request):
-    """
-    Direct passthrough to official RAGFlow `/api/v1/*` endpoints.
-
-    Example:
-      GET /api/v1/ragflow/datasets?page=1&page_size=20
-      -> GET {ragflow_base_url}/api/v1/datasets?page=1&page_size=20
-    """
-    method = request.method.upper()
-    body = await request.body()
-
-    # Keep caller content negotiation headers, but always use configured
-    # RAGFlow API key for upstream authentication.
-    extra_headers: dict[str, str] = {}
-    for header_name in ("content-type", "accept"):
-        if header_name in request.headers:
-            extra_headers[header_name] = request.headers[header_name]
-
-    resp = await _request_ragflow_official(
-        method,
-        ragflow_path,
-        params=list(request.query_params.multi_items()),
-        content=body,
-        extra_headers=extra_headers,
-        timeout=300.0,
-    )
-
-    return Response(
-        content=resp.content,
-        status_code=resp.status_code,
-        headers={
-            **_copy_passthrough_headers(resp.headers),
-            "Content-Type": resp.headers.get("content-type", "application/octet-stream"),
-        },
-    )
 
 
 # ===========================================================================
@@ -807,10 +770,10 @@ async def proxy_document(document_id: str):
 
 
 # ---------------------------------------------------------------------------
-# POST /assessments/documents/upload  –  Standalone document upload
+# POST /ragflow/documents/upload  –  Standalone document upload
 # ---------------------------------------------------------------------------
 
-@router.post("/assessments/documents/upload")
+@router.post("/ragflow/documents/upload", tags=["ragflow-passthrough"])
 async def upload_documents(
     dataset_id: str = Form(..., description="Existing RAGFlow dataset ID"),
     files: list[UploadFile] = File(..., description="Documents to upload"),
@@ -875,7 +838,7 @@ class DeleteDocumentsRequest(BaseModel):
     ids: list[str]
 
 
-@router.get("/datasets", tags=["ragflow-passthrough"])
+@router.get("/ragflow/datasets", tags=["ragflow-passthrough"])
 async def list_datasets(
     page: int = Query(1, ge=1),
     page_size: int = Query(100, ge=1),
@@ -921,14 +884,14 @@ async def list_datasets(
     }
 
 
-@router.delete("/datasets", tags=["ragflow-passthrough"])
+@router.delete("/ragflow/datasets", tags=["ragflow-passthrough"])
 async def delete_datasets(req: DeleteDatasetsRequest):
     resp = await _request_ragflow_official("DELETE", "datasets", json_body={"ids": req.ids})
     _parse_ragflow_json_or_raise(resp)
     return {"message": "Datasets deleted"}
 
 
-@router.get("/datasets/{dataset_id}/documents", tags=["ragflow-passthrough"])
+@router.get("/ragflow/datasets/{dataset_id}/documents", tags=["ragflow-passthrough"])
 async def list_documents(
     dataset_id: str,
     page: int = Query(1, ge=1),
@@ -973,7 +936,7 @@ async def list_documents(
     }
 
 
-@router.delete("/datasets/{dataset_id}/documents", tags=["ragflow-passthrough"])
+@router.delete("/ragflow/datasets/{dataset_id}/documents", tags=["ragflow-passthrough"])
 async def delete_documents(dataset_id: str, req: DeleteDocumentsRequest):
     resp = await _request_ragflow_official(
         "DELETE",
@@ -982,3 +945,44 @@ async def delete_documents(dataset_id: str, req: DeleteDocumentsRequest):
     )
     _parse_ragflow_json_or_raise(resp)
     return {"message": "Documents deleted"}
+
+@router.api_route(
+    "/ragflow/{ragflow_path:path}",
+    methods=_PASSTHROUGH_METHODS,
+    tags=["ragflow-passthrough"],
+)
+async def ragflow_official_passthrough(ragflow_path: str, request: Request):
+    """
+    Direct passthrough to official RAGFlow `/api/v1/*` endpoints.
+
+    Example:
+      GET /api/v1/ragflow/chats?page=1&page_size=20
+      -> GET {ragflow_base_url}/api/v1/chats?page=1&page_size=20
+    """
+    method = request.method.upper()
+    body = await request.body()
+
+    # Keep caller content negotiation headers, but always use configured
+    # RAGFlow API key for upstream authentication.
+    extra_headers: dict[str, str] = {}
+    for header_name in ("content-type", "accept"):
+        if header_name in request.headers:
+            extra_headers[header_name] = request.headers[header_name]
+
+    resp = await _request_ragflow_official(
+        method,
+        ragflow_path,
+        params=list(request.query_params.multi_items()),
+        content=body,
+        extra_headers=extra_headers,
+        timeout=300.0,
+    )
+
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        headers={
+            **_copy_passthrough_headers(resp.headers),
+            "Content-Type": resp.headers.get("content-type", "application/octet-stream"),
+        },
+    )

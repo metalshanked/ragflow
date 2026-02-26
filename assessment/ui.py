@@ -931,7 +931,7 @@ async function uploadDocs(){
   fd.append('dataset_id',dsid);
   for(const f of files)fd.append('files',f);
   fd.append('parse',document.getElementById('up-parse').checked?'true':'false');
-  const ok=await postForm(API+'/documents/upload',fd,'up-result','btn-upload');
+  const ok=await postForm(API+'/ragflow/documents/upload',fd,'up-result','btn-upload');
   if(ok) btnDone('btn-upload'); else btnError('btn-upload');
 }
 
@@ -1032,7 +1032,7 @@ async function loadDatasets(page=1){
   const div = document.getElementById('manage-datasets-list');
   div.innerHTML = '<span class="spinner spinner-dark"></span> Loading...';
   try {
-    const res = await fetch(`${API}/datasets?page=${dsPage}&page_size=${dsPageSize}`, { headers: headers() });
+    const res = await fetch(`${API}/ragflow/datasets?page=${dsPage}&page_size=${dsPageSize}`, { headers: headers() });
     if(!res.ok) throw new Error('Failed to load datasets');
     const data = await res.json();
     
@@ -1081,7 +1081,7 @@ async function deleteSelectedDatasets(){
   if(!confirm(`Delete ${ids.length} datasets? This cannot be undone.`)) return;
   
   try {
-    const res = await fetch(API + '/datasets', {
+    const res = await fetch(API + '/ragflow/datasets', {
       method: 'DELETE',
       headers: {...headers(), 'Content-Type': 'application/json'},
       body: JSON.stringify({ids: ids})
@@ -1102,7 +1102,7 @@ async function loadDocuments(page=1){
   const div = document.getElementById('manage-documents-list');
   div.innerHTML = '<span class="spinner spinner-dark"></span> Loading...';
   try {
-    const res = await fetch(`${API}/datasets/${dsId}/documents?page=${docPage}&page_size=${docPageSize}`, { headers: headers() });
+    const res = await fetch(`${API}/ragflow/datasets/${dsId}/documents?page=${docPage}&page_size=${docPageSize}`, { headers: headers() });
     if(!res.ok) throw new Error('Failed to load documents');
     const data = await res.json();
     
@@ -1153,7 +1153,7 @@ async function deleteSelectedDocuments(){
   if(!confirm(`Delete ${ids.length} documents? This cannot be undone.`)) return;
 
   try {
-    const res = await fetch(`${API}/datasets/${dsId}/documents`, {
+    const res = await fetch(`${API}/ragflow/datasets/${dsId}/documents`, {
       method: 'DELETE',
       headers: {...headers(), 'Content-Type': 'application/json'},
       body: JSON.stringify({ids: ids})
