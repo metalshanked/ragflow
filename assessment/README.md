@@ -378,7 +378,7 @@ Role permissions:
 
 - `viewer`: read-only API usage (`GET`/`HEAD`/`OPTIONS`)
 - `operator`: everything in `viewer` plus write/execute flows (`POST`/`PUT`/`PATCH`) for assessment operations
-- `admin`: full access, including destructive endpoints (`DELETE`) and direct RAGFlow passthrough (`/api/v1/ragflow/*`)
+- `admin`: full access, including destructive endpoints (`DELETE`) and direct native passthrough (`/api/v1/native/*`)
 
 ### Legacy Manual JWT
 
@@ -687,7 +687,7 @@ Proxies document downloads from RAGFlow. Reference `document_url` fields point h
 #### Upload Documents (Standalone)
 
 ```
-POST /api/v1/ragflow/documents/upload
+POST /api/v1/native/documents/upload
 Content-Type: multipart/form-data
 ```
 
@@ -741,26 +741,26 @@ Manage datasets and documents programmatically.
 
 **List Datasets:**
 ```
-GET /api/v1/ragflow/datasets?page=1&page_size=100&name=optional_filter
+GET /api/v1/native/datasets?page=1&page_size=100&name=optional_filter
 ```
 Returns `{"items": [...], "total": N}`.
 
 **Delete Datasets:**
 ```
-DELETE /api/v1/ragflow/datasets
+DELETE /api/v1/native/datasets
 Content-Type: application/json
 { "ids": ["dataset_id_1", "dataset_id_2"] }
 ```
 
 **List Documents:**
 ```
-GET /api/v1/ragflow/datasets/{dataset_id}/documents?page=1&page_size=100
+GET /api/v1/native/datasets/{dataset_id}/documents?page=1&page_size=100
 ```
 Returns `{"items": [...], "total": N}`.
 
 **Delete Documents:**
 ```
-DELETE /api/v1/ragflow/datasets/{dataset_id}/documents
+DELETE /api/v1/native/datasets/{dataset_id}/documents
 Content-Type: application/json
 { "ids": ["doc_id_1", "doc_id_2"] }
 ```
@@ -1098,7 +1098,7 @@ The assessment pipeline is optimized for throughput at every stage:
 | **Question processing** | Concurrent question processing with semaphore-controlled parallelism |
 | **Progress persistence** | Batched DB writes — progress is persisted every 5 questions (and always on the final question), reducing DB round-trips by ~80% while still providing timely updates |
 | **Resource cleanup** | When stale datasets or chat assistants need deletion (e.g. `ensure_dataset`, `ensure_chat`), deletions run concurrently via `asyncio.gather` |
-| **Standalone uploads** | The `POST /ragflow/documents/upload` endpoint also uploads files concurrently |
+| **Standalone uploads** | The `POST /native/documents/upload` endpoint also uploads files concurrently |
 
 ## Scaling Considerations
 

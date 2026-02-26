@@ -15,12 +15,12 @@ Two-phase workflow:
   POST   /api/v1/assessments/sessions/{task_id}/start     - Trigger assessment
 
 Proxy (RAGFlow resource passthrough):
-  *      /api/v1/ragflow/{path}                          - Direct official RAGFlow API passthrough
-  POST   /api/v1/ragflow/documents/upload                - Upload documents to an existing dataset
-  GET    /api/v1/ragflow/datasets                        - List datasets
-  DELETE /api/v1/ragflow/datasets                        - Delete datasets
-  GET    /api/v1/ragflow/datasets/{dataset_id}/documents - List dataset documents
-  DELETE /api/v1/ragflow/datasets/{dataset_id}/documents - Delete dataset documents
+  *      /api/v1/native/{path}                           - Direct official RAGFlow API passthrough
+  POST   /api/v1/native/documents/upload                 - Upload documents to an existing dataset
+  GET    /api/v1/native/datasets                         - List datasets
+  DELETE /api/v1/native/datasets                         - Delete datasets
+  GET    /api/v1/native/datasets/{dataset_id}/documents  - List dataset documents
+  DELETE /api/v1/native/datasets/{dataset_id}/documents  - Delete dataset documents
   GET    /api/v1/proxy/image/{image_id}                   - Proxy RAGFlow chunk image
   GET    /api/v1/proxy/document/{document_id}             - Proxy RAGFlow document
 
@@ -770,10 +770,10 @@ async def proxy_document(document_id: str):
 
 
 # ---------------------------------------------------------------------------
-# POST /ragflow/documents/upload  –  Standalone document upload
+# POST /native/documents/upload  –  Standalone document upload
 # ---------------------------------------------------------------------------
 
-@router.post("/ragflow/documents/upload", tags=["ragflow-passthrough"])
+@router.post("/native/documents/upload", tags=["native-passthrough"])
 async def upload_documents(
     dataset_id: str = Form(..., description="Existing RAGFlow dataset ID"),
     files: list[UploadFile] = File(..., description="Documents to upload"),
@@ -838,7 +838,7 @@ class DeleteDocumentsRequest(BaseModel):
     ids: list[str]
 
 
-@router.get("/ragflow/datasets", tags=["ragflow-passthrough"])
+@router.get("/native/datasets", tags=["native-passthrough"])
 async def list_datasets(
     page: int = Query(1, ge=1),
     page_size: int = Query(100, ge=1),
@@ -884,14 +884,14 @@ async def list_datasets(
     }
 
 
-@router.delete("/ragflow/datasets", tags=["ragflow-passthrough"])
+@router.delete("/native/datasets", tags=["native-passthrough"])
 async def delete_datasets(req: DeleteDatasetsRequest):
     resp = await _request_ragflow_official("DELETE", "datasets", json_body={"ids": req.ids})
     _parse_ragflow_json_or_raise(resp)
     return {"message": "Datasets deleted"}
 
 
-@router.get("/ragflow/datasets/{dataset_id}/documents", tags=["ragflow-passthrough"])
+@router.get("/native/datasets/{dataset_id}/documents", tags=["native-passthrough"])
 async def list_documents(
     dataset_id: str,
     page: int = Query(1, ge=1),
@@ -936,7 +936,7 @@ async def list_documents(
     }
 
 
-@router.delete("/ragflow/datasets/{dataset_id}/documents", tags=["ragflow-passthrough"])
+@router.delete("/native/datasets/{dataset_id}/documents", tags=["native-passthrough"])
 async def delete_documents(dataset_id: str, req: DeleteDocumentsRequest):
     resp = await _request_ragflow_official(
         "DELETE",
@@ -947,16 +947,16 @@ async def delete_documents(dataset_id: str, req: DeleteDocumentsRequest):
     return {"message": "Documents deleted"}
 
 @router.api_route(
-    "/ragflow/{ragflow_path:path}",
+    "/native/{ragflow_path:path}",
     methods=_PASSTHROUGH_METHODS,
-    tags=["ragflow-passthrough"],
+    tags=["native-passthrough"],
 )
 async def ragflow_official_passthrough(ragflow_path: str, request: Request):
     """
     Direct passthrough to official RAGFlow `/api/v1/*` endpoints.
 
     Example:
-      GET /api/v1/ragflow/chats?page=1&page_size=20
+      GET /api/v1/native/chats?page=1&page_size=20
       -> GET {ragflow_base_url}/api/v1/chats?page=1&page_size=20
     """
     method = request.method.upper()

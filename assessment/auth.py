@@ -160,7 +160,7 @@ def _required_roles_for_request(method: str, path: str) -> set[str]:
     m = method.upper()
     p = path.lower()
 
-    if "/api/v1/ragflow/" in p:
+    if "/api/v1/native/" in p:
         return {ROLE_ADMIN}
 
     if m == "DELETE":

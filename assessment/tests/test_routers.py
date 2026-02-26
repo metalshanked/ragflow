@@ -52,7 +52,7 @@ def test_ragflow_passthrough_forwards_request_and_response():
             mocked = AsyncMock(return_value=upstream)
             with patch("assessment.routers._request_ragflow_official", mocked):
                 resp = client.post(
-                    "/api/v1/ragflow/chats?page=2&page_size=5",
+                    "/api/v1/native/chats?page=2&page_size=5",
                     data=b'{"name":"ds"}',
                     headers={
                         "Content-Type": "application/json",
@@ -88,7 +88,7 @@ def test_list_datasets_uses_passthrough_helper():
                 )
             )
             with patch("assessment.routers._request_ragflow_official", mocked):
-                resp = client.get("/api/v1/ragflow/datasets?page=3&page_size=10&name=abc")
+                resp = client.get("/api/v1/native/datasets?page=3&page_size=10&name=abc")
 
             assert resp.status_code == 200
             assert resp.json() == {
@@ -115,7 +115,7 @@ def test_list_datasets_name_not_found_permission_error_returns_empty():
                 )
             )
             with patch("assessment.routers._request_ragflow_official", mocked):
-                resp = client.get("/api/v1/ragflow/datasets?name=missing")
+                resp = client.get("/api/v1/native/datasets?name=missing")
 
             assert resp.status_code == 200
             assert resp.json() == {
@@ -147,7 +147,7 @@ def test_list_documents_uses_passthrough_and_normalizes_status():
                 )
             )
             with patch("assessment.routers._request_ragflow_official", mocked):
-                resp = client.get("/api/v1/ragflow/datasets/ds-1/documents?page=2&page_size=2")
+                resp = client.get("/api/v1/native/datasets/ds-1/documents?page=2&page_size=2")
 
             assert resp.status_code == 200
             payload = resp.json()
@@ -168,12 +168,12 @@ def test_delete_dataset_and_documents_use_passthrough_helper():
             with patch("assessment.routers._request_ragflow_official", mocked):
                 ds_resp = client.request(
                     "DELETE",
-                    "/api/v1/ragflow/datasets",
+                    "/api/v1/native/datasets",
                     json={"ids": ["ds-1"]},
                 )
                 doc_resp = client.request(
                     "DELETE",
-                    "/api/v1/ragflow/datasets/ds-1/documents",
+                    "/api/v1/native/datasets/ds-1/documents",
                     json={"ids": ["doc-1"]},
                 )
 

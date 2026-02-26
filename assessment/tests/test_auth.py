@@ -42,8 +42,8 @@ def make_app() -> FastAPI:
     async def protected_delete(_: dict | None = Depends(auth.verify_jwt)):
         return {"ok": True}
 
-    @app.get("/api/v1/ragflow/test-endpoint")
-    async def protected_ragflow(_: dict | None = Depends(auth.verify_jwt)):
+    @app.get("/api/v1/native/test-endpoint")
+    async def protected_native(_: dict | None = Depends(auth.verify_jwt)):
         return {"ok": True}
 
     return app
@@ -123,7 +123,7 @@ def test_auth_token_verify_refresh_happy_path():
                 assert set(refresh_data["roles"]) == {"viewer", "operator"}
 
 
-def test_rbac_for_viewer_operator_admin_and_ragflow_passthrough():
+def test_rbac_for_viewer_operator_admin_and_native_passthrough():
     app = make_app()
     with TestClient(app) as client:
         with override_settings(
@@ -142,17 +142,17 @@ def test_rbac_for_viewer_operator_admin_and_ragflow_passthrough():
             assert client.get("/api/v1/protected-read", headers=viewer_h).status_code == 200
             assert client.post("/api/v1/protected-write", headers=viewer_h).status_code == 403
             assert client.delete("/api/v1/protected-delete", headers=viewer_h).status_code == 403
-            assert client.get("/api/v1/ragflow/test-endpoint", headers=viewer_h).status_code == 403
+            assert client.get("/api/v1/native/test-endpoint", headers=viewer_h).status_code == 403
 
             assert client.get("/api/v1/protected-read", headers=operator_h).status_code == 200
             assert client.post("/api/v1/protected-write", headers=operator_h).status_code == 200
             assert client.delete("/api/v1/protected-delete", headers=operator_h).status_code == 403
-            assert client.get("/api/v1/ragflow/test-endpoint", headers=operator_h).status_code == 403
+            assert client.get("/api/v1/native/test-endpoint", headers=operator_h).status_code == 403
 
             assert client.get("/api/v1/protected-read", headers=admin_h).status_code == 200
             assert client.post("/api/v1/protected-write", headers=admin_h).status_code == 200
             assert client.delete("/api/v1/protected-delete", headers=admin_h).status_code == 200
-            assert client.get("/api/v1/ragflow/test-endpoint", headers=admin_h).status_code == 200
+            assert client.get("/api/v1/native/test-endpoint", headers=admin_h).status_code == 200
 
 
 def test_legacy_token_without_roles_allowed_when_ldap_disabled():
