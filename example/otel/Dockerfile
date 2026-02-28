@@ -383,17 +383,41 @@
 
 FROM infiniflow/ragflow:v0.24.0
 ARG INSTALL_DOCLING=0
-ARG UV_PIP_INDEX_URL=https://artifactor.cera.com/api/pypi/pypi/simple
+ARG UV_PIP_INDEX_URL=https://pypi.org/simple
+# Company mirror example: https://artifactor.cera.com/api/pypi/pypi/simple
+ARG APT_MIRROR_URL=https://archive.ubuntu.com/ubuntu
+# Company mirror example: https://artifactory.cera.com/ubuntu-apt/ubuntu
+ARG MAVEN_REPO_BASE_URL=https://repo1.maven.org/maven2
+# Company mirror example: https://artifactory.cera.com/iq-maven-central-proxy
+ARG NODEJS_ORG_MIRROR=https://nodejs.org
+# Company mirror example: https://artifactory.cera.com/nodejs-proxy
+ARG NPM_REGISTRY_URL=https://registry.npmjs.org
+# Company mirror example: https://artifactory.cera.com/api/npm/npm
+ARG NODE_VERSION=24.13.0
+ARG NODE_EXTRA_CA_CERT_PEM_B64=""
 
 # Global uv package index for all installs in this Dockerfile.
 # Override at build time to use a custom mirror:
 #   --build-arg UV_PIP_INDEX_URL=https://pypi.org/simple
+#   --build-arg APT_MIRROR_URL=https://archive.ubuntu.com/ubuntu
+#   --build-arg MAVEN_REPO_BASE_URL=https://repo1.maven.org/maven2
+#   --build-arg NODEJS_ORG_MIRROR=https://nodejs.org
+#   --build-arg NPM_REGISTRY_URL=https://registry.npmjs.org
+#   --build-arg NODE_VERSION=24.13.0
+#   --build-arg NODE_EXTRA_CA_CERT_PEM_B64=<base64_pem>
 # Exports both env var names for compatibility across uv versions.
 ENV UV_NO_CONFIG=1 \
     UV_INDEX_STRATEGY=first-index \
     UV_DEFAULT_INDEX=${UV_PIP_INDEX_URL} \
     UV_INDEX_URL=${UV_PIP_INDEX_URL} \
     PIP_INDEX_URL=${UV_PIP_INDEX_URL}
+
+# Central mirror controls for security remediation steps.
+ENV APT_MIRROR_URL=${APT_MIRROR_URL} \
+    MAVEN_REPO_BASE_URL=${MAVEN_REPO_BASE_URL} \
+    NODEJS_ORG_MIRROR=${NODEJS_ORG_MIRROR} \
+    NPM_REGISTRY_URL=${NPM_REGISTRY_URL} \
+    NODE_VERSION=${NODE_VERSION}
 
 
 # Use C.UTF-8 by default because en_US.UTF-8 may not exist without locale packages.
@@ -1281,6 +1305,7 @@ RUN case "${INSTALL_DOCLING}" in \
       *) \
         echo "Skipping docling install (INSTALL_DOCLING=${INSTALL_DOCLING})" ;; \
     esac
+
 #
 #    (Optional) Add more instrumentations if needed, e.g.:
 #      opentelemetry-instrumentation-grpc \
@@ -1508,4 +1533,150 @@ RUN sed -i '/except Exception as ex:/{n;/Failed to add/s/        logging.critica
 ##    Standard OTel Redis instrumentation targets the 'redis' library.
 ##    We manually trigger the RedisInstrumentor on the 'valkey' module.
 #RUN sed -i '/import valkey as redis/a try:\n    import sys\n    sys.modules["redis"] = redis\n    from opentelemetry.instrumentation.redis import RedisInstrumentor\n    print("OTEL: Attempting to instrument Valkey (Redis)...")\n    RedisInstrumentor().instrument(redis_module=redis)\n    print("OTEL: Valkey instrumented successfully")\nexcept Exception as e:\n    print(f"OTEL: Valkey instrumentation failed: {e}")' /ragflow/rag/utils/redis_conn.py
+
+# 12. Security and compliance remediation bundle (single maintenance section):
+#    Keep this block updated as new Prisma findings arrive.
+#    - OS/OpenSSL refresh (keeping legacy libssl1.1 for base-image compatibility)
+#    - Node.js runtime refresh from NODEJS_ORG_MIRROR (fixes Node engine CVEs)
+#    - Apache Tika jar refresh (inherits newer jackson-core chain)
+#    - Targeted Python package minimum versions for known CVEs
+RUN set -eux; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    APT_MIRROR_HOST="$(echo "${APT_MIRROR_URL}" | sed -E 's#https?://([^/]+)/?.*#\1#')"; \
+    APT_EXTRA_OPTS="-o Acquire::https::${APT_MIRROR_HOST}::Verify-Peer=false -o Acquire::Check-Valid-Until=false"; \
+    if [ -f /etc/apt/sources.list ]; then \
+      sed -i "s#https\\{0,1\\}://\\(us\\.\\)\\{0,1\\}security.ubuntu.com/ubuntu/\\{0,1\\}#${APT_MIRROR_URL}#g" /etc/apt/sources.list; \
+      sed -i "s#https\\{0,1\\}://\\(us\\.\\)\\{0,1\\}archive.ubuntu.com/ubuntu/\\{0,1\\}#${APT_MIRROR_URL}#g" /etc/apt/sources.list; \
+    fi; \
+    if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
+      sed -i -E "s#^URIs: .*#URIs: ${APT_MIRROR_URL}#g" /etc/apt/sources.list.d/ubuntu.sources; \
+    fi; \
+    apt-get update ${APT_EXTRA_OPTS}; \
+    apt-get install -y ${APT_EXTRA_OPTS} --no-install-recommends ca-certificates; \
+    apt-get -y ${APT_EXTRA_OPTS} -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" upgrade; \
+    NEED_PKGS=""; \
+    command -v curl >/dev/null 2>&1 || NEED_PKGS="${NEED_PKGS} curl"; \
+    if [ -n "${NEED_PKGS}" ]; then apt-get install -y ${APT_EXTRA_OPTS} --no-install-recommends ${NEED_PKGS}; fi; \
+    apt-get install -y ${APT_EXTRA_OPTS} --no-install-recommends openssl libcap2-bin xz-utils; \
+    NODE_CA_CERT_FILE="/usr/local/share/ca-certificates/cera-root-node-extra.crt"; \
+    if [ -n "${NODE_EXTRA_CA_CERT_PEM_B64}" ]; then \
+      echo "${NODE_EXTRA_CA_CERT_PEM_B64}" | base64 -d > "${NODE_CA_CERT_FILE}"; \
+      update-ca-certificates; \
+      export NODE_EXTRA_CA_CERTS="${NODE_CA_CERT_FILE}"; \
+    fi; \
+    NODE_ARCH="$(uname -m)"; \
+    if [ "${NODE_ARCH}" = "x86_64" ]; then NODE_ARCH="x64"; \
+    elif [ "${NODE_ARCH}" = "aarch64" ]; then NODE_ARCH="arm64"; \
+    else echo "Unsupported Node architecture: ${NODE_ARCH}" >&2; exit 1; fi; \
+    NODE_DIST_URL="${NODEJS_ORG_MIRROR%/}/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz"; \
+    curl -fsSL "${NODE_DIST_URL}" -o /tmp/node.tar.xz; \
+    rm -rf /opt/node && mkdir -p /opt/node; \
+    tar -xJf /tmp/node.tar.xz -C /opt/node --strip-components=1; \
+    ln -sf /opt/node/bin/node /usr/local/bin/node; \
+    ln -sf /opt/node/bin/npm /usr/local/bin/npm; \
+    ln -sf /opt/node/bin/npx /usr/local/bin/npx; \
+    npm config set registry "${NPM_REGISTRY_URL}" --location=global; \
+    npm install -g npm@latest; \
+    rm -f /tmp/node.tar.xz; \
+    apt-get autoremove -y; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    TIKA_BASE_URL="${MAVEN_REPO_BASE_URL%/}/org/apache/tika/tika-server-standard"; \
+    TIKA_VERSION="$(curl -fsSL "${TIKA_BASE_URL}/maven-metadata.xml" | sed -n 's:.*<release>\(.*\)</release>.*:\1:p' | head -n1)"; \
+    test -n "${TIKA_VERSION}"; \
+    curl -fsSLo "/ragflow/tika-server-standard-${TIKA_VERSION}.jar" \
+        "${TIKA_BASE_URL}/${TIKA_VERSION}/tika-server-standard-${TIKA_VERSION}.jar"; \
+    ln -sf "/ragflow/tika-server-standard-${TIKA_VERSION}.jar" /ragflow/tika-server-standard.jar; \
+    rm -f /ragflow/tika-server-standard-3.2.3.jar /ragflow/tika-server-standard-3.2.3.jar.md5
+
+ENV TIKA_SERVER_JAR="file:///ragflow/tika-server-standard.jar"
+
+RUN python3 - <<'PY'
+import importlib.metadata as md
+import os
+import subprocess
+
+fixed_min_versions = {
+    "crawl4ai": "0.8.0",
+    "nltk": "3.9.3",
+    "jaraco.context": "6.1.0",
+    "pdfminer.six": "20251230",
+    "protobuf": "5.29.6",
+    "google-cloud-aiplatform": "1.133.0",
+    "mcp": "1.23.0",
+    "pillow": "12.1.1",
+    "python-multipart": "0.0.22",
+    "pyasn1": "0.6.2",
+    "azure-core": "1.38.0",
+}
+
+to_upgrade = []
+for pkg, min_ver in fixed_min_versions.items():
+    try:
+        md.version(pkg)
+    except md.PackageNotFoundError:
+        continue
+    to_upgrade.append(f"{pkg}>={min_ver}")
+
+if to_upgrade:
+    cmd = [
+        "uv",
+        "pip",
+        "install",
+        "--no-config",
+        "--default-index",
+        os.environ["UV_PIP_INDEX_URL"],
+        "--index-strategy",
+        "first-index",
+        "--no-cache",
+        "--upgrade",
+        *to_upgrade,
+    ]
+    print("Applying security upgrades:", ", ".join(to_upgrade))
+    subprocess.check_call(cmd)
+else:
+    print("No targeted vulnerable Python packages are installed; skipping upgrade step.")
+PY
+
+# 13. Compliance hardening:
+#    - remove bundled private keys from the image filesystem
+#    - generate runtime RSA keypair on container startup (instead of baking private keys in image)
+#    - run as a non-root user by default
+RUN set -eux; \
+    rm -f /ragflow/conf/private.pem /ragflow/conf/public.pem; \
+    find /ragflow/.venv/lib -type f -path '*/site-packages/future/backports/test/*' \( -name '*.pem' -o -name '*.key' \) -delete; \
+    find /ragflow/.venv/lib -type f -path '*/site-packages/seleniumwire/ca.key' -delete
+
+RUN cat > /usr/local/bin/ragflow-secure-entrypoint <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+KEY_DIR="/ragflow/conf"
+PRIVATE_KEY="${KEY_DIR}/private.pem"
+PUBLIC_KEY="${KEY_DIR}/public.pem"
+
+if [[ ! -s "${PRIVATE_KEY}" || ! -s "${PUBLIC_KEY}" ]]; then
+    mkdir -p "${KEY_DIR}"
+    openssl genrsa -des3 -passout pass:Welcome -out "${PRIVATE_KEY}" 2048 >/dev/null 2>&1
+    openssl rsa -in "${PRIVATE_KEY}" -passin pass:Welcome -pubout -out "${PUBLIC_KEY}" >/dev/null 2>&1
+    chmod 600 "${PRIVATE_KEY}"
+    chmod 644 "${PUBLIC_KEY}"
+fi
+
+exec /ragflow/entrypoint.sh "$@"
+EOF
+
+RUN set -eux; \
+    chmod +x /usr/local/bin/ragflow-secure-entrypoint; \
+    if ! getent group ragflow >/dev/null; then groupadd --system --gid 10001 ragflow; fi; \
+    if ! id -u ragflow >/dev/null 2>&1; then useradd --system --uid 10001 --gid 10001 --home-dir /ragflow --shell /usr/sbin/nologin ragflow; fi; \
+    sed -i 's/^user[[:space:]]\+root;/user ragflow;/' /etc/nginx/nginx.conf; \
+    mkdir -p /ragflow/logs /ragflow/conf /var/cache/nginx /var/lib/nginx /var/log/nginx /tmp/nginx; \
+    touch /var/run/nginx.pid; \
+    chown -R ragflow:ragflow /ragflow/logs /ragflow/conf /var/cache/nginx /var/lib/nginx /var/log/nginx /tmp/nginx /var/run/nginx.pid; \
+    setcap 'cap_net_bind_service=+ep' /usr/sbin/nginx
+
+USER ragflow
+ENTRYPOINT ["/usr/local/bin/ragflow-secure-entrypoint"]
 
