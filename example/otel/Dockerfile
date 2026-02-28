@@ -411,6 +411,7 @@ ENV UV_NO_CONFIG=1 \
     UV_INDEX_STRATEGY=first-index \
     UV_DEFAULT_INDEX=${UV_PIP_INDEX_URL} \
     UV_INDEX_URL=${UV_PIP_INDEX_URL} \
+    UV_CACHE_DIR=/tmp/uv-cache \
     PIP_INDEX_URL=${UV_PIP_INDEX_URL}
 
 # Central mirror controls for security remediation steps.
@@ -1614,11 +1615,30 @@ RUN set -eux; \
     curl -fsSL "${NODE_DIST_URL}" -o /tmp/node.tar.xz; \
     rm -rf /opt/node && mkdir -p /opt/node; \
     tar -xJf /tmp/node.tar.xz -C /opt/node --strip-components=1; \
+    find / -xdev -type d -name 'node-v*' ! -path '/opt/node*' -prune -exec rm -rf {} + 2>/dev/null || true; \
     ln -sf /opt/node/bin/node /usr/local/bin/node; \
     rm -rf /opt/node/lib/node_modules/npm; \
     rm -f /opt/node/bin/npm /opt/node/bin/npx; \
+    find /usr /usr/local /opt /ragflow /root -type f \( -name node -o -name nodejs \) 2>/dev/null | while read -r b; do \
+      [ -x "${b}" ] || continue; \
+      v="$("${b}" -v 2>/dev/null || true)"; \
+      case "${v}" in v*) \
+        if [ "${v}" != "v${NODE_VERSION}" ] && [ "${b}" != "/opt/node/bin/node" ]; then \
+          echo "Removing stale Node binary ${b} (${v})"; rm -f "${b}"; \
+        fi ;; \
+      esac; \
+    done; \
     node --version; \
     if [ "$(node -v)" != "v${NODE_VERSION}" ]; then echo "ERROR: expected Node v${NODE_VERSION}, got $(node -v)" >&2; exit 1; fi; \
+    if find /usr /usr/local /opt /ragflow /root -type f \( -name node -o -name nodejs \) 2>/dev/null | while read -r b; do \
+      [ -x "${b}" ] || continue; \
+      v="$("${b}" -v 2>/dev/null || true)"; \
+      case "${v}" in v*) \
+        if [ "${v}" != "v${NODE_VERSION}" ] && [ "${b}" != "/opt/node/bin/node" ]; then \
+          echo "ERROR: stale Node binary remains: ${b} (${v})" >&2; exit 1; \
+        fi ;; \
+      esac; \
+    done; then :; else exit 1; fi; \
     rm -f /tmp/node.tar.xz; \
     apt-get autoremove -y; \
     rm -rf /var/lib/apt/lists/*
@@ -1709,7 +1729,7 @@ PY
 RUN rm -f /tmp/jackson-core.jar
 ENV TIKA_SERVER_JAR="file:///ragflow/tika-server-standard.jar"
 
-RUN python3 - <<'PY'
+RUN /ragflow/.venv/bin/python3 - <<'PY'
 import importlib.metadata as md
 import os
 import subprocess
@@ -1752,22 +1772,20 @@ if not to_remove and not to_reinstall_specs:
 
 if to_remove:
     print("Removing Python packages from base image:", ", ".join(to_remove))
-    subprocess.check_call(["uv", "pip", "uninstall", *to_remove])
+    subprocess.check_call(["/ragflow/.venv/bin/python3", "-m", "pip", "uninstall", "-y", *to_remove])
 
 if to_reinstall_specs:
     reinstall_names = [norm_name(s.split("==", 1)[0].split(">=", 1)[0].split("<=", 1)[0]) for s in to_reinstall_specs]
     print("Reinstalling Python security-pinned packages:", ", ".join(to_reinstall_specs))
-    subprocess.check_call(["uv", "pip", "uninstall", *reinstall_names])
+    subprocess.check_call(["/ragflow/.venv/bin/python3", "-m", "pip", "uninstall", "-y", *reinstall_names])
     subprocess.check_call([
-        "uv",
+        "/ragflow/.venv/bin/python3",
+        "-m",
         "pip",
         "install",
-        "--no-config",
-        "--default-index",
+        "--index-url",
         os.environ["UV_PIP_INDEX_URL"],
-        "--index-strategy",
-        "first-index",
-        "--no-cache",
+        "--no-cache-dir",
         "--upgrade",
         *to_reinstall_specs,
     ])
@@ -1776,7 +1794,6 @@ PY
 # 14. Compliance hardening:
 #    - remove bundled private keys from the image filesystem
 #    - generate runtime RSA keypair on container startup (instead of baking private keys in image)
-#    - run as a non-root user by default
 RUN set -eux; \
     rm -f /ragflow/conf/private.pem /ragflow/conf/public.pem; \
     find /ragflow/.venv/lib -type f -path '*/site-packages/future/backports/test/*' \( -name '*.pem' -o -name '*.key' \) -delete; \
@@ -1803,16 +1820,9 @@ EOF
 
 RUN set -eux; \
     chmod +x /usr/local/bin/ragflow-secure-entrypoint; \
-    if ! getent group ragflow >/dev/null; then groupadd --system --gid 10001 ragflow; fi; \
-    if ! id -u ragflow >/dev/null 2>&1; then useradd --system --uid 10001 --gid 10001 --home-dir /ragflow --shell /usr/sbin/nologin ragflow; fi; \
-    sed -i -E '/^[[:space:]]*user[[:space:]]+/d' /etc/nginx/nginx.conf; \
-    chmod -R a+rX /ragflow/.venv; \
-    find /ragflow/.venv/bin -maxdepth 1 -type f -exec chmod a+rx {} +; \
-    mkdir -p /ragflow/logs /ragflow/conf /var/cache/nginx /var/lib/nginx /var/log/nginx /tmp/nginx; \
-    touch /var/run/nginx.pid; \
-    chown -R ragflow:ragflow /ragflow/logs /ragflow/conf /var/cache/nginx /var/lib/nginx /var/log/nginx /tmp/nginx /var/run/nginx.pid; \
-    setcap 'cap_net_bind_service=+ep' /usr/sbin/nginx
+    mkdir -p /ragflow/logs /ragflow/conf /ragflow/.cache /tmp/uv-cache /var/cache/nginx /var/lib/nginx /var/log/nginx /tmp/nginx; \
+    touch /var/run/nginx.pid
 
-USER ragflow
+
 ENTRYPOINT ["/usr/local/bin/ragflow-secure-entrypoint"]
 
