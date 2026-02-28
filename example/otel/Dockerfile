@@ -383,20 +383,18 @@
 
 FROM infiniflow/ragflow:v0.24.0
 ARG INSTALL_DOCLING=0
-ARG UV_PIP_INDEX_URL=https://pypi.org/simple
+ARG UV_PIP_INDEX_URL=https://artifactor.cera.com/api/pypi/pypi/simple
 
 # Global uv package index for all installs in this Dockerfile.
 # Override at build time to use a custom mirror:
 #   --build-arg UV_PIP_INDEX_URL=https://pypi.org/simple
 # Exports both env var names for compatibility across uv versions.
-ENV UV_DEFAULT_INDEX=${UV_PIP_INDEX_URL} \
+ENV UV_NO_CONFIG=1 \
+    UV_INDEX_STRATEGY=first-index \
+    UV_DEFAULT_INDEX=${UV_PIP_INDEX_URL} \
     UV_INDEX_URL=${UV_PIP_INDEX_URL} \
     PIP_INDEX_URL=${UV_PIP_INDEX_URL}
 
-# Force uv/pip to use the configured mirror even if base image baked a different index.
-RUN mkdir -p /etc/uv /root/.config/pip && \
-    printf '[[index]]\nurl = "%s"\ndefault = true\n' "${UV_PIP_INDEX_URL}" > /etc/uv/uv.toml && \
-    printf '[global]\nindex-url = %s\n' "${UV_PIP_INDEX_URL}" > /root/.config/pip/pip.conf
 
 # Use C.UTF-8 by default because en_US.UTF-8 may not exist without locale packages.
 ENV LANG=C.UTF-8 \
@@ -1220,7 +1218,7 @@ RUN printf '%s\n' \
 #
 #    Uvicorn is already in the base image (MCP server dependency).
 #    Uses 'uv' because it's pre-installed in the base image (pip may not be).
-RUN uv pip install -i "${UV_PIP_INDEX_URL}" --no-cache \
+RUN uv pip install --no-config --default-index "${UV_PIP_INDEX_URL}" --index-strategy first-index --no-cache \
       uvicorn \
       gunicorn \
       opentelemetry-distro \
@@ -1279,7 +1277,7 @@ RUN case "${INSTALL_DOCLING}" in \
       1|true|TRUE|yes|YES|on|ON) \
         DOCLING_PIN="$(sed -n 's/.*DOCLING_VERSION:-==\([0-9][0-9.]*\).*/\1/p' /ragflow/entrypoint.sh | head -n1)" && \
         test -n "${DOCLING_PIN}" && \
-        uv pip install -i "${UV_PIP_INDEX_URL}" --no-cache "docling==${DOCLING_PIN}" ;; \
+        uv pip install --no-config --default-index "${UV_PIP_INDEX_URL}" --index-strategy first-index --no-cache "docling==${DOCLING_PIN}" ;; \
       *) \
         echo "Skipping docling install (INSTALL_DOCLING=${INSTALL_DOCLING})" ;; \
     esac
