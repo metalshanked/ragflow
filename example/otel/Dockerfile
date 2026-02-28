@@ -394,7 +394,7 @@ ARG NODEJS_ORG_MIRROR=https://nodejs.org
 ARG NODE_VERSION=24.14.0
 ARG NODE_EXTRA_CA_CERT_PEM_B64=""
 ARG REMOVE_PYTHON_PACKAGES="crawl4ai"
-ARG SECURITY_PYTHON_SAFE_SPECS="nltk==3.9.3 jaraco.context==6.1.0 pdfminer.six==20251230 protobuf==5.29.6 google-cloud-aiplatform==1.133.0 mcp==1.23.0 pillow==12.1.1 python-multipart==0.0.22 pyasn1==0.6.2 azure-core==1.38.0"
+ARG SECURITY_PYTHON_SAFE_SPECS="nltk==3.9.3 pdfminer.six==20251230 protobuf==5.29.6 google-cloud-aiplatform==1.133.0 mcp==1.23.0 pillow==12.1.1 python-multipart==0.0.22 pyasn1==0.6.2 azure-core==1.38.0"
 
 # Global uv package index for all installs in this Dockerfile.
 # Override at build time to use a custom mirror:
@@ -1573,6 +1573,8 @@ PY
 #    - Node.js runtime refresh from NODEJS_ORG_MIRROR (fixes Node engine CVEs)
 #    - Keep bundled Apache Tika 3.2.3 + replace embedded jackson-core for GHSA fixes
 #    - Targeted Python package minimum versions for known CVEs
+# 13.1 OS/OpenSSL refresh (including legacy libssl1.1 removal)
+# 13.2 Node.js runtime refresh from NODEJS_ORG_MIRROR (implemented in the same RUN below)
 RUN set -eux; \
     export DEBIAN_FRONTEND=noninteractive; \
     APT_MIRROR_HOST="$(echo "${APT_MIRROR_URL}" | sed -E 's#https?://([^/]+)/?.*#\1#')"; \
@@ -1640,13 +1642,14 @@ RUN set -eux; \
       esac; \
     done; then :; else exit 1; fi; \
     rm -f /tmp/node.tar.xz; \
-    apt-get autoremove -y; \
-    rm -rf /var/lib/apt/lists/*
+	    apt-get autoremove -y; \
+	    rm -rf /var/lib/apt/lists/*
 
+# 13.3 Keep bundled Apache Tika 3.2.3 + replace embedded jackson-core for GHSA fixes
 RUN set -eux; \
-    JACKSON_CORE_SAFE_VERSION="2.21.1"; \
-    JACKSON_CORE_URL="${MAVEN_REPO_BASE_URL%/}/com/fasterxml/jackson/core/jackson-core/${JACKSON_CORE_SAFE_VERSION}/jackson-core-${JACKSON_CORE_SAFE_VERSION}.jar"; \
-    curl -fsSLo /tmp/jackson-core.jar "${JACKSON_CORE_URL}"
+	    JACKSON_CORE_SAFE_VERSION="2.21.1"; \
+	    JACKSON_CORE_URL="${MAVEN_REPO_BASE_URL%/}/com/fasterxml/jackson/core/jackson-core/${JACKSON_CORE_SAFE_VERSION}/jackson-core-${JACKSON_CORE_SAFE_VERSION}.jar"; \
+	    curl -fsSLo /tmp/jackson-core.jar "${JACKSON_CORE_URL}"
 
 RUN python3 - <<'PY'
 import glob
@@ -1729,6 +1732,7 @@ PY
 RUN rm -f /tmp/jackson-core.jar
 ENV TIKA_SERVER_JAR="file:///ragflow/tika-server-standard.jar"
 
+# 13.4 Targeted Python package minimum versions for known CVEs
 RUN /ragflow/.venv/bin/python3 - <<'PY'
 import importlib.metadata as md
 import os
@@ -1792,37 +1796,12 @@ if to_reinstall_specs:
 PY
 
 # 14. Compliance hardening:
-#    - remove bundled private keys from the image filesystem
-#    - generate runtime RSA keypair on container startup (instead of baking private keys in image)
+#    - remove known non-runtime private keys shipped by third-party packages
 RUN set -eux; \
-    rm -f /ragflow/conf/private.pem /ragflow/conf/public.pem; \
     find /ragflow/.venv/lib -type f -path '*/site-packages/future/backports/test/*' \( -name '*.pem' -o -name '*.key' \) -delete; \
     find /ragflow/.venv/lib -type f -path '*/site-packages/seleniumwire/ca.key' -delete
 
-RUN cat > /usr/local/bin/ragflow-secure-entrypoint <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
 
-KEY_DIR="/ragflow/conf"
-PRIVATE_KEY="${KEY_DIR}/private.pem"
-PUBLIC_KEY="${KEY_DIR}/public.pem"
-
-if [[ ! -s "${PRIVATE_KEY}" || ! -s "${PUBLIC_KEY}" ]]; then
-    mkdir -p "${KEY_DIR}"
-    openssl genrsa -des3 -passout pass:Welcome -out "${PRIVATE_KEY}" 2048 >/dev/null 2>&1
-    openssl rsa -in "${PRIVATE_KEY}" -passin pass:Welcome -pubout -out "${PUBLIC_KEY}" >/dev/null 2>&1
-    chmod 600 "${PRIVATE_KEY}"
-    chmod 644 "${PUBLIC_KEY}"
-fi
-
-exec /ragflow/entrypoint.sh "$@"
-EOF
-
-RUN set -eux; \
-    chmod +x /usr/local/bin/ragflow-secure-entrypoint; \
-    mkdir -p /ragflow/logs /ragflow/conf /ragflow/.cache /tmp/uv-cache /var/cache/nginx /var/lib/nginx /var/log/nginx /tmp/nginx; \
-    touch /var/run/nginx.pid
-
-
-ENTRYPOINT ["/usr/local/bin/ragflow-secure-entrypoint"]
+#USER ragflow
+ENTRYPOINT ["/ragflow/entrypoint.sh"]
 
