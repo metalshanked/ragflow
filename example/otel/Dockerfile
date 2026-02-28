@@ -1568,7 +1568,11 @@ RUN set -eux; \
     if [ "${NODE_ARCH}" = "x86_64" ]; then NODE_ARCH="x64"; \
     elif [ "${NODE_ARCH}" = "aarch64" ]; then NODE_ARCH="arm64"; \
     else echo "Unsupported Node architecture: ${NODE_ARCH}" >&2; exit 1; fi; \
-    NODE_DIST_URL="${NODEJS_ORG_MIRROR%/}/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz"; \
+    NODE_BASE_URL="${NODEJS_ORG_MIRROR%/}"; \
+    NODE_DIST_URL="${NODE_BASE_URL}/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz"; \
+    if ! curl -fsSLI "${NODE_DIST_URL}" >/dev/null; then \
+      NODE_DIST_URL="${NODE_BASE_URL}/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz"; \
+    fi; \
     curl -fsSL "${NODE_DIST_URL}" -o /tmp/node.tar.xz; \
     rm -rf /opt/node && mkdir -p /opt/node; \
     tar -xJf /tmp/node.tar.xz -C /opt/node --strip-components=1; \
