@@ -62,23 +62,25 @@
 #      via uv. Uvicorn is already present in the base image.
 #   2. (Optional) Bootstraps auto-discovered instrumentations
 #      — disabled by default due to version conflicts.
-#   3. Patches entrypoint.sh via sed — replaces "$PY" with
-#      opentelemetry-instrument python3 so every Python process
-#      gets OTel auto-instrumentation.
-#   4. Patches ragflow_server.py via sed — replaces app.run()
+#   3. Adds a small Python launcher wrapper with OTEL flags:
+#      - RAGFLOW_OTEL_ENABLED (global on/off)
+#      - per-service toggles (Postgres, Redis, ORM, HTTP, etc.)
+#   4. Patches entrypoint.sh via sed — replaces "$PY" with the wrapper
+#      so every long-running Python process follows those OTEL flags.
+#   5. Patches ragflow_server.py via sed — replaces app.run()
 #      with uvicorn.run() wrapped in OpenTelemetryMiddleware
 #      for inbound request tracing + UVICORN_WORKERS support.
 #      (Quart has no auto-instrumentor, so manual ASGI middleware
 #      is required to generate server spans for incoming requests.)
-#   5. Patches admin_server.py via sed — replaces werkzeug's
+#   6. Patches admin_server.py via sed — replaces werkzeug's
 #      run_simple() with Gunicorn, supporting GUNICORN_WORKERS
 #      env var for multi-worker mode.
-#   6. Merges ELASTIC_INDEX_SETTINGS env var into conf/mapping.json
+#   7. Merges ELASTIC_INDEX_SETTINGS env var into conf/mapping.json
 #      at container startup (deep-merge into "settings" section).
-#   7. Patches MinIO client to respect 'secure' config setting.
-#   8. Patches MinIO health check to use https when secure is on.
+#   8. Patches MinIO client to respect 'secure' config setting.
+#   9. Patches MinIO health check to use https when secure is on.
 #
-#   No wrapt, no .pth files, no wrapper scripts.
+#   No wrapt, no .pth files.
 #
 # ------------------------------------------------------------
 # Build
@@ -170,6 +172,43 @@
 #   OTEL_SERVICE_NAME              Logical service name shown in
 #                                  your tracing backend.
 #                                  Example: ragflow-api
+#
+#   RAGFLOW_OTEL_ENABLED           Global OTEL switch for all RAGFlow
+#                                  Python services in this image.
+#                                  Default: true
+#                                  Set false to disable OTEL entirely.
+#
+#   RAGFLOW_OTEL_INSTRUMENT_POSTGRES / RAGFLOW_OTEL_DISABLE_POSTGRES
+#                                  Enable/disable PostgreSQL telemetry
+#                                  (psycopg2 instrumentation).
+#                                  Default enabled.
+#
+#   RAGFLOW_OTEL_INSTRUMENT_REDIS / RAGFLOW_OTEL_DISABLE_REDIS
+#                                  Enable/disable Redis telemetry.
+#                                  Default enabled.
+#
+#   RAGFLOW_OTEL_INSTRUMENT_ELASTICSEARCH / RAGFLOW_OTEL_DISABLE_ELASTICSEARCH
+#                                  Enable/disable Elasticsearch telemetry.
+#                                  Default enabled.
+#
+#   RAGFLOW_OTEL_INSTRUMENT_ORM / RAGFLOW_OTEL_DISABLE_ORM
+#                                  Enable/disable ORM telemetry (Peewee).
+#                                  Default enabled.
+#
+#   RAGFLOW_OTEL_INSTRUMENT_HTTP / RAGFLOW_OTEL_DISABLE_HTTP
+#                                  Enable/disable outbound HTTP client telemetry
+#                                  for requests + urllib3 (includes MinIO HTTP calls).
+#                                  Default enabled.
+#
+#   RAGFLOW_OTEL_INSTRUMENT_FLASK / RAGFLOW_OTEL_DISABLE_FLASK
+#                                  Enable/disable Flask telemetry
+#                                  (primarily Admin server).
+#                                  Default enabled.
+#
+#   RAGFLOW_OTEL_INSTRUMENT_ASGI / RAGFLOW_OTEL_DISABLE_ASGI
+#                                  Enable/disable inbound ASGI middleware
+#                                  spans for ragflow_server.
+#                                  Default enabled.
 #
 #   OTEL_EXPORTER_OTLP_ENDPOINT   OTLP collector endpoint.
 #                                  Example: http://otel-collector:4317
@@ -343,6 +382,201 @@
 # ============================================================
 
 FROM infiniflow/ragflow:v0.24.0
+ARG INSTALL_DOCLING=0
+
+# Use C.UTF-8 by default because en_US.UTF-8 may not exist without locale packages.
+ENV LANG=C.UTF-8 \
+    LANGUAGE=en_US:en \
+    LC_ALL=C.UTF-8 \
+    RAGFLOW_SET_ENGLISH=true \
+    RAGFLOW_LANG_SHIM_DEBUG=false
+
+# Install a runtime language shim through sitecustomize (upgrade-safe):
+# - normalizes missing/"Chinese" lang to English
+# - patches LLMBundle, TenantLLMService.model_instance, and direct CvModel/Seq2txtModel constructors
+RUN python3 - <<'PY'
+import site
+import textwrap
+from pathlib import Path
+
+shim = textwrap.dedent(
+    """
+    import builtins
+    import functools
+    import inspect
+    import logging
+    import os
+    import sys
+
+    def _truthy(value):
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _debug_enabled():
+        return _truthy(os.getenv("RAGFLOW_LANG_SHIM_DEBUG", "false"))
+
+    def _debug(msg, *args):
+        if _debug_enabled():
+            logging.warning(msg, *args)
+
+    def _set_english_enabled():
+        return _truthy(os.getenv("RAGFLOW_SET_ENGLISH", "true"))
+
+    def _normalize_lang(lang):
+        if not _set_english_enabled():
+            return lang
+        if lang is None:
+            return "English"
+        s = str(lang).strip()
+        if not s:
+            return "English"
+        if s.lower() in {
+            "chinese",
+            "traditional chinese",
+            "simplified chinese",
+            "zh",
+            "zh-cn",
+            "zh_cn",
+            "zh-hans",
+            "zh-hant",
+            "cn",
+
+        }:
+            return "English"
+        return lang
+
+    def _patch_ctor_with_lang_param(cls):
+        init = getattr(cls, "__init__", None)
+        if not callable(init) or getattr(init, "__ragflow_lang_patch__", False):
+            return
+
+        try:
+            sig = inspect.signature(init)
+        except Exception:
+            return
+
+        params = list(sig.parameters.keys())
+        if "lang" not in params:
+            return
+
+        lang_index = params.index("lang") - 1  # self removed from *args
+        original = init
+
+        @functools.wraps(original)
+        def wrapped(self, *args, **kwargs):
+            before = kwargs.get("lang")
+            after = None
+            if "lang" in kwargs:
+                kwargs["lang"] = _normalize_lang(kwargs["lang"])
+                after = kwargs["lang"]
+            elif lang_index >= 0 and len(args) > lang_index:
+                mutable = list(args)
+                before = mutable[lang_index]
+                mutable[lang_index] = _normalize_lang(mutable[lang_index])
+                args = tuple(mutable)
+                after = mutable[lang_index]
+            else:
+                kwargs["lang"] = _normalize_lang(None)
+                before = None
+                after = kwargs["lang"]
+            _debug("ragflow lang shim ctor patch: %s lang %r -> %r", cls.__name__, before, after)
+            return original(self, *args, **kwargs)
+
+        wrapped.__ragflow_lang_patch__ = True
+        cls.__init__ = wrapped
+
+    def _patch_llm_bundle():
+        mod = sys.modules.get("api.db.services.llm_service")
+        if not mod:
+            return
+        bundle = getattr(mod, "LLMBundle", None)
+        if bundle is None:
+            return
+        _patch_ctor_with_lang_param(bundle)
+
+    def _patch_tenant_model_instance():
+        mod = sys.modules.get("api.db.services.tenant_llm_service")
+        if not mod:
+            return
+        svc = getattr(mod, "TenantLLMService", None)
+        if svc is None:
+            return
+
+        method = getattr(svc, "model_instance", None)
+        base = getattr(method, "__func__", None)
+        if not callable(base) or getattr(base, "__ragflow_lang_patch__", False):
+            return
+
+        @functools.wraps(base)
+        def wrapped(cls, tenant_id, llm_type, llm_name=None, lang="Chinese", **kwargs):
+            normalized = _normalize_lang(lang)
+            _debug("ragflow lang shim tenant model_instance: %r -> %r", lang, normalized)
+            return base(cls, tenant_id, llm_type, llm_name, normalized, **kwargs)
+
+        wrapped.__ragflow_lang_patch__ = True
+        svc.model_instance = classmethod(wrapped)
+
+    def _patch_model_registries():
+        llm_mod = sys.modules.get("rag.llm")
+        if llm_mod:
+            for attr in ("CvModel", "Seq2txtModel"):
+                registry = getattr(llm_mod, attr, None)
+                if isinstance(registry, dict):
+                    for cls in set(registry.values()):
+                        _patch_ctor_with_lang_param(cls)
+
+        for mod_name in ("rag.llm.cv_model", "rag.llm.sequence2txt_model"):
+            mod = sys.modules.get(mod_name)
+            if not mod:
+                continue
+            for _, cls in inspect.getmembers(mod, inspect.isclass):
+                _patch_ctor_with_lang_param(cls)
+
+    def _apply_patches():
+        _patch_llm_bundle()
+        _patch_tenant_model_instance()
+        _patch_model_registries()
+
+    _orig_import = builtins.__import__
+
+    @functools.wraps(_orig_import)
+    def _import_hook(name, globals=None, locals=None, fromlist=(), level=0):
+        module = _orig_import(name, globals, locals, fromlist, level)
+        try:
+            if name.startswith(("api.db.services", "rag.llm")):
+                _apply_patches()
+            elif fromlist:
+                for item in fromlist:
+                    if isinstance(item, str) and item.startswith("rag.llm"):
+                        _apply_patches()
+                        break
+        except Exception as e:
+            logging.debug("ragflow lang shim import hook skipped: %s", e)
+        return module
+
+    builtins.__import__ = _import_hook
+    _apply_patches()
+    _debug("ragflow language shim loaded (set_english=%s)", _set_english_enabled())
+    """
+)
+
+site_pkg = Path(site.getsitepackages()[0])
+shim_target = site_pkg / "ragflow_lang_shim.py"
+shim_target.write_text(shim, encoding="utf-8")
+
+sitecustomize = site_pkg / "sitecustomize.py"
+marker = "import ragflow_lang_shim  # ragflow-lang-shim"
+if sitecustomize.exists():
+    existing = sitecustomize.read_text(encoding="utf-8", errors="ignore")
+    if marker not in existing:
+        if existing and not existing.endswith("\n"):
+            existing += "\n"
+        sitecustomize.write_text(existing + marker + "\n", encoding="utf-8")
+else:
+    sitecustomize.write_text(marker + "\n", encoding="utf-8")
+
+print(f"Installed language shim module at: {shim_target}")
+print(f"Ensured sitecustomize loader at: {sitecustomize}")
+PY
 
 # Inline LDAP Auth Script
 # -----------------------
@@ -964,6 +1198,8 @@ RUN printf '%s\n' \
 #    - opentelemetry-instrumentation-asgi    → ASGI middleware for inbound HTTP spans
 #    - opentelemetry-instrumentation-flask   → auto-instruments Flask (Admin server)
 #    - opentelemetry-instrumentation-requests → auto-instruments outbound HTTP
+#    - opentelemetry-instrumentation-urllib3 → auto-instruments urllib3 clients
+#      (including MinIO SDK traffic)
 #    - opentelemetry-instrumentation-redis   → auto-instruments Redis calls
 #
 #    IMPORTANT: opentelemetry-distro alone provides only the CLI tool and SDK
@@ -974,20 +1210,68 @@ RUN printf '%s\n' \
 #    Uvicorn is already in the base image (MCP server dependency).
 #    Uses 'uv' because it's pre-installed in the base image (pip may not be).
 RUN uv pip install --no-cache \
-    uvicorn \
-    gunicorn \
-    opentelemetry-distro \
-    opentelemetry-exporter-otlp \
-    opentelemetry-instrumentation-asgi \
-    opentelemetry-instrumentation-flask \
-    opentelemetry-instrumentation-requests \
-    opentelemetry-instrumentation-redis \
-    opentelemetry-instrumentation-elasticsearch \
-    opentelemetry-instrumentation-psycopg2 \
-    opentelemetry-instrumentation-mysql \
-    opentelemetry-instrumentation-urllib3 \
-    opentelemetry-instrumentation-peewee \
-    ldap3
+      uvicorn \
+      gunicorn \
+      opentelemetry-distro \
+      opentelemetry-exporter-otlp \
+      opentelemetry-instrumentation-asgi \
+      opentelemetry-instrumentation-flask \
+      opentelemetry-instrumentation-requests \
+      opentelemetry-instrumentation-redis \
+      opentelemetry-instrumentation-elasticsearch \
+      opentelemetry-instrumentation-psycopg2 \
+      opentelemetry-instrumentation-urllib3 \
+      opentelemetry-instrumentation-peewee \
+      ldap3
+
+# Ensure shim loaders remain present after pip installs.
+# opentelemetry-instrument injects its own sitecustomize; chain our shim there too.
+RUN python3 - <<'PY'
+import importlib.util
+import site
+from pathlib import Path
+
+site_pkg = Path(site.getsitepackages()[0])
+shim_module = site_pkg / "ragflow_lang_shim.py"
+if not shim_module.exists():
+    raise RuntimeError(f"Missing shim module: {shim_module}")
+
+sitecustomize = site_pkg / "sitecustomize.py"
+marker = "import ragflow_lang_shim  # ragflow-lang-shim"
+content = sitecustomize.read_text(encoding="utf-8", errors="ignore") if sitecustomize.exists() else ""
+if marker not in content:
+    if content and not content.endswith("\n"):
+        content += "\n"
+    sitecustomize.write_text(content + marker + "\n", encoding="utf-8")
+    print(f"Ensured ragflow language shim loader in: {sitecustomize}")
+
+spec = importlib.util.find_spec("opentelemetry.instrumentation.auto_instrumentation.sitecustomize")
+if not spec or not spec.origin:
+    print("OTel sitecustomize not found; skipping ragflow language shim chaining")
+else:
+    target = Path(spec.origin)
+    content = target.read_text(encoding="utf-8", errors="ignore")
+    if marker not in content:
+        if content and not content.endswith("\n"):
+            content += "\n"
+        target.write_text(content + marker + "\n", encoding="utf-8")
+        print(f"Chained ragflow language shim in: {target}")
+    else:
+        print(f"Ragflow language shim already chained in: {target}")
+PY
+
+# Optional: install Docling using the same default version pinned in /ragflow/entrypoint.sh.
+# Build examples:
+#   --build-arg INSTALL_DOCLING=1   (install docling)
+#   --build-arg INSTALL_DOCLING=0   (default, skip docling install)
+RUN case "${INSTALL_DOCLING}" in \
+      1|true|TRUE|yes|YES|on|ON) \
+        DOCLING_PIN="$(sed -n 's/.*DOCLING_VERSION:-==\([0-9][0-9.]*\).*/\1/p' /ragflow/entrypoint.sh | head -n1)" && \
+        test -n "${DOCLING_PIN}" && \
+        uv pip install --no-cache "docling==${DOCLING_PIN}" ;; \
+      *) \
+        echo "Skipping docling install (INSTALL_DOCLING=${INSTALL_DOCLING})" ;; \
+    esac
 #
 #    (Optional) Add more instrumentations if needed, e.g.:
 #      opentelemetry-instrumentation-grpc \
@@ -1005,13 +1289,94 @@ RUN uv pip install --no-cache \
 #    instrumentations AND have resolved any version conflicts:
 # RUN uv run opentelemetry-bootstrap -a install
 
-# 3. Patch entrypoint.sh — run every Python process through opentelemetry-instrument
-#    "$PY" is defined as python3 in entrypoint.sh
-#    The pattern skips lines containing '-c "' (e.g. the docling import check)
-#    to avoid unnecessary OTel SDK startup on one-shot commands.
-RUN sed -i '/-c "/!s/"$PY"/opentelemetry-instrument python3/g' /ragflow/entrypoint.sh
+# 3. Add a tiny launcher wrapper so OTEL can be toggled globally/per-service.
+#    This wrapper:
+#    - bypasses opentelemetry-instrument if RAGFLOW_OTEL_ENABLED=false
+#    - maps service flags to OTEL_PYTHON_DISABLED_INSTRUMENTATIONS
+RUN cat > /usr/local/bin/ragflow-otel-python <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
 
-# 4. Patch ragflow_server.py — replace Quart's dev-mode app.run() with Uvicorn
+to_lower() {
+    echo "${1:-}" | tr '[:upper:]' '[:lower:]'
+}
+
+is_false() {
+    local v
+    v="$(to_lower "${1:-}")"
+    [[ "${v}" == "0" || "${v}" == "false" || "${v}" == "no" || "${v}" == "off" ]]
+}
+
+is_true() {
+    local v
+    v="$(to_lower "${1:-}")"
+    [[ "${v}" == "1" || "${v}" == "true" || "${v}" == "yes" || "${v}" == "on" ]]
+}
+
+should_disable_instrumentation() {
+    local enable_var="$1"
+    local disable_var="$2"
+
+    if [[ -n "${!disable_var:-}" ]] && is_true "${!disable_var}"; then
+        return 0
+    fi
+
+    if [[ -n "${!enable_var:-}" ]] && is_false "${!enable_var}"; then
+        return 0
+    fi
+
+    return 1
+}
+
+append_disabled() {
+    local name="$1"
+    if [[ -z "${disabled_instrumentations}" ]]; then
+        disabled_instrumentations="${name}"
+    else
+        disabled_instrumentations="${disabled_instrumentations},${name}"
+    fi
+}
+
+if is_false "${RAGFLOW_OTEL_ENABLED:-true}"; then
+    exec python3 "$@"
+fi
+
+disabled_instrumentations="${OTEL_PYTHON_DISABLED_INSTRUMENTATIONS:-}"
+
+if should_disable_instrumentation "RAGFLOW_OTEL_INSTRUMENT_POSTGRES" "RAGFLOW_OTEL_DISABLE_POSTGRES"; then append_disabled "psycopg2"; fi
+if should_disable_instrumentation "RAGFLOW_OTEL_INSTRUMENT_REDIS" "RAGFLOW_OTEL_DISABLE_REDIS"; then append_disabled "redis"; fi
+if should_disable_instrumentation "RAGFLOW_OTEL_INSTRUMENT_ELASTICSEARCH" "RAGFLOW_OTEL_DISABLE_ELASTICSEARCH"; then append_disabled "elasticsearch"; fi
+if should_disable_instrumentation "RAGFLOW_OTEL_INSTRUMENT_ORM" "RAGFLOW_OTEL_DISABLE_ORM"; then append_disabled "peewee"; fi
+if should_disable_instrumentation "RAGFLOW_OTEL_INSTRUMENT_HTTP" "RAGFLOW_OTEL_DISABLE_HTTP"; then
+    append_disabled "requests"
+    append_disabled "urllib3"
+fi
+if should_disable_instrumentation "RAGFLOW_OTEL_INSTRUMENT_FLASK" "RAGFLOW_OTEL_DISABLE_FLASK"; then append_disabled "flask"; fi
+
+# Normalize ASGI toggle semantics for ragflow_server.py middleware guard.
+if should_disable_instrumentation "RAGFLOW_OTEL_INSTRUMENT_ASGI" "RAGFLOW_OTEL_DISABLE_ASGI"; then
+    export RAGFLOW_OTEL_INSTRUMENT_ASGI="false"
+    export RAGFLOW_OTEL_DISABLE_ASGI="true"
+else
+    export RAGFLOW_OTEL_INSTRUMENT_ASGI="${RAGFLOW_OTEL_INSTRUMENT_ASGI:-true}"
+    export RAGFLOW_OTEL_DISABLE_ASGI="false"
+fi
+
+if [[ -n "${disabled_instrumentations}" ]]; then
+    export OTEL_PYTHON_DISABLED_INSTRUMENTATIONS="${disabled_instrumentations// /}"
+fi
+
+exec opentelemetry-instrument python3 "$@"
+EOF
+RUN sed -i 's/\r$//' /usr/local/bin/ragflow-otel-python && chmod +x /usr/local/bin/ragflow-otel-python
+
+# 4. Patch entrypoint.sh — run every Python process through /usr/local/bin/ragflow-otel-python.
+#    "$PY" is defined as python3 in entrypoint.sh.
+#    The pattern skips lines containing '-c "' (e.g. the docling import check)
+#    to avoid unnecessary OTEL startup on one-shot commands.
+RUN sed -i '/-c "/!s/"$PY"/\/usr\/local\/bin\/ragflow-otel-python/g' /ragflow/entrypoint.sh
+
+# 5. Patch ragflow_server.py — replace Quart's dev-mode app.run() with Uvicorn
 #    + wrap the app in OpenTelemetryMiddleware for inbound request tracing.
 #    Quart has no auto-instrumentor, so manual ASGI middleware is required
 #    to generate server spans for incoming HTTP requests.
@@ -1022,9 +1387,9 @@ RUN sed -i '/-c "/!s/"$PY"/opentelemetry-instrument python3/g' /ragflow/entrypoi
 #    c) Replace app.run() with uvicorn.run(OpenTelemetryMiddleware(app))
 RUN sed -i '1i import api.ldap_auth' /ragflow/api/ragflow_server.py && \
     sed -i '/^import os$/a import uvicorn\nfrom opentelemetry.instrumentation.asgi import OpenTelemetryMiddleware' /ragflow/api/ragflow_server.py && \
-    sed -i 's/app\.run(host=settings\.HOST_IP, port=settings\.HOST_PORT)/uvicorn.run(OpenTelemetryMiddleware(app), host=settings.HOST_IP, port=int(settings.HOST_PORT), access_log=True)/' /ragflow/api/ragflow_server.py
+    sed -i 's/app\.run(host=settings\.HOST_IP, port=settings\.HOST_PORT)/uvicorn.run(OpenTelemetryMiddleware(app) if str(os.environ.get("RAGFLOW_OTEL_ENABLED", "true")).lower() in ("1", "true", "yes", "on") and not (str(os.environ.get("RAGFLOW_OTEL_DISABLE_ASGI", "false")).lower() in ("1", "true", "yes", "on") or str(os.environ.get("RAGFLOW_OTEL_INSTRUMENT_ASGI", "true")).lower() in ("0", "false", "no", "off")) else app, host=settings.HOST_IP, port=int(settings.HOST_PORT), access_log=True)/' /ragflow/api/ragflow_server.py
 
-# 5. Patch admin_server.py — replace werkzeug's dev server with Gunicorn
+# 6. Patch admin_server.py — replace werkzeug's dev server with Gunicorn
 #    Gunicorn is the standard production WSGI server for Flask apps.
 #    This replaces run_simple() with a programmatic Gunicorn application.
 #
@@ -1055,7 +1420,7 @@ RUN printf '%s\n' \
 RUN sed -i '/^from werkzeug.serving import run_simple$/a from _gunicorn_app import GunicornApp' /ragflow/admin/server/admin_server.py && \
     sed -i '/run_simple(/,/)/c\        GunicornApp(app, {"bind": "0.0.0.0:9381", "workers": int(os.environ.get("GUNICORN_WORKERS", "2")), "accesslog": "-", "timeout": 120}).run()' /ragflow/admin/server/admin_server.py
 
-# 6. Merge ELASTIC_INDEX_SETTINGS env var into conf/mapping.json at startup
+# 7. Merge ELASTIC_INDEX_SETTINGS env var into conf/mapping.json at startup
 #    Creates a small Python helper script and injects a call into entrypoint.sh
 #    right before services start.  The script deep-merges the JSON value of
 #    ELASTIC_INDEX_SETTINGS into the "settings" key of mapping.json.
@@ -1107,11 +1472,11 @@ RUN mkdir -p /ragflow/scripts && \
 # This is immune to upstream renames/refactors of functions or comments.
 RUN sed -i '/^set -e$/a python3 /ragflow/scripts/merge_es_settings.py' /ragflow/entrypoint.sh
 
-# 7. Patch MinIO client to respect 'secure' configuration instead of hardcoding secure=False
+# 8. Patch MinIO client to respect 'secure' configuration instead of hardcoding secure=False
 #    Also handles self-signed certificates via MINIO_CERT_CHECK env var (set to "false" to skip verification)
 RUN sed -i 's/secure=False/secure=str(settings.MINIO.get("secure", False)).lower() == "true"/' /ragflow/rag/utils/minio_conn.py
 
-# 8. Patch MinIO health check to use https when secure is enabled
+# 9. Patch MinIO health check to use https when secure is enabled
 #    a) Replace hardcoded 'http://' with a dynamic scheme based on MINIO secure setting
 #    b) Add verify= parameter to handle self-signed certificates
 #    NOTE: The sed patterns include 'MINIO' context to avoid modifying other
@@ -1119,7 +1484,7 @@ RUN sed -i 's/secure=False/secure=str(settings.MINIO.get("secure", False)).lower
 RUN sed -i "s|f'http://{settings\.MINIO|f'{\"https\" if str(settings.MINIO.get(\"secure\", False)).lower() == \"true\" else \"http\"}://{settings.MINIO|" /ragflow/api/utils/health_utils.py && \
     sed -i "s|/minio/health/live')|/minio/health/live', verify=not (str(settings.MINIO.get(\"secure\", False)).lower() == \"true\"))|" /ragflow/api/utils/health_utils.py
 
-# 9. Patch db_models.py — suppress PostgreSQL "column already exists" migration errors
+# 10. Patch db_models.py — suppress PostgreSQL "column already exists" migration errors
 #    The alter_db_add_column function only handles MySQL duplicate column errors
 #    (error code 1060 / message 'Duplicate column name'). PostgreSQL raises a
 #    different exception type with "already exists" message, which falls through
@@ -1129,7 +1494,7 @@ RUN sed -i "s|f'http://{settings\.MINIO|f'{\"https\" if str(settings.MINIO.get(\
 RUN sed -i '/except Exception as ex:/{n;/Failed to add/s/        logging.critical/        if "already exists" not in str(ex): logging.critical/}' /ragflow/api/db/db_models.py
 
 ## REDIS (VALKEY) OTEL DOES NOT WORK
-## 10. Patch redis_conn.py — instrument Valkey (Redis)
+## 11. Patch redis_conn.py — instrument Valkey (Redis)
 ##    RAGFlow uses 'valkey' as the Redis client, but imports it as 'redis'.
 ##    Standard OTel Redis instrumentation targets the 'redis' library.
 ##    We manually trigger the RedisInstrumentor on the 'valkey' module.
