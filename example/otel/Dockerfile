@@ -391,11 +391,10 @@ ARG MAVEN_REPO_BASE_URL=https://repo1.maven.org/maven2
 # Company mirror example: https://artifactory.cera.com/iq-maven-central-proxy
 ARG NODEJS_ORG_MIRROR=https://nodejs.org
 # Company mirror example: https://artifactory.cera.com/nodejs-proxy
-ARG NPM_REGISTRY_URL=https://registry.npmjs.org
-# Company mirror example: https://artifactory.cera.com/api/npm/npm
 ARG NODE_VERSION=24.14.0
 ARG NODE_EXTRA_CA_CERT_PEM_B64=""
 ARG REMOVE_PYTHON_PACKAGES="crawl4ai"
+ARG SECURITY_PYTHON_SAFE_SPECS="nltk==3.9.3 jaraco.context==6.1.0 pdfminer.six==20251230 protobuf==5.29.6 google-cloud-aiplatform==1.133.0 mcp==1.23.0 pillow==12.1.1 python-multipart==0.0.22 pyasn1==0.6.2 azure-core==1.38.0"
 
 # Global uv package index for all installs in this Dockerfile.
 # Override at build time to use a custom mirror:
@@ -403,10 +402,10 @@ ARG REMOVE_PYTHON_PACKAGES="crawl4ai"
 #   --build-arg APT_MIRROR_URL=https://archive.ubuntu.com/ubuntu
 #   --build-arg MAVEN_REPO_BASE_URL=https://repo1.maven.org/maven2
 #   --build-arg NODEJS_ORG_MIRROR=https://nodejs.org
-#   --build-arg NPM_REGISTRY_URL=https://registry.npmjs.org
 #   --build-arg NODE_VERSION=24.14.0
 #   --build-arg NODE_EXTRA_CA_CERT_PEM_B64=<base64_pem>
 #   --build-arg REMOVE_PYTHON_PACKAGES="crawl4ai,package-two"  (default: crawl4ai)
+#   --build-arg SECURITY_PYTHON_SAFE_SPECS="<space-separated package pins>"
 # Exports both env var names for compatibility across uv versions.
 ENV UV_NO_CONFIG=1 \
     UV_INDEX_STRATEGY=first-index \
@@ -418,9 +417,9 @@ ENV UV_NO_CONFIG=1 \
 ENV APT_MIRROR_URL=${APT_MIRROR_URL} \
     MAVEN_REPO_BASE_URL=${MAVEN_REPO_BASE_URL} \
     NODEJS_ORG_MIRROR=${NODEJS_ORG_MIRROR} \
-    NPM_REGISTRY_URL=${NPM_REGISTRY_URL} \
     NODE_VERSION=${NODE_VERSION} \
-    REMOVE_PYTHON_PACKAGES=${REMOVE_PYTHON_PACKAGES}
+    REMOVE_PYTHON_PACKAGES=${REMOVE_PYTHON_PACKAGES} \
+    SECURITY_PYTHON_SAFE_SPECS=${SECURITY_PYTHON_SAFE_SPECS}
 
 
 # Use C.UTF-8 by default because en_US.UTF-8 may not exist without locale packages.
@@ -1569,9 +1568,9 @@ PY
 
 # 13. Security and compliance remediation bundle (single maintenance section):
 #    Keep this block updated as new Prisma findings arrive.
-#    - OS/OpenSSL refresh (keeping legacy libssl1.1 for base-image compatibility)
+#    - OS/OpenSSL refresh (including legacy libssl1.1 removal)
 #    - Node.js runtime refresh from NODEJS_ORG_MIRROR (fixes Node engine CVEs)
-#    - Keep bundled Apache Tika 3.2.3 (no custom repack/download)
+#    - Keep bundled Apache Tika 3.2.3 + replace embedded jackson-core for GHSA fixes
 #    - Targeted Python package minimum versions for known CVEs
 RUN set -eux; \
     export DEBIAN_FRONTEND=noninteractive; \
@@ -1591,6 +1590,12 @@ RUN set -eux; \
     command -v curl >/dev/null 2>&1 || NEED_PKGS="${NEED_PKGS} curl"; \
     if [ -n "${NEED_PKGS}" ]; then apt-get install -y ${APT_EXTRA_OPTS} --no-install-recommends ${NEED_PKGS}; fi; \
     apt-get install -y ${APT_EXTRA_OPTS} --no-install-recommends openssl libcap2-bin xz-utils; \
+    if dpkg-query -W -f='${Status}' nodejs 2>/dev/null | grep -q "ok installed"; then apt-get purge -y ${APT_EXTRA_OPTS} nodejs; fi; \
+    if dpkg-query -W -f='${Status}' npm 2>/dev/null | grep -q "ok installed"; then apt-get purge -y ${APT_EXTRA_OPTS} npm; fi; \
+    if dpkg-query -W -f='${Status}' libssl1.1 2>/dev/null | grep -q "ok installed"; then apt-get purge -y ${APT_EXTRA_OPTS} libssl1.1; fi; \
+    if dpkg-query -W -f='${Status}' libssl1.1 2>/dev/null | grep -q "ok installed"; then echo "ERROR: libssl1.1 is still installed after purge attempt" >&2; exit 1; fi; \
+    rm -rf /root/.nvm /usr/lib/node_modules /usr/local/lib/node_modules /usr/include/node /usr/local/include/node; \
+    rm -f /usr/bin/node /usr/bin/npm /usr/bin/npx /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx; \
     NODE_CA_CERT_FILE="/usr/local/share/ca-certificates/cera-root-node-extra.crt"; \
     if [ -n "${NODE_EXTRA_CA_CERT_PEM_B64}" ]; then \
       echo "${NODE_EXTRA_CA_CERT_PEM_B64}" | base64 -d > "${NODE_CA_CERT_FILE}"; \
@@ -1610,52 +1615,150 @@ RUN set -eux; \
     rm -rf /opt/node && mkdir -p /opt/node; \
     tar -xJf /tmp/node.tar.xz -C /opt/node --strip-components=1; \
     ln -sf /opt/node/bin/node /usr/local/bin/node; \
-    ln -sf /opt/node/bin/npm /usr/local/bin/npm; \
-    ln -sf /opt/node/bin/npx /usr/local/bin/npx; \
-    npm config set registry "${NPM_REGISTRY_URL}" --location=global; \
-    npm install -g npm@latest; \
+    rm -rf /opt/node/lib/node_modules/npm; \
+    rm -f /opt/node/bin/npm /opt/node/bin/npx; \
+    node --version; \
+    if [ "$(node -v)" != "v${NODE_VERSION}" ]; then echo "ERROR: expected Node v${NODE_VERSION}, got $(node -v)" >&2; exit 1; fi; \
     rm -f /tmp/node.tar.xz; \
     apt-get autoremove -y; \
     rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    JACKSON_CORE_SAFE_VERSION="2.21.1"; \
+    JACKSON_CORE_URL="${MAVEN_REPO_BASE_URL%/}/com/fasterxml/jackson/core/jackson-core/${JACKSON_CORE_SAFE_VERSION}/jackson-core-${JACKSON_CORE_SAFE_VERSION}.jar"; \
+    curl -fsSLo /tmp/jackson-core.jar "${JACKSON_CORE_URL}"
+
+RUN python3 - <<'PY'
+import glob
+import os
+import re
+import shutil
+import zipfile
+
+patched_component = "/tmp/jackson-core.jar"
+tmp_output = "/tmp/tika-server-standard.patched.jar"
+stable_tika_link = "/ragflow/tika-server-standard.jar"
+
+versioned_candidates = glob.glob("/ragflow/tika-server-standard-*.jar")
+
+if versioned_candidates:
+    def version_key(path: str):
+        name = os.path.basename(path)
+        m = re.match(r"tika-server-standard-(.+)\.jar$", name)
+        if not m:
+            return ()
+        return tuple(int(x) for x in re.findall(r"\d+", m.group(1)))
+    tika_jar = max(versioned_candidates, key=version_key)
+elif os.path.exists(stable_tika_link):
+    tika_jar = os.path.realpath(stable_tika_link)
+else:
+    raise SystemExit("Unable to find bundled Tika jar in /ragflow")
+
+drop_prefixes = (
+    "com/fasterxml/jackson/core/",
+    "META-INF/versions/11/com/fasterxml/jackson/core/",
+    "META-INF/versions/17/com/fasterxml/jackson/core/",
+    "META-INF/versions/21/com/fasterxml/jackson/core/",
+    "META-INF/maven/com.fasterxml.jackson.core/jackson-core/",
+)
+drop_exact = {
+    "META-INF/services/com.fasterxml.jackson.core.ObjectCodec",
+    "META-INF/services/com.fasterxml.jackson.core.JsonFactory",
+}
+
+with zipfile.ZipFile(patched_component, "r") as jcore:
+    skip_overlay_exact = {
+        "META-INF/LICENSE",
+        "META-INF/NOTICE",
+        "META-INF/thirdparty-LICENSE",
+        "META-INF/FastDoubleParser-LICENSE",
+        "META-INF/FastDoubleParser-NOTICE",
+    }
+    core_entries = {
+        name: jcore.read(name)
+        for name in jcore.namelist()
+        if not name.endswith("/") and name != "META-INF/MANIFEST.MF" and name not in skip_overlay_exact
+    }
+
+removed = 0
+with zipfile.ZipFile(tika_jar, "r") as zin, zipfile.ZipFile(tmp_output, "w") as zout:
+    for info in zin.infolist():
+        name = info.filename
+        if name in drop_exact or any(name.startswith(prefix) for prefix in drop_prefixes):
+            removed += 1
+            continue
+        zout.writestr(info, zin.read(name))
+
+    for name, data in core_entries.items():
+        zout.writestr(name, data, compress_type=zipfile.ZIP_DEFLATED)
+
+if removed == 0:
+    raise SystemExit("No jackson-core entries were found to replace in bundled Tika jar")
+
+shutil.move(tmp_output, tika_jar)
+if os.path.lexists(stable_tika_link) and os.path.realpath(stable_tika_link) != os.path.realpath(tika_jar):
+    os.remove(stable_tika_link)
+if not os.path.lexists(stable_tika_link):
+    os.symlink(tika_jar, stable_tika_link)
+md5_file = tika_jar + ".md5"
+if os.path.exists(md5_file):
+    os.remove(md5_file)
+print(f"Replaced jackson-core package in {tika_jar}: removed={removed}, added={len(core_entries)}")
+PY
+
+RUN rm -f /tmp/jackson-core.jar
+ENV TIKA_SERVER_JAR="file:///ragflow/tika-server-standard.jar"
 
 RUN python3 - <<'PY'
 import importlib.metadata as md
 import os
 import subprocess
 
-fixed_min_versions = {
-    "crawl4ai": "0.8.0",
-    "nltk": "3.9.3",
-    "jaraco.context": "6.1.0",
-    "pdfminer.six": "20251230",
-    "protobuf": "5.29.6",
-    "google-cloud-aiplatform": "1.133.0",
-    "mcp": "1.23.0",
-    "pillow": "12.1.1",
-    "python-multipart": "0.0.22",
-    "pyasn1": "0.6.2",
-    "azure-core": "1.38.0",
-}
+def norm_name(name: str) -> str:
+    return name.strip().lower().replace("_", "-")
 
 remove_pkgs = {
-    pkg.strip().lower()
+    norm_name(pkg)
     for pkg in os.environ.get("REMOVE_PYTHON_PACKAGES", "").replace(",", " ").split()
     if pkg.strip()
 }
 
-to_upgrade = []
-for pkg, min_ver in fixed_min_versions.items():
-    if pkg.lower() in remove_pkgs:
-        print(f"Skipping security upgrade for {pkg} because it is scheduled for removal.")
-        continue
-    try:
-        md.version(pkg)
-    except md.PackageNotFoundError:
-        continue
-    to_upgrade.append(f"{pkg}>={min_ver}")
+safe_specs_raw = [s.strip() for s in os.environ.get("SECURITY_PYTHON_SAFE_SPECS", "").split() if s.strip()]
+safe_specs_by_name = {}
+for spec in safe_specs_raw:
+    pkg_name = norm_name(spec.split("==", 1)[0].split(">=", 1)[0].split("<=", 1)[0])
+    safe_specs_by_name[pkg_name] = spec
 
-if to_upgrade:
-    cmd = [
+installed_names = set()
+for dist in md.distributions():
+    try:
+        name = dist.metadata["Name"]
+    except Exception:
+        continue
+    if name:
+        installed_names.add(norm_name(name))
+
+to_remove = sorted([pkg for pkg in remove_pkgs if pkg in installed_names])
+to_reinstall_specs = []
+for name, spec in safe_specs_by_name.items():
+    if name in remove_pkgs:
+        continue
+    if name in installed_names:
+        to_reinstall_specs.append(spec)
+
+if not to_remove and not to_reinstall_specs:
+    print("No Python removals or security reinstalls required.")
+    raise SystemExit(0)
+
+if to_remove:
+    print("Removing Python packages from base image:", ", ".join(to_remove))
+    subprocess.check_call(["uv", "pip", "uninstall", *to_remove])
+
+if to_reinstall_specs:
+    reinstall_names = [norm_name(s.split("==", 1)[0].split(">=", 1)[0].split("<=", 1)[0]) for s in to_reinstall_specs]
+    print("Reinstalling Python security-pinned packages:", ", ".join(to_reinstall_specs))
+    subprocess.check_call(["uv", "pip", "uninstall", *reinstall_names])
+    subprocess.check_call([
         "uv",
         "pip",
         "install",
@@ -1666,45 +1769,8 @@ if to_upgrade:
         "first-index",
         "--no-cache",
         "--upgrade",
-        *to_upgrade,
-    ]
-    print("Applying security upgrades:", ", ".join(to_upgrade))
-    subprocess.check_call(cmd)
-else:
-    print("No targeted vulnerable Python packages are installed; skipping upgrade step.")
-PY
-
-RUN python3 - <<'PY'
-import importlib.metadata as md
-import os
-import subprocess
-
-requested = []
-for token in os.environ.get("REMOVE_PYTHON_PACKAGES", "").replace(",", " ").split():
-    pkg = token.strip()
-    if pkg and pkg not in requested:
-        requested.append(pkg)
-
-if not requested:
-    print("No Python package removals requested.")
-    raise SystemExit(0)
-
-installed = []
-for pkg in requested:
-    try:
-        md.version(pkg)
-    except md.PackageNotFoundError:
-        print(f"Skipping uninstall for {pkg}: not installed.")
-        continue
-    installed.append(pkg)
-
-if not installed:
-    print("None of the requested Python packages are installed; skipping uninstall.")
-    raise SystemExit(0)
-
-cmd = ["uv", "pip", "uninstall", *installed]
-print("Removing Python packages from base image:", ", ".join(installed))
-subprocess.check_call(cmd)
+        *to_reinstall_specs,
+    ])
 PY
 
 # 14. Compliance hardening:
@@ -1739,7 +1805,9 @@ RUN set -eux; \
     chmod +x /usr/local/bin/ragflow-secure-entrypoint; \
     if ! getent group ragflow >/dev/null; then groupadd --system --gid 10001 ragflow; fi; \
     if ! id -u ragflow >/dev/null 2>&1; then useradd --system --uid 10001 --gid 10001 --home-dir /ragflow --shell /usr/sbin/nologin ragflow; fi; \
-    sed -i 's/^user[[:space:]]\+root;/user ragflow;/' /etc/nginx/nginx.conf; \
+    sed -i -E '/^[[:space:]]*user[[:space:]]+/d' /etc/nginx/nginx.conf; \
+    chmod -R a+rX /ragflow/.venv; \
+    find /ragflow/.venv/bin -maxdepth 1 -type f -exec chmod a+rx {} +; \
     mkdir -p /ragflow/logs /ragflow/conf /var/cache/nginx /var/lib/nginx /var/log/nginx /tmp/nginx; \
     touch /var/run/nginx.pid; \
     chown -R ragflow:ragflow /ragflow/logs /ragflow/conf /var/cache/nginx /var/lib/nginx /var/log/nginx /tmp/nginx /var/run/nginx.pid; \
