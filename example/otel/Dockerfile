@@ -393,8 +393,9 @@ ARG NODEJS_ORG_MIRROR=https://nodejs.org
 # Company mirror example: https://artifactory.cera.com/nodejs-proxy
 ARG NPM_REGISTRY_URL=https://registry.npmjs.org
 # Company mirror example: https://artifactory.cera.com/api/npm/npm
-ARG NODE_VERSION=24.13.0
+ARG NODE_VERSION=24.14.0
 ARG NODE_EXTRA_CA_CERT_PEM_B64=""
+ARG REMOVE_PYTHON_PACKAGES="crawl4ai"
 
 # Global uv package index for all installs in this Dockerfile.
 # Override at build time to use a custom mirror:
@@ -403,8 +404,9 @@ ARG NODE_EXTRA_CA_CERT_PEM_B64=""
 #   --build-arg MAVEN_REPO_BASE_URL=https://repo1.maven.org/maven2
 #   --build-arg NODEJS_ORG_MIRROR=https://nodejs.org
 #   --build-arg NPM_REGISTRY_URL=https://registry.npmjs.org
-#   --build-arg NODE_VERSION=24.13.0
+#   --build-arg NODE_VERSION=24.14.0
 #   --build-arg NODE_EXTRA_CA_CERT_PEM_B64=<base64_pem>
+#   --build-arg REMOVE_PYTHON_PACKAGES="crawl4ai,package-two"  (default: crawl4ai)
 # Exports both env var names for compatibility across uv versions.
 ENV UV_NO_CONFIG=1 \
     UV_INDEX_STRATEGY=first-index \
@@ -417,7 +419,8 @@ ENV APT_MIRROR_URL=${APT_MIRROR_URL} \
     MAVEN_REPO_BASE_URL=${MAVEN_REPO_BASE_URL} \
     NODEJS_ORG_MIRROR=${NODEJS_ORG_MIRROR} \
     NPM_REGISTRY_URL=${NPM_REGISTRY_URL} \
-    NODE_VERSION=${NODE_VERSION}
+    NODE_VERSION=${NODE_VERSION} \
+    REMOVE_PYTHON_PACKAGES=${REMOVE_PYTHON_PACKAGES}
 
 
 # Use C.UTF-8 by default because en_US.UTF-8 may not exist without locale packages.
@@ -1527,14 +1530,44 @@ RUN sed -i "s|f'http://{settings\.MINIO|f'{\"https\" if str(settings.MINIO.get(\
 #    harmless "column already exists" during migration.
 RUN sed -i '/except Exception as ex:/{n;/Failed to add/s/        logging.critical/        if "already exists" not in str(ex): logging.critical/}' /ragflow/api/db/db_models.py
 
+# 11. Make crawl4ai optional for agent startup by lazy-importing AsyncWebCrawler.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+path = Path("/ragflow/agent/tools/crawler.py")
+text = path.read_text()
+
+text = text.replace("from crawl4ai import AsyncWebCrawler\n", "")
+
+needle = (
+    '    async def get_web(self, url):\n'
+    '        if self.check_if_canceled("Crawler async operation"):\n'
+    '            return\n'
+    '\n'
+)
+insert = (
+    needle
+    + "        try:\n"
+    + "            from crawl4ai import AsyncWebCrawler\n"
+    + "        except ImportError:\n"
+    + "            return \"Crawler tool is unavailable because optional package 'crawl4ai' is not installed.\"\n"
+    + "\n"
+)
+
+if needle in text:
+    text = text.replace(needle, insert, 1)
+
+path.write_text(text)
+PY
+
 ## REDIS (VALKEY) OTEL DOES NOT WORK
-## 11. Patch redis_conn.py — instrument Valkey (Redis)
+## 12. Patch redis_conn.py — instrument Valkey (Redis)
 ##    RAGFlow uses 'valkey' as the Redis client, but imports it as 'redis'.
 ##    Standard OTel Redis instrumentation targets the 'redis' library.
 ##    We manually trigger the RedisInstrumentor on the 'valkey' module.
 #RUN sed -i '/import valkey as redis/a try:\n    import sys\n    sys.modules["redis"] = redis\n    from opentelemetry.instrumentation.redis import RedisInstrumentor\n    print("OTEL: Attempting to instrument Valkey (Redis)...")\n    RedisInstrumentor().instrument(redis_module=redis)\n    print("OTEL: Valkey instrumented successfully")\nexcept Exception as e:\n    print(f"OTEL: Valkey instrumentation failed: {e}")' /ragflow/rag/utils/redis_conn.py
 
-# 12. Security and compliance remediation bundle (single maintenance section):
+# 13. Security and compliance remediation bundle (single maintenance section):
 #    Keep this block updated as new Prisma findings arrive.
 #    - OS/OpenSSL refresh (keeping legacy libssl1.1 for base-image compatibility)
 #    - Node.js runtime refresh from NODEJS_ORG_MIRROR (fixes Node engine CVEs)
@@ -1604,8 +1637,17 @@ fixed_min_versions = {
     "azure-core": "1.38.0",
 }
 
+remove_pkgs = {
+    pkg.strip().lower()
+    for pkg in os.environ.get("REMOVE_PYTHON_PACKAGES", "").replace(",", " ").split()
+    if pkg.strip()
+}
+
 to_upgrade = []
 for pkg, min_ver in fixed_min_versions.items():
+    if pkg.lower() in remove_pkgs:
+        print(f"Skipping security upgrade for {pkg} because it is scheduled for removal.")
+        continue
     try:
         md.version(pkg)
     except md.PackageNotFoundError:
@@ -1632,7 +1674,40 @@ else:
     print("No targeted vulnerable Python packages are installed; skipping upgrade step.")
 PY
 
-# 13. Compliance hardening:
+RUN python3 - <<'PY'
+import importlib.metadata as md
+import os
+import subprocess
+
+requested = []
+for token in os.environ.get("REMOVE_PYTHON_PACKAGES", "").replace(",", " ").split():
+    pkg = token.strip()
+    if pkg and pkg not in requested:
+        requested.append(pkg)
+
+if not requested:
+    print("No Python package removals requested.")
+    raise SystemExit(0)
+
+installed = []
+for pkg in requested:
+    try:
+        md.version(pkg)
+    except md.PackageNotFoundError:
+        print(f"Skipping uninstall for {pkg}: not installed.")
+        continue
+    installed.append(pkg)
+
+if not installed:
+    print("None of the requested Python packages are installed; skipping uninstall.")
+    raise SystemExit(0)
+
+cmd = ["uv", "pip", "uninstall", *installed]
+print("Removing Python packages from base image:", ", ".join(installed))
+subprocess.check_call(cmd)
+PY
+
+# 14. Compliance hardening:
 #    - remove bundled private keys from the image filesystem
 #    - generate runtime RSA keypair on container startup (instead of baking private keys in image)
 #    - run as a non-root user by default
@@ -1672,3 +1747,4 @@ RUN set -eux; \
 
 USER ragflow
 ENTRYPOINT ["/usr/local/bin/ragflow-secure-entrypoint"]
+
