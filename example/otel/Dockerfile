@@ -1795,6 +1795,12 @@ if to_reinstall_specs:
     ])
 PY
 
+# 13.5 Force install jaraco.context to override vulnerable vendored version in setuptools
+# This addresses CVE-2026-23949 (path traversal in jaraco.context.tarball)
+# The vulnerable code is in setuptools/_vendor/jaraco/context.py which is bundled with setuptools.
+# Installing jaraco.context as a top-level package overrides the vendored version due to Python import priority.
+RUN /ragflow/.venv/bin/python3 -m pip install --index-url "${UV_PIP_INDEX_URL}" --no-cache-dir "jaraco.context>=6.1.0"
+
 # 14. Compliance hardening:
 #    - remove bundled RAGFlow keypair from image (mount keys at runtime instead)
 #    - remove known non-runtime private keys shipped by third-party packages
