@@ -1538,7 +1538,7 @@ RUN sed -i '/except Exception as ex:/{n;/Failed to add/s/        logging.critica
 #    Keep this block updated as new Prisma findings arrive.
 #    - OS/OpenSSL refresh (keeping legacy libssl1.1 for base-image compatibility)
 #    - Node.js runtime refresh from NODEJS_ORG_MIRROR (fixes Node engine CVEs)
-#    - Apache Tika jar refresh (inherits newer jackson-core chain)
+#    - Keep bundled Apache Tika 3.2.3 (no custom repack/download)
 #    - Targeted Python package minimum versions for known CVEs
 RUN set -eux; \
     export DEBIAN_FRONTEND=noninteractive; \
@@ -1580,17 +1580,6 @@ RUN set -eux; \
     rm -f /tmp/node.tar.xz; \
     apt-get autoremove -y; \
     rm -rf /var/lib/apt/lists/*
-
-RUN set -eux; \
-    TIKA_BASE_URL="${MAVEN_REPO_BASE_URL%/}/org/apache/tika/tika-server-standard"; \
-    TIKA_VERSION="$(curl -fsSL "${TIKA_BASE_URL}/maven-metadata.xml" | sed -n 's:.*<release>\(.*\)</release>.*:\1:p' | head -n1)"; \
-    test -n "${TIKA_VERSION}"; \
-    curl -fsSLo "/ragflow/tika-server-standard-${TIKA_VERSION}.jar" \
-        "${TIKA_BASE_URL}/${TIKA_VERSION}/tika-server-standard-${TIKA_VERSION}.jar"; \
-    ln -sf "/ragflow/tika-server-standard-${TIKA_VERSION}.jar" /ragflow/tika-server-standard.jar; \
-    rm -f /ragflow/tika-server-standard-3.2.3.jar /ragflow/tika-server-standard-3.2.3.jar.md5
-
-ENV TIKA_SERVER_JAR="file:///ragflow/tika-server-standard.jar"
 
 RUN python3 - <<'PY'
 import importlib.metadata as md
@@ -1679,4 +1668,3 @@ RUN set -eux; \
 
 USER ragflow
 ENTRYPOINT ["/usr/local/bin/ragflow-secure-entrypoint"]
-
