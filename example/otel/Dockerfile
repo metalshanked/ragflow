@@ -1796,12 +1796,14 @@ if to_reinstall_specs:
 PY
 
 # 14. Compliance hardening:
+#    - remove bundled RAGFlow keypair from image (mount keys at runtime instead)
 #    - remove known non-runtime private keys shipped by third-party packages
 RUN set -eux; \
+    rm -f /ragflow/conf/private.pem /ragflow/conf/public.pem; \
     find /ragflow/.venv/lib -type f -path '*/site-packages/future/backports/test/*' \( -name '*.pem' -o -name '*.key' \) -delete; \
     find /ragflow/.venv/lib -type f -path '*/site-packages/seleniumwire/ca.key' -delete
 
 
-#USER ragflow
+USER ragflow
 ENTRYPOINT ["/ragflow/entrypoint.sh"]
 
