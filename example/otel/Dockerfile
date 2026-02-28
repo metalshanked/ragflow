@@ -392,7 +392,7 @@ ENV LANG=C.UTF-8 \
     RAGFLOW_LANG_SHIM_DEBUG=false
 
 # Install a runtime language shim through sitecustomize (upgrade-safe):
-# - normalizes missing/"Chinese" lang to English
+# - normalizes missing/non-English lang to English
 # - patches LLMBundle, TenantLLMService.model_instance, and direct CvModel/Seq2txtModel constructors
 RUN python3 - <<'PY'
 import site
@@ -421,6 +421,14 @@ shim = textwrap.dedent(
     def _set_english_enabled():
         return _truthy(os.getenv("RAGFLOW_SET_ENGLISH", "true"))
 
+    def _is_english_lang(value):
+        s = str(value).strip().lower()
+        if not s:
+            return False
+        if s in {"english", "en", "eng", "en-us", "en_us", "en-gb", "en_gb"}:
+            return True
+        return s.startswith("en-") or s.startswith("en_")
+
     def _normalize_lang(lang):
         if not _set_english_enabled():
             return lang
@@ -429,20 +437,9 @@ shim = textwrap.dedent(
         s = str(lang).strip()
         if not s:
             return "English"
-        if s.lower() in {
-            "chinese",
-            "traditional chinese",
-            "simplified chinese",
-            "zh",
-            "zh-cn",
-            "zh_cn",
-            "zh-hans",
-            "zh-hant",
-            "cn",
-
-        }:
+        if _is_english_lang(s):
             return "English"
-        return lang
+        return "English"
 
     def _patch_ctor_with_lang_param(cls):
         init = getattr(cls, "__init__", None)
@@ -507,7 +504,7 @@ shim = textwrap.dedent(
             return
 
         @functools.wraps(base)
-        def wrapped(cls, tenant_id, llm_type, llm_name=None, lang="Chinese", **kwargs):
+        def wrapped(cls, tenant_id, llm_type, llm_name=None, lang=None, **kwargs):
             normalized = _normalize_lang(lang)
             _debug("ragflow lang shim tenant model_instance: %r -> %r", lang, normalized)
             return base(cls, tenant_id, llm_type, llm_name, normalized, **kwargs)
