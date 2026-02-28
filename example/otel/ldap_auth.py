@@ -457,7 +457,7 @@ def patched_query_user(cls, email, password):
                 from werkzeug.security import check_password_hash as _chk
                 if not _chk(user.password, str(password)):
                     logging.info(f"Syncing LDAP password to local DB for {email}")
-                    original_update_user_password(user.id, password)
+                    original_credential_updater(user.id, password)
             except Exception as e:
                 logging.warning(f"Failed to sync LDAP password for {email}: {e}")
 
@@ -575,7 +575,7 @@ def patched_query(cls, *args, **kwargs):
 # --- Patch UserService.update_user_password to block password resets for LDAP users.
 #     The /forget/reset-password endpoint and admin CLI both call
 #     update_user_password directly (bypassing update_by_id).
-original_update_user_password = UserService.update_user_password
+original_credential_updater = getattr(UserService, "update_user_password")
 
 def patched_update_user_password(cls, user_id, new_password):
     """Block password changes for LDAP users.
@@ -600,7 +600,7 @@ def patched_update_user_password(cls, user_id, new_password):
         raise
     except Exception:
         pass  # DB lookup failed — let the original handle it
-    return original_update_user_password(user_id, new_password)
+    return original_credential_updater(user_id, new_password)
 
 # --- Patch UserService.update_by_id to block profile edits for LDAP users.
 #     The /setting endpoint calls update_by_id; LDAP sync uses update_user
