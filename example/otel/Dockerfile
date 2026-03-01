@@ -394,7 +394,7 @@ ARG NODEJS_ORG_MIRROR=https://nodejs.org
 ARG NODE_VERSION=24.14.0
 ARG NODE_EXTRA_CA_CERT_PEM_B64=""
 ARG REMOVE_PYTHON_PACKAGES="crawl4ai"
-ARG SECURITY_PYTHON_SAFE_SPECS="setuptools==82.0.0 nltk==3.9.3 pdfminer.six==20251230 protobuf==5.29.6 google-cloud-aiplatform==1.133.0 mcp==1.23.0 pillow==12.1.1 python-multipart==0.0.22 pyasn1==0.6.2 azure-core==1.38.0"
+ARG SECURITY_PYTHON_SAFE_SPECS="setuptools==81.0.0 nltk==3.9.3 pdfminer.six==20251230 protobuf==5.29.6 google-cloud-aiplatform==1.133.0 mcp==1.23.0 pillow==12.1.1 python-multipart==0.0.22 pyasn1==0.6.2 azure-core==1.38.0"
 
 # Global uv package index for all installs in this Dockerfile.
 # Override at build time to use a custom mirror:
@@ -1794,7 +1794,6 @@ if to_reinstall_specs:
         *to_reinstall_specs,
     ])
 PY
-
 
 # 14. Compliance hardening:
 #    - remove bundled RAGFlow keypair from image (mount keys at runtime instead)
