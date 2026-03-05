@@ -384,7 +384,7 @@
 # Optional Docling integration (single source of truth for stage selection below).
 #   INSTALL_DOCLING=0 -> no Docling stage pull
 #   INSTALL_DOCLING=1 -> integrate Docling from DOCLING_SERVE_IMAGE
-ARG INSTALL_DOCLING=1
+ARG INSTALL_DOCLING=0
 ARG RAGFLOW_BASE_IMAGE=infiniflow/ragflow:v0.24.0
 # Proxy override example:
 #   --build-arg RAGFLOW_BASE_IMAGE=artifactory.cera.com/dockerproxy/infiniflow/ragflow:v0.24.0
@@ -1585,7 +1585,18 @@ RUN set -eux; \
     if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
       sed -i -E "s#^URIs: .*#URIs: ${APT_MIRROR_URL}#g" /etc/apt/sources.list.d/ubuntu.sources; \
     fi; \
-    apt-get update ${APT_EXTRA_OPTS}; \
+    # NodeSource apt repo can be transiently inconsistent ("unexpected size").
+    # We install Node from tarball below, so disable NodeSource apt lists here.
+    find /etc/apt/sources.list.d -maxdepth 1 -type f -name '*nodesource*' -delete 2>/dev/null || true; \
+    if [ -f /etc/apt/sources.list ]; then sed -i '/deb\\.nodesource\\.com/d' /etc/apt/sources.list; fi; \
+    apt_try=0; \
+    until [ "${apt_try}" -ge 5 ]; do \
+      if apt-get update ${APT_EXTRA_OPTS} -o Acquire::Retries=3; then break; fi; \
+      apt_try=$((apt_try + 1)); \
+      echo "apt-get update failed, retry ${apt_try}/5"; \
+      sleep $((apt_try * 2)); \
+    done; \
+    [ "${apt_try}" -lt 5 ]; \
     apt-get install -y ${APT_EXTRA_OPTS} --no-install-recommends ca-certificates; \
     apt-get -y ${APT_EXTRA_OPTS} -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" upgrade; \
     NEED_PKGS=""; \
