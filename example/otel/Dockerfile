@@ -381,7 +381,14 @@
 #
 # ============================================================
 
-FROM infiniflow/ragflow:v0.24.0
+# Docling switch is used at final stage selection:
+#   INSTALL_DOCLING=0 -> no Docling stage pull
+#   INSTALL_DOCLING=1 -> integrate Docling from DOCLING_SERVE_IMAGE
+ARG INSTALL_DOCLING=1
+#ARG DOCLING_SERVE_IMAGE=ghcr.io/docling-project/docling-serve:v1.12.0
+ARG DOCLING_SERVE_IMAGE=ghcr.io/docling-project/docling-serve-cpu:v1.12.0
+
+FROM infiniflow/ragflow:v0.24.0 AS runtime_base
 ARG INSTALL_DOCLING=0
 ARG UV_PIP_INDEX_URL=https://pypi.org/simple
 # Company mirror example: https://artifactor.cera.com/api/pypi/pypi/simple
@@ -1260,6 +1267,24 @@ RUN uv pip install --no-config --default-index "${UV_PIP_INDEX_URL}" --index-str
       opentelemetry-instrumentation-peewee \
       ldap3
 
+
+# Optional Docling integration is applied only in final stage runtime_1 below.
+#    (Optional) Add more instrumentations if needed, e.g.:
+#      opentelemetry-instrumentation-grpc \
+#      opentelemetry-instrumentation-peewee \
+#      opentelemetry-instrumentation-asyncio
+
+# 2. Auto-discover instrumentations (optional — disabled by default)
+#    opentelemetry-bootstrap -a install uses pip internally and installs
+#    each discovered instrumentation one-at-a-time without full dependency
+#    resolution, which causes version conflicts with packages already in
+#    the base image (e.g. opentelemetry-api 1.36.0 vs 1.39.1).
+#    The explicit installs above (via uv) are sufficient — uv resolves
+#    the full dependency graph correctly in a single pass.
+#    Uncomment the next line only if you need additional auto-discovered
+#    instrumentations AND have resolved any version conflicts:
+# RUN uv run opentelemetry-bootstrap -a install
+
 # Ensure shim loaders remain present after pip installs.
 # opentelemetry-instrument injects its own sitecustomize; chain our shim there too.
 RUN python3 - <<'PY'
@@ -1296,35 +1321,6 @@ else:
         print(f"Ragflow language shim already chained in: {target}")
 PY
 
-# Optional: install Docling using the same default version pinned in /ragflow/entrypoint.sh.
-# Build examples:
-#   --build-arg INSTALL_DOCLING=1   (install docling)
-#   --build-arg INSTALL_DOCLING=0   (default, skip docling install)
-RUN case "${INSTALL_DOCLING}" in \
-      1|true|TRUE|yes|YES|on|ON) \
-        DOCLING_PIN="$(sed -n 's/.*DOCLING_VERSION:-==\([0-9][0-9.]*\).*/\1/p' /ragflow/entrypoint.sh | head -n1)" && \
-        test -n "${DOCLING_PIN}" && \
-        uv pip install --no-config --default-index "${UV_PIP_INDEX_URL}" --index-strategy first-index --no-cache "docling==${DOCLING_PIN}" ;; \
-      *) \
-        echo "Skipping docling install (INSTALL_DOCLING=${INSTALL_DOCLING})" ;; \
-    esac
-
-#
-#    (Optional) Add more instrumentations if needed, e.g.:
-#      opentelemetry-instrumentation-grpc \
-#      opentelemetry-instrumentation-peewee \
-#      opentelemetry-instrumentation-asyncio
-
-# 2. Auto-discover instrumentations (optional — disabled by default)
-#    opentelemetry-bootstrap -a install uses pip internally and installs
-#    each discovered instrumentation one-at-a-time without full dependency
-#    resolution, which causes version conflicts with packages already in
-#    the base image (e.g. opentelemetry-api 1.36.0 vs 1.39.1).
-#    The explicit installs above (via uv) are sufficient — uv resolves
-#    the full dependency graph correctly in a single pass.
-#    Uncomment the next line only if you need additional auto-discovered
-#    instrumentations AND have resolved any version conflicts:
-# RUN uv run opentelemetry-bootstrap -a install
 
 # 3. Add a tiny launcher wrapper so OTEL can be toggled globally/per-service.
 #    This wrapper:
@@ -1806,4 +1802,156 @@ RUN set -eux; \
 
 USER ragflow
 ENTRYPOINT ["/ragflow/entrypoint.sh"]
+
+
+# Variant without Docling (default)
+FROM runtime_base AS runtime_0
+
+# Variant with Docling (only built when INSTALL_DOCLING=1 is selected below)
+FROM ${DOCLING_SERVE_IMAGE} AS docling_serve
+
+FROM runtime_base AS runtime_1
+USER root
+RUN --mount=type=bind,from=docling_serve,source=/opt/app-root/lib,target=/tmp/docling-lib,readonly \
+    --mount=type=bind,from=docling_serve,source=/opt/app-root/src/.cache/docling,target=/tmp/docling-cache,readonly \
+    PY_SITE="$(python3 -c 'import site; print(site.getsitepackages()[0])')" \
+    python3 - <<'PY'
+import csv
+import importlib.util
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+
+src_root = Path("/tmp/docling-lib")
+dst_site = Path(os.environ["PY_SITE"])
+py_mm = f"python{sys.version_info.major}.{sys.version_info.minor}"
+preferred_src_site = src_root / py_mm / "site-packages"
+if preferred_src_site.is_dir():
+    src_site = preferred_src_site
+else:
+    candidates = [p for p in src_root.glob("python*/site-packages") if p.is_dir()]
+    if not candidates:
+        raise RuntimeError(f"No source site-packages found under: {src_root}")
+    src_site = max(candidates, key=lambda p: p.name)
+
+def norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+dist_infos = {}
+for dist_info in src_site.glob("*.dist-info"):
+    meta = dist_info / "METADATA"
+    if not meta.exists():
+        continue
+    name = None
+    requires = []
+    for line in meta.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if line.startswith("Name: "):
+            name = line[6:].strip()
+        elif line.startswith("Requires-Dist: "):
+            req = line[len("Requires-Dist: "):].strip()
+            base = re.split(r"[ ;(<>=\\[]", req, maxsplit=1)[0].strip()
+            if base:
+                requires.append(base)
+    if name:
+        dist_infos[norm(name)] = {"requires": requires, "dist_info": dist_info}
+
+dst_dist_infos = {}
+for dist_info in dst_site.glob("*.dist-info"):
+    meta = dist_info / "METADATA"
+    if not meta.exists():
+        continue
+    name = None
+    for line in meta.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if line.startswith("Name: "):
+            name = line[6:].strip()
+            break
+    if name:
+        dst_dist_infos.setdefault(norm(name), []).append(dist_info)
+
+seed_packages = ["docling", "transformers", "huggingface-hub"]
+missing_seeds = [p for p in seed_packages if norm(p) not in dist_infos]
+if missing_seeds:
+    raise RuntimeError(f"Required distributions not found in source environment {src_site}: {missing_seeds}")
+
+closure = set()
+queue = list(seed_packages)
+while queue:
+    pkg = norm(queue.pop())
+    if not pkg or pkg in closure:
+        continue
+    info = dist_infos.get(pkg)
+    if info is None:
+        continue
+    closure.add(pkg)
+    queue.extend(info["requires"])
+
+# Remove conflicting destination metadata so importlib.metadata resolves
+# versions copied from docling_serve instead of pre-existing base-image ones.
+for pkg in sorted(closure):
+    wanted = dist_infos[pkg]["dist_info"].name
+    for existing in dst_dist_infos.get(pkg, []):
+        if existing.name != wanted:
+            shutil.rmtree(existing, ignore_errors=True)
+
+for pkg in sorted(closure):
+    record = dist_infos[pkg]["dist_info"] / "RECORD"
+    if not record.exists():
+        continue
+    with record.open("r", encoding="utf-8", newline="") as fp:
+        for row in csv.reader(fp):
+            if not row:
+                continue
+            rel = row[0]
+            if rel.startswith(".."):
+                continue
+            src = src_site / rel
+            dst = dst_site / rel
+            if not src.exists():
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if src.is_dir():
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
+
+cache_src = Path("/tmp/docling-cache")
+if cache_src.is_dir():
+    cache_dst = Path("/root/.cache/docling")
+    cache_dst.mkdir(parents=True, exist_ok=True)
+    for child in cache_src.iterdir():
+        if child.is_dir():
+            shutil.copytree(child, cache_dst / child.name, dirs_exist_ok=True)
+        else:
+            shutil.copy2(child, cache_dst / child.name)
+
+if importlib.util.find_spec("docling") is None:
+    sys.exit("docling package missing after installation")
+
+try:
+    from docling.document_converter import DocumentConverter  # noqa: F401
+except Exception as exc:
+    raise SystemExit(f"docling import validation failed: {exc}")
+
+try:
+    import importlib.metadata as md
+    print(
+        "Docling runtime versions:",
+        "docling=" + md.version("docling"),
+        "transformers=" + md.version("transformers"),
+        "huggingface-hub=" + md.version("huggingface-hub"),
+    )
+except Exception:
+    pass
+
+print(f"Copied {len(closure)} distributions for docling from {src_site} to {dst_site}")
+PY
+USER ragflow
+
+# Final selector:
+#   INSTALL_DOCLING=0 -> runtime_0 (does not pull Docling stage)
+#   INSTALL_DOCLING=1 -> runtime_1 (pulls Docling stage and integrates package)
+ARG INSTALL_DOCLING=0
+FROM runtime_${INSTALL_DOCLING}
 
