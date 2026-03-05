@@ -384,7 +384,7 @@
 # Optional Docling integration (single source of truth for stage selection below).
 #   INSTALL_DOCLING=0 -> no Docling stage pull
 #   INSTALL_DOCLING=1 -> integrate Docling from DOCLING_SERVE_IMAGE
-ARG INSTALL_DOCLING=0
+ARG INSTALL_DOCLING=1
 ARG RAGFLOW_BASE_IMAGE=infiniflow/ragflow:v0.24.0
 # Proxy override example:
 #   --build-arg RAGFLOW_BASE_IMAGE=artifactory.cera.com/dockerproxy/infiniflow/ragflow:v0.24.0
@@ -1903,15 +1903,35 @@ while queue:
     closure.add(pkg)
     queue.extend(info["requires"])
 
-# Remove conflicting destination metadata so importlib.metadata resolves
-# versions copied from docling_serve instead of pre-existing base-image ones.
+# Preserve the base scientific stack used by RAGFlow (e.g., numba/graspologic).
+# Only force override Docling/HF packages; for all other packages, copy only if absent.
+force_override = {
+    "transformers",
+    "huggingface-hub",
+    "tokenizers",
+    "safetensors",
+}
+force_override.update({pkg for pkg in closure if pkg.startswith("docling")})
+
+copy_set = set()
 for pkg in sorted(closure):
+    if pkg in force_override:
+        copy_set.add(pkg)
+        continue
+    if pkg not in dst_dist_infos:
+        copy_set.add(pkg)
+
+# For force-overridden packages, remove conflicting destination metadata so
+# importlib.metadata resolves versions copied from docling_serve.
+for pkg in sorted(copy_set):
+    if pkg not in force_override:
+        continue
     wanted = dist_infos[pkg]["dist_info"].name
     for existing in dst_dist_infos.get(pkg, []):
         if existing.name != wanted:
             shutil.rmtree(existing, ignore_errors=True)
 
-for pkg in sorted(closure):
+for pkg in sorted(copy_set):
     record = dist_infos[pkg]["dist_info"] / "RECORD"
     if not record.exists():
         continue
@@ -1951,17 +1971,27 @@ except Exception as exc:
     raise SystemExit(f"docling import validation failed: {exc}")
 
 try:
+    import numba  # noqa: F401
+except Exception as exc:
+    raise SystemExit(f"ragflow stack validation failed (numba import): {exc}")
+
+try:
     import importlib.metadata as md
     print(
         "Docling runtime versions:",
         "docling=" + md.version("docling"),
         "transformers=" + md.version("transformers"),
         "huggingface-hub=" + md.version("huggingface-hub"),
+        "numpy=" + md.version("numpy"),
+        "numba=" + md.version("numba"),
     )
 except Exception:
     pass
 
-print(f"Copied {len(closure)} distributions for docling from {src_site} to {dst_site}")
+print(
+    f"Docling copy summary: selected={len(copy_set)} total_closure={len(closure)} "
+    f"from {src_site} to {dst_site}"
+)
 PY
 
 # 15.3 Final selector:
