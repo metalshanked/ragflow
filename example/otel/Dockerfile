@@ -385,9 +385,14 @@
 #   INSTALL_DOCLING=0 -> no Docling stage pull
 #   INSTALL_DOCLING=1 -> integrate Docling from DOCLING_SERVE_IMAGE
 ARG INSTALL_DOCLING=1
+ARG RAGFLOW_BASE_IMAGE=infiniflow/ragflow:v0.24.0
+# Proxy override example:
+#   --build-arg RAGFLOW_BASE_IMAGE=artifactory.cera.com/dockerproxy/infiniflow/ragflow:v0.24.0
 ARG DOCLING_SERVE_IMAGE=ghcr.io/docling-project/docling-serve-cpu:v1.12.0
+# Proxy override example:
+#   --build-arg DOCLING_SERVE_IMAGE=artifactory.cera.com/dockerproxy/ghcr.io/docling-project/docling-serve-cpu:v1.12.0
 
-FROM infiniflow/ragflow:v0.24.0 AS runtime_base
+FROM ${RAGFLOW_BASE_IMAGE} AS runtime_base
 ARG UV_PIP_INDEX_URL=https://pypi.org/simple
 # Company mirror example: https://artifactor.cera.com/api/pypi/pypi/simple
 ARG APT_MIRROR_URL=https://archive.ubuntu.com/ubuntu
