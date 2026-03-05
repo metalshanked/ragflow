@@ -1830,6 +1830,7 @@ FROM runtime_base AS runtime_1
 USER root
 RUN --mount=type=bind,from=docling_serve,source=/opt/app-root/lib,target=/tmp/docling-lib,readonly \
     --mount=type=bind,from=docling_serve,source=/opt/app-root/src/.cache/docling,target=/tmp/docling-cache,readonly \
+    --mount=type=bind,from=docling_serve,source=/opt/app-root/src/.cache/huggingface,target=/tmp/hf-cache,readonly \
     PY_SITE="$(python3 -c 'import site; print(site.getsitepackages()[0])')" \
     python3 - <<'PY'
 import csv
@@ -1952,15 +1953,25 @@ for pkg in sorted(copy_set):
             else:
                 shutil.copy2(src, dst)
 
-cache_src = Path("/tmp/docling-cache")
-if cache_src.is_dir():
-    cache_dst = Path("/root/.cache/docling")
-    cache_dst.mkdir(parents=True, exist_ok=True)
-    for child in cache_src.iterdir():
+docling_cache_src = Path("/tmp/docling-cache")
+docling_cache_dst = Path("/ragflow/.cache/docling")
+if docling_cache_src.is_dir():
+    docling_cache_dst.mkdir(parents=True, exist_ok=True)
+    for child in docling_cache_src.iterdir():
         if child.is_dir():
-            shutil.copytree(child, cache_dst / child.name, dirs_exist_ok=True)
+            shutil.copytree(child, docling_cache_dst / child.name, dirs_exist_ok=True)
         else:
-            shutil.copy2(child, cache_dst / child.name)
+            shutil.copy2(child, docling_cache_dst / child.name)
+
+hf_cache_src = Path("/tmp/hf-cache")
+hf_cache_dst = Path("/ragflow/.cache/huggingface")
+if hf_cache_src.is_dir():
+    hf_cache_dst.mkdir(parents=True, exist_ok=True)
+    for child in hf_cache_src.iterdir():
+        if child.is_dir():
+            shutil.copytree(child, hf_cache_dst / child.name, dirs_exist_ok=True)
+        else:
+            shutil.copy2(child, hf_cache_dst / child.name)
 
 if importlib.util.find_spec("docling") is None:
     sys.exit("docling package missing after installation")
@@ -1993,6 +2004,13 @@ print(
     f"from {src_site} to {dst_site}"
 )
 PY
+RUN mkdir -p /ragflow/.cache && chmod -R a+rwX /ragflow/.cache
+ENV DOCLING_CACHE_DIR=/ragflow/.cache/docling \
+    DOCLING_ARTIFACTS_PATH=/ragflow/.cache/docling/models \
+    HF_HOME=/ragflow/.cache/huggingface \
+    HUGGINGFACE_HUB_CACHE=/ragflow/.cache/huggingface/hub \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
 
 # 15.3 Final selector:
 #   INSTALL_DOCLING=0 -> runtime_0 (does not pull Docling stage)
