@@ -381,15 +381,13 @@
 #
 # ============================================================
 
-# Docling switch is used at final stage selection:
+# Optional Docling integration (single source of truth for stage selection below).
 #   INSTALL_DOCLING=0 -> no Docling stage pull
 #   INSTALL_DOCLING=1 -> integrate Docling from DOCLING_SERVE_IMAGE
 ARG INSTALL_DOCLING=1
-#ARG DOCLING_SERVE_IMAGE=ghcr.io/docling-project/docling-serve:v1.12.0
 ARG DOCLING_SERVE_IMAGE=ghcr.io/docling-project/docling-serve-cpu:v1.12.0
 
 FROM infiniflow/ragflow:v0.24.0 AS runtime_base
-ARG INSTALL_DOCLING=0
 ARG UV_PIP_INDEX_URL=https://pypi.org/simple
 # Company mirror example: https://artifactor.cera.com/api/pypi/pypi/simple
 ARG APT_MIRROR_URL=https://archive.ubuntu.com/ubuntu
@@ -1800,14 +1798,16 @@ RUN set -eux; \
     find /ragflow/.venv/lib -type f -path '*/site-packages/seleniumwire/ca.key' -delete
 
 
-USER ragflow
-ENTRYPOINT ["/ragflow/entrypoint.sh"]
 
 
-# Variant without Docling (default)
+# 15. Optional Docling integration
+#     INSTALL_DOCLING and DOCLING_SERVE_IMAGE are defined once at top.
+#     Keep all Docling-specific logic contained in this block.
+
+# 15.1 Variant without Docling
 FROM runtime_base AS runtime_0
 
-# Variant with Docling (only built when INSTALL_DOCLING=1 is selected below)
+# 15.2 Variant with Docling (only built when INSTALL_DOCLING=1 is selected below)
 FROM ${DOCLING_SERVE_IMAGE} AS docling_serve
 
 FROM runtime_base AS runtime_1
@@ -1947,11 +1947,11 @@ except Exception:
 
 print(f"Copied {len(closure)} distributions for docling from {src_site} to {dst_site}")
 PY
-USER ragflow
 
-# Final selector:
+# 15.3 Final selector:
 #   INSTALL_DOCLING=0 -> runtime_0 (does not pull Docling stage)
 #   INSTALL_DOCLING=1 -> runtime_1 (pulls Docling stage and integrates package)
-ARG INSTALL_DOCLING=0
 FROM runtime_${INSTALL_DOCLING}
+USER ragflow
+ENTRYPOINT ["/ragflow/entrypoint.sh"]
 
