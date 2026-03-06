@@ -1258,6 +1258,7 @@ RUN printf '%s\n' \
 RUN uv pip install --no-config --default-index "${UV_PIP_INDEX_URL}" --index-strategy first-index --no-cache \
       uvicorn \
       gunicorn \
+      ragflow-cli \
       opentelemetry-distro \
       opentelemetry-exporter-otlp \
       opentelemetry-instrumentation-asgi \
