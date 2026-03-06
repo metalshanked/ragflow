@@ -26,6 +26,7 @@ from assessment.services import (
     _process_questions,
     add_documents_to_session,
     build_results_excel,
+    create_session,
     create_task,
     get_paginated_results,
     parse_questions_excel,
@@ -288,6 +289,35 @@ class TestCreateTask(unittest.TestCase):
         _mock_db_add_event.assert_called_once()
 
 
+class TestCreateSessionReuse(unittest.TestCase):
+    """create_session should pass dataset reuse intent to RagflowClient."""
+
+    @patch.object(_services_mod, "RagflowClient")
+    def test_dataset_name_defaults_to_reuse_mode(self, MockClient):
+        mock_client = AsyncMock()
+        mock_client.ensure_dataset = AsyncMock(return_value="ds-1")
+        mock_client.close = AsyncMock()
+        MockClient.return_value = mock_client
+
+        _run(create_session([{"serial_no": 1, "question": "Q1"}], dataset_name="shared-ds"))
+
+        args, kwargs = mock_client.ensure_dataset.await_args
+        self.assertEqual(args[0], "shared-ds")
+        self.assertTrue(kwargs["reuse_existing_dataset"])
+
+    @patch.object(_services_mod, "RagflowClient")
+    def test_empty_dataset_name_uses_create_mode(self, MockClient):
+        mock_client = AsyncMock()
+        mock_client.ensure_dataset = AsyncMock(return_value="ds-2")
+        mock_client.close = AsyncMock()
+        MockClient.return_value = mock_client
+
+        _run(create_session([{"serial_no": 1, "question": "Q1"}], dataset_name=None))
+
+        _, kwargs = mock_client.ensure_dataset.await_args
+        self.assertFalse(kwargs["reuse_existing_dataset"])
+
+
 class TestGetPaginatedResults(unittest.TestCase):
     """get_paginated_results should paginate correctly."""
 
@@ -532,6 +562,49 @@ class TestRunAssessmentForSessionRetry(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             _run(run_assessment_for_session("sess-retry-002"))
         self.assertIn("no evidence", str(ctx.exception).lower())
+
+    @patch.object(_services_mod, "RagflowClient")
+    def test_session_start_updates_dataset_with_merged_options(self, MockClient):
+        """Session start should apply merged default+runtime dataset options via update API."""
+        from assessment.ragflow_client import RagflowClient as _RealClient
+
+        record = self._make_session_record(TaskState.AWAITING_DOCUMENTS, with_results=False)
+        _mock_db_get.reset_mock()
+        _mock_db_get.return_value = record
+        _mock_db_save.reset_mock()
+
+        mock_client = AsyncMock()
+        mock_client.update_dataset = AsyncMock(return_value={"id": "ds-existing"})
+        mock_client.start_parsing = AsyncMock()
+        mock_client.wait_for_parsing = AsyncMock(return_value=[
+            {"document_id": "doc-1", "document_name": "test.pdf", "status": "success", "progress": 1.0, "message": "ok"}
+        ])
+        mock_client.ensure_chat = AsyncMock(return_value="chat-new")
+        mock_client.create_session = AsyncMock(return_value="sess-new")
+        mock_client.ask = AsyncMock(return_value={"answer": "Answer: Yes\nDetails: OK", "reference": {}})
+        mock_client.close = AsyncMock()
+        MockClient.return_value = mock_client
+        MockClient.parse_yes_no = _RealClient.parse_yes_no
+        MockClient.extract_references = _RealClient.extract_references
+        MockClient.get_cited_indices = _RealClient.get_cited_indices
+
+        with patch.object(
+            _services_mod.settings,
+            "default_dataset_options",
+            {"permission": "team", "parser_config": {"auto_keywords": 2, "enable_metadata": False}},
+        ):
+            _run(
+                run_assessment_for_session(
+                    "sess-retry-002",
+                    dataset_opts={"parser_config": {"enable_metadata": True}},
+                )
+            )
+
+        args, kwargs = mock_client.update_dataset.await_args
+        self.assertEqual(args[0], "ds-existing")
+        self.assertEqual(kwargs["permission"], "team")
+        self.assertEqual(kwargs["parser_config"]["auto_keywords"], 2)
+        self.assertTrue(kwargs["parser_config"]["enable_metadata"])
 
 
 class TestOnlyCitedReferences(unittest.TestCase):

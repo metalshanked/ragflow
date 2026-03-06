@@ -315,7 +315,7 @@ class TestParseYesNo(unittest.TestCase):
 
 
 class TestEnsureDataset(unittest.TestCase):
-    """ensure_dataset should delete existing datasets with the same name."""
+    """ensure_dataset supports recreate or reuse-by-name modes."""
 
     def _make_client(self):
         with patch.object(RagflowClient, "__init__", lambda self, **kw: None):
@@ -359,6 +359,136 @@ class TestEnsureDataset(unittest.TestCase):
         result = _run(client.ensure_dataset("my-ds"))
         self.assertEqual(result, "new-id")
         client.delete_dataset.assert_not_called()
+
+    def test_reuse_existing_dataset_updates_without_delete(self):
+        """Reuse mode should keep existing dataset and update options in-place."""
+        client = self._make_client()
+        client.list_datasets = AsyncMock(return_value=[
+            {"id": "existing-id", "name": "my-ds"},
+        ])
+        client.delete_dataset = AsyncMock()
+        client.create_dataset = AsyncMock(return_value="new-id")
+        client.update_dataset = AsyncMock(return_value={"id": "existing-id"})
+
+        result = _run(
+            client.ensure_dataset(
+                "my-ds",
+                reuse_existing_dataset=True,
+                permission="team",
+                parser_config={"enable_metadata": True},
+            )
+        )
+
+        self.assertEqual(result, "existing-id")
+        client.delete_dataset.assert_not_called()
+        client.create_dataset.assert_not_called()
+        client.update_dataset.assert_awaited_once_with(
+            "existing-id",
+            permission="team",
+            parser_config={"enable_metadata": True},
+        )
+
+    def test_reuse_mode_creates_when_no_existing_dataset(self):
+        """Reuse mode should create a new dataset if no exact name match exists."""
+        client = self._make_client()
+        client.list_datasets = AsyncMock(return_value=[])
+        client.delete_dataset = AsyncMock()
+        client.create_dataset = AsyncMock(return_value="new-id")
+        client.update_dataset = AsyncMock()
+
+        result = _run(client.ensure_dataset("my-ds", reuse_existing_dataset=True))
+
+        self.assertEqual(result, "new-id")
+        client.delete_dataset.assert_not_called()
+        client.update_dataset.assert_not_called()
+        client.create_dataset.assert_awaited_once_with("my-ds")
+
+
+class TestDatasetUiApis(unittest.TestCase):
+    """Dataset create/update should use UI KB APIs."""
+
+    def _make_client(self):
+        with patch.object(RagflowClient, "__init__", lambda self, **kw: None):
+            c = object.__new__(RagflowClient)
+            c.base_url = "http://test:9380"
+            c.headers = {"Authorization": "Bearer test"}
+            c._client = None
+            return c
+
+    def test_create_dataset_uses_kb_create(self):
+        client = self._make_client()
+        client._request = AsyncMock(return_value={"code": 0, "data": {"kb_id": "kb-123"}})
+
+        result = _run(
+            client.create_dataset(
+                "my-ds",
+                permission="team",
+                parser_config={"enable_metadata": True},
+            )
+        )
+
+        self.assertEqual(result, "kb-123")
+        client._request.assert_called_once_with(
+            "POST",
+            "/v1/kb/create",
+            json={
+                "name": "my-ds",
+                "permission": "team",
+                "parser_config": {"enable_metadata": True},
+            },
+        )
+
+    def test_update_dataset_merges_parser_config_and_required_fields(self):
+        client = self._make_client()
+        client._request = AsyncMock(side_effect=[
+            {
+                "code": 0,
+                "data": {
+                    "id": "kb-123",
+                    "name": "my-ds",
+                    "description": "desc",
+                    "parser_id": "naive",
+                    "parser_config": {
+                        "enable_metadata": False,
+                        "auto_keywords": 1,
+                        "raptor": {"use_raptor": False, "max_token": 128},
+                    },
+                },
+            },
+            {"code": 0, "data": {"id": "kb-123"}},
+        ])
+
+        _run(
+            client.update_dataset(
+                "kb-123",
+                permission="team",
+                parser_config={
+                    "enable_metadata": True,
+                    "raptor": {"max_token": 512},
+                },
+            )
+        )
+
+        self.assertEqual(client._request.await_count, 2)
+        first = client._request.await_args_list[0]
+        second = client._request.await_args_list[1]
+
+        self.assertEqual(first.args[0], "GET")
+        self.assertEqual(first.args[1], "/v1/kb/detail")
+        self.assertEqual(first.kwargs["params"], {"kb_id": "kb-123"})
+
+        self.assertEqual(second.args[0], "POST")
+        self.assertEqual(second.args[1], "/v1/kb/update")
+        payload = second.kwargs["json"]
+        self.assertEqual(payload["kb_id"], "kb-123")
+        self.assertEqual(payload["name"], "my-ds")
+        self.assertEqual(payload["description"], "desc")
+        self.assertEqual(payload["parser_id"], "naive")
+        self.assertEqual(payload["permission"], "team")
+        self.assertTrue(payload["parser_config"]["enable_metadata"])
+        self.assertEqual(payload["parser_config"]["auto_keywords"], 1)
+        self.assertFalse(payload["parser_config"]["raptor"]["use_raptor"])
+        self.assertEqual(payload["parser_config"]["raptor"]["max_token"], 512)
 
 
 class TestEnsureChat(unittest.TestCase):

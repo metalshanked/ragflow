@@ -8,6 +8,7 @@ stays decoupled from raw HTTP details.
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import logging
 import re
 from typing import Any, Optional
@@ -174,6 +175,17 @@ class RagflowClient:
     # Dataset
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _deep_merge_dicts(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+        """Recursively merge dictionaries with *overrides* taking precedence."""
+        merged = deepcopy(base)
+        for key, value in overrides.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = RagflowClient._deep_merge_dicts(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
     async def list_datasets(self, name: str | None = None, page: int = 1, page_size: int = 100) -> list[dict]:
         """Return a list of dataset dicts, optionally filtered by name."""
         res = await self.list_datasets_page(name, page, page_size)
@@ -206,20 +218,89 @@ class RagflowClient:
         return {"items": [], "total": 0}
 
     async def create_dataset(self, name: str, **kwargs) -> str:
-        """Create a dataset and return its ID."""
+        """Create a dataset through UI KB API and return its ID."""
         payload = {"name": name}
         payload.update(kwargs)
-        body = await self._request("POST", "/api/v1/datasets", json=payload)
-        return body["data"]["id"]
+        body = await self._request("POST", "/v1/kb/create", json=payload)
+        data = body.get("data", {}) if isinstance(body, dict) else {}
+        dataset_id = (
+            data.get("kb_id")
+            if isinstance(data, dict)
+            else None
+        ) or (
+            data.get("id")
+            if isinstance(data, dict)
+            else None
+        )
+        if not dataset_id:
+            raise RuntimeError(f"Create dataset succeeded but no dataset id returned: {body}")
+        return str(dataset_id)
 
-    async def ensure_dataset(self, name: str, **kwargs) -> str:
+    async def get_dataset_detail(self, dataset_id: str) -> dict[str, Any]:
+        """Fetch dataset details from UI KB API."""
+        body = await self._request("GET", "/v1/kb/detail", params={"kb_id": dataset_id})
+        data = body.get("data", {}) if isinstance(body, dict) else {}
+        if not isinstance(data, dict) or not data:
+            raise RuntimeError(f"Dataset detail not found for id={dataset_id}")
+        return data
+
+    async def update_dataset(self, dataset_id: str, **kwargs) -> dict[str, Any]:
+        """Update a dataset through UI KB API, preserving required fields."""
+        detail = await self.get_dataset_detail(dataset_id)
+        payload: dict[str, Any] = {
+            "kb_id": dataset_id,
+            "name": detail.get("name", ""),
+            "description": detail.get("description") or "",
+            "parser_id": detail.get("parser_id") or "naive",
+        }
+
+        updates = dict(kwargs)
+        parser_updates = updates.get("parser_config")
+        if isinstance(parser_updates, dict) and isinstance(detail.get("parser_config"), dict):
+            updates["parser_config"] = self._deep_merge_dicts(detail["parser_config"], parser_updates)
+        payload.update(updates)
+
+        # UI update endpoint requires these to be present and non-empty.
+        payload["kb_id"] = dataset_id
+        payload["name"] = str(payload.get("name") or detail.get("name") or "").strip()
+        if not payload["name"]:
+            raise RuntimeError(f"Cannot update dataset {dataset_id}: dataset name is empty")
+        if payload.get("description") is None:
+            payload["description"] = ""
+        payload["parser_id"] = payload.get("parser_id") or detail.get("parser_id") or "naive"
+
+        body = await self._request("POST", "/v1/kb/update", json=payload)
+        data = body.get("data", {}) if isinstance(body, dict) else {}
+        return data if isinstance(data, dict) else {}
+
+    async def ensure_dataset(
+        self,
+        name: str,
+        *,
+        reuse_existing_dataset: bool = False,
+        **kwargs,
+    ) -> str:
         """Return an existing dataset ID for *name*, or create a new one.
 
-        If a dataset with the given name already exists it is deleted first
-        so that the caller always gets a clean, empty dataset.
+        If ``reuse_existing_dataset`` is true and a dataset with the exact
+        same name exists, reuse it and apply dataset updates in-place.
+
+        Otherwise, if a dataset with the same name exists it is deleted first
+        so the caller gets a clean, empty dataset.
         """
         existing = await self.list_datasets(name=name)
         to_delete = [ds for ds in existing if ds.get("name") == name]
+        if reuse_existing_dataset and to_delete:
+            picked = to_delete[0]
+            dataset_id = str(picked.get("id") or "").strip()
+            if not dataset_id:
+                raise RuntimeError(
+                    f"Cannot reuse dataset '{name}': existing dataset id is empty"
+                )
+            if kwargs:
+                await self.update_dataset(dataset_id, **kwargs)
+            return dataset_id
+
         if to_delete:
             for ds in to_delete:
                 logger.info("Deleting existing dataset '%s' (id=%s)", name, ds["id"])

@@ -5,6 +5,10 @@ All settings can be overridden via environment variables or a .env file
 placed in the assessment directory.
 """
 
+import json
+from typing import Any
+
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -22,6 +26,11 @@ class Settings(BaseSettings):
     default_chat_name_prefix: str = "assessment"
     default_similarity_threshold: float = 0.1
     default_top_n: int = 8
+    # Default dataset options merged into all dataset create/update operations
+    # initiated by this app. Runtime `dataset_options` payloads override these.
+    # Example env value:
+    # ASSESSMENT_DEFAULT_DATASET_OPTIONS='{"permission":"team","parser_config":{"enable_metadata":true}}'
+    default_dataset_options: dict[str, Any] = Field(default_factory=dict)
 
     # Questions Excel column names (1-based column numbers or header names)
     # Accessible via env: ASSESSMENT_QUESTION_ID_COLUMN, ASSESSMENT_QUESTION_COLUMN, etc.
@@ -128,6 +137,29 @@ class Settings(BaseSettings):
         '{"viewer":[],"operator":[],"admin":[]}'
     )
     ldap_require_mapped_roles: bool = True
+
+    @field_validator("default_dataset_options", mode="before")
+    @classmethod
+    def _parse_default_dataset_options(cls, value: Any) -> dict[str, Any]:
+        if value in (None, ""):
+            return {}
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "ASSESSMENT_DEFAULT_DATASET_OPTIONS must be valid JSON"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise ValueError(
+                    "ASSESSMENT_DEFAULT_DATASET_OPTIONS must be a JSON object"
+                )
+            return parsed
+        raise ValueError(
+            "ASSESSMENT_DEFAULT_DATASET_OPTIONS must be a JSON object"
+        )
 
     model_config = {"env_prefix": "ASSESSMENT_", "env_file": ".env"}
 

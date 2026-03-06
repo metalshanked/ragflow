@@ -187,6 +187,7 @@ class RagflowContext(BaseModel):
     dataset_ids: list[str] = Field(default_factory=list)
     document_ids: list[str] = Field(default_factory=list)
     file_hashes: dict[str, str] = Field(default_factory=dict)  # Maps file hash -> document_id
+    reuse_existing_dataset: bool = False
     chat_id: str = ""
     session_id: str = ""
 

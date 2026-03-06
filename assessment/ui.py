@@ -172,6 +172,7 @@ th{background:var(--bg);font-weight:600;position:sticky;top:0}
       <div><label>Dataset Name (optional)</label><input type="text" id="single-ds" placeholder="Auto-generated if empty" oninput="onSingleFieldChange()"/></div>
       <div><label>Chat Name (optional)</label><input type="text" id="single-chat" placeholder="Auto-generated if empty" oninput="onSingleFieldChange()"/></div>
     </div>
+    <label style="display:flex;align-items:center;gap:.5rem;margin-top:.5rem"><input type="checkbox" id="single-reuse-existing-ds" checked onchange="onSingleFieldChange()"/> Reuse existing dataset by name (upsert mode)</label>
     <div class="row">
       <div><label>Dataset Options (JSON, optional)</label><textarea id="single-ds-opts" placeholder='{"permission": "me"}' oninput="onSingleFieldChange(); validateJsonInput(this)" rows="2"></textarea></div>
       <div><label>Chat Options (JSON, optional)</label><textarea id="single-chat-opts" placeholder='{"prompt": {"system": "..."}}' oninput="onSingleFieldChange(); validateJsonInput(this)" rows="2"></textarea></div>
@@ -226,6 +227,7 @@ th{background:var(--bg);font-weight:600;position:sticky;top:0}
       <input type="file" id="sess-q" accept=".xlsx,.xls" onchange="onSessCreateFieldChange()"/>
       <label>Dataset Name (optional)</label>
       <input type="text" id="sess-ds" placeholder="Auto-generated" oninput="onSessCreateFieldChange()"/>
+      <label style="display:flex;align-items:center;gap:.5rem;margin-top:.5rem"><input type="checkbox" id="sess-reuse-existing-ds" checked onchange="onSessCreateFieldChange()"/> Reuse existing dataset by name (upsert mode)</label>
       <div class="row">
         <div><label>Dataset Options (JSON, optional)</label><textarea id="sess-ds-opts" placeholder='{"permission": "me"}' oninput="onSessCreateFieldChange(); validateJsonInput(this)" rows="2"></textarea></div>
         <div><label>Chat Options (JSON, optional)</label><textarea id="sess-chat-opts" placeholder='{"prompt": {"system": "..."}}' oninput="onSessCreateFieldChange(); validateJsonInput(this)" rows="2"></textarea></div>
@@ -820,8 +822,10 @@ async function submitSingle(){
   const cn=document.getElementById('single-chat').value.trim();
   const dso=document.getElementById('single-ds-opts').value.trim();
   const cno=document.getElementById('single-chat-opts').value.trim();
+  const reuseExistingDs=document.getElementById('single-reuse-existing-ds').checked;
   if(ds)fd.append('dataset_name',ds);
   if(cn)fd.append('chat_name',cn);
+  fd.append('reuse_exisiting_dataset',reuseExistingDs?'true':'false');
   if(dso)fd.append('dataset_options',dso);
   if(cno)fd.append('chat_options',cno);
   const qidCol=document.getElementById('single-qid-col').value.trim();
@@ -875,7 +879,9 @@ async function createSession(){
   const ds=document.getElementById('sess-ds').value.trim();
   const dso=document.getElementById('sess-ds-opts').value.trim();
   const cno=document.getElementById('sess-chat-opts').value.trim();
+  const reuseExistingDs=document.getElementById('sess-reuse-existing-ds').checked;
   if(ds)fd.append('dataset_name',ds);
+  fd.append('reuse_exisiting_dataset',reuseExistingDs?'true':'false');
   if(dso)fd.append('dataset_options',dso);
   if(cno)fd.append('chat_options',cno);
   const qidCol=document.getElementById('sess-qid-col').value.trim();

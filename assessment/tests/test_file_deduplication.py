@@ -19,7 +19,7 @@ class TestFileDeduplication(unittest.TestCase):
         _mock_db_get.reset_mock()
         _mock_db_save.reset_mock()
 
-    def _make_record(self, file_hashes=None, doc_ids=None):
+    def _make_record(self, file_hashes=None, doc_ids=None, reuse_existing_dataset=False):
         if file_hashes is None:
             file_hashes = {}
         if doc_ids is None:
@@ -35,7 +35,8 @@ class TestFileDeduplication(unittest.TestCase):
             ragflow=RagflowContext(
                 dataset_id="ds-1",
                 document_ids=doc_ids,
-                file_hashes=file_hashes
+                file_hashes=file_hashes,
+                reuse_existing_dataset=reuse_existing_dataset,
             ),
             questions=[]
         )
@@ -144,3 +145,32 @@ class TestFileDeduplication(unittest.TestCase):
         self.assertEqual(mock_client.upload_document.call_count, 2)
         self.assertIn("skipped 2 duplicate(s)", resp.message.lower())
 
+    @patch.object(_services_mod, "db_find_document_by_hash", new_callable=AsyncMock)
+    @patch.object(_services_mod, "RagflowClient")
+    def test_reuse_mode_reuses_existing_success_doc(self, MockClient, mock_find_by_hash):
+        """In reuse mode, matching hash with success status should not re-upload."""
+        content = b"already parsed"
+        fhash = hashlib.sha256(content).hexdigest()
+
+        record = self._make_record(reuse_existing_dataset=True)
+        _mock_db_get.return_value = record
+
+        mock_client = AsyncMock()
+        mock_client.list_documents = AsyncMock(return_value=[
+            {"id": "doc-existing-1", "name": "existing.pdf", "status": "success"}
+        ])
+        mock_client.upload_document = AsyncMock(return_value="doc-new-1")
+        MockClient.return_value = mock_client
+
+        mock_find_by_hash.return_value = [
+            {"task_id": "old", "document_id": "doc-existing-1", "dataset_id": "ds-1"}
+        ]
+
+        resp = self._run(add_documents_to_session("test-task-1", [("file.pdf", content)]))
+
+        self.assertEqual(resp.uploaded_document_ids, [])
+        self.assertEqual(resp.total_documents, 1)
+        self.assertIn("reused", resp.message.lower())
+        self.assertIn(fhash, record.ragflow.file_hashes)
+        self.assertEqual(record.ragflow.file_hashes[fhash], "doc-existing-1")
+        mock_client.upload_document.assert_not_called()

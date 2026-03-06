@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from assessment import routers
+from assessment.models import SessionCreateResponse, TaskState, TaskStatus
 
 
 @contextmanager
@@ -222,3 +223,66 @@ def test_task_events_endpoint_returns_paginated_history():
             assert body["events"][0]["event_type"] == "task_created"
             mock_get_task.assert_awaited_once_with("task-1")
             mock_list_events.assert_awaited_once_with("task-1", 1, 50)
+
+
+def test_start_assessment_defaults_reuse_existing_dataset_true():
+    app = make_app()
+    with TestClient(app) as client:
+        with override_settings(jwt_secret_key=""):
+            mock_parse = MagicMock(return_value=[{"serial_no": 1, "question": "Q1"}])
+            mock_create_task = AsyncMock(
+                return_value=type(
+                    "_R",
+                    (),
+                    {
+                        "task_id": "task-123",
+                        "status": TaskStatus(task_id="task-123", state=TaskState.PENDING, total_questions=1),
+                    },
+                )()
+            )
+            mock_run = AsyncMock()
+
+            with patch("assessment.routers.parse_questions_excel", mock_parse), patch(
+                "assessment.routers.create_task", mock_create_task
+            ), patch("assessment.routers.run_assessment", mock_run):
+                resp = client.post(
+                    "/api/v1/assessments",
+                    files={
+                        "questions_file": ("q.xlsx", b"xlsx-bytes", "application/octet-stream"),
+                        "evidence_files": ("evidence.pdf", b"pdf-bytes", "application/pdf"),
+                    },
+                    data={"dataset_name": "shared-ds"},
+                )
+
+            assert resp.status_code == 202
+            args = mock_run.await_args.args
+            assert args[3] == "shared-ds"
+            assert args[5] is True
+
+
+def test_create_session_endpoint_accepts_reuse_existing_dataset_false():
+    app = make_app()
+    with TestClient(app) as client:
+        with override_settings(jwt_secret_key=""):
+            mock_parse = MagicMock(return_value=[{"serial_no": 1, "question": "Q1"}])
+            mock_create_session = AsyncMock(
+                return_value=SessionCreateResponse(task_id="task-1", dataset_id="ds-1")
+            )
+
+            with patch("assessment.routers.parse_questions_excel", mock_parse), patch(
+                "assessment.routers.create_session", mock_create_session
+            ):
+                resp = client.post(
+                    "/api/v1/assessments/sessions",
+                    files={"questions_file": ("q.xlsx", b"xlsx-bytes", "application/octet-stream")},
+                    data={
+                        "dataset_name": "shared-ds",
+                        "reuse_exisiting_dataset": "false",
+                    },
+                )
+
+            assert resp.status_code == 201
+            mock_create_session.assert_awaited_once()
+            args = mock_create_session.await_args.args
+            assert args[1] == "shared-ds"
+            assert args[2] is False

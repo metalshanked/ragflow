@@ -50,6 +50,19 @@ To ensure efficiency and data integrity, the Assessment API implements **SHA256-
 
 This applies to both initial uploads and incremental uploads (Two-phase strategy).
 
+### Dataset Reuse Upsert Mode
+
+When you provide `dataset_name`, requests now support a `reuse_exisiting_dataset` form field (default: `true`):
+
+- `reuse_exisiting_dataset=true`: reuse the existing dataset by name, apply dataset option updates in-place, and upsert incoming files by hash.
+  - If a matching hash already exists in that dataset and is parsed successfully, upload is skipped.
+  - If a matching hash is failed/not usable, the document is re-uploaded.
+- `reuse_exisiting_dataset=false`: legacy behavior, delete same-name dataset and recreate it.
+
+This field is available in:
+- `POST /api/v1/assessments`
+- `POST /api/v1/assessments/sessions`
+
 ## Quick Start
 
 ### 1. Install Dependencies
@@ -134,6 +147,7 @@ All settings (see `config.py`):
 | `ASSESSMENT_DOCUMENT_PARSE_TIMEOUT_SECONDS` | `600.0` | Max wait for document parsing |
 | `ASSESSMENT_DEFAULT_SIMILARITY_THRESHOLD` | `0.1` | RAG similarity threshold |
 | `ASSESSMENT_DEFAULT_TOP_N` | `8` | Number of chunks to retrieve |
+| `ASSESSMENT_DEFAULT_DATASET_OPTIONS` | `{}` | JSON object of default dataset options merged into dataset create/update operations (runtime `dataset_options` overrides defaults) |
 | `ASSESSMENT_QUESTION_ID_COLUMN` | `A` | Default Excel column for Question Serial No (letter like `A` or 1-based number like `1`) |
 | `ASSESSMENT_QUESTION_COLUMN` | `B` | Default Excel column for Question text (letter like `B` or 1-based number like `2`) |
 | `ASSESSMENT_VENDOR_RESPONSE_COLUMN` | `C` | Default Excel column for Vendor response (letter like `C` or 1-based number like `3`) |
@@ -194,6 +208,17 @@ All settings (see `config.py`):
 | `ASSESSMENT_OTEL_INSTRUMENT_HTTPX` | `true` | Enable HTTPX auto instrumentation |
 | `ASSESSMENT_OTEL_INSTRUMENT_SQLALCHEMY` | `true` | Enable SQLAlchemy auto instrumentation |
 | `ASSESSMENT_OPENINFERENCE_ENABLED` | `true` | Add OpenInference semantic attributes/context |
+
+Default dataset options example:
+
+```bash
+export ASSESSMENT_DEFAULT_DATASET_OPTIONS='{"permission":"team","parser_config":{"enable_metadata":true,"auto_keywords":3,"auto_questions":2}}'
+```
+
+Merge precedence:
+
+1. `ASSESSMENT_DEFAULT_DATASET_OPTIONS`
+2. Request `dataset_options` (overrides defaults, including nested fields)
 
 ### Observability (OpenTelemetry + OpenInference)
 
@@ -347,6 +372,7 @@ The UI is a single-page app served directly from FastAPI — no extra dependenci
 | **Single-call assessment** | Upload questions Excel + evidence documents in one step |
 | **From existing dataset** | Run assessment against already-uploaded RAGFlow datasets |
 | **Two-phase workflow** | Create session → upload docs incrementally → start assessment |
+| **Dataset reuse toggle** | reuse_exisiting_dataset checkbox (enabled by default) on single-call and session creation forms |
 | **Document upload** | Upload documents to an existing RAGFlow dataset |
 | **Data Management** | List, paginate, and delete datasets and documents directly from the dashboard |
 | **Health check** | View API and RAGFlow connection status |
@@ -941,7 +967,9 @@ curl -X POST http://localhost:8000/api/v1/assessments \
   -H "Authorization: Bearer $TOKEN" \
   -F "questions_file=@questions.xlsx" \
   -F "evidence_files=@policy_doc.pdf" \
-  -F 'dataset_options={"permission":"team"}' \
+  -F "dataset_name=shared-assessment-dataset" \
+  -F "reuse_exisiting_dataset=true" \
+  -F 'dataset_options={"permission":"team","parser_config":{"enable_metadata":true,"auto_keywords":5,"auto_questions":3}}' \
   -F 'chat_options={"prompt":{"system":"You are a helpful assistant."}}'
 
 # Start with custom question columns (questions in columns C and D instead of A and B)
@@ -999,7 +1027,9 @@ curl -X POST http://localhost:8000/api/v1/assessments \
 # Phase 1: Create session with questions
 RESPONSE=$(curl -s -X POST http://localhost:8000/api/v1/assessments/sessions \
   -H "Authorization: Bearer $TOKEN" \
-  -F "questions_file=@questions.xlsx")
+  -F "questions_file=@questions.xlsx" \
+  -F "dataset_name=shared-assessment-dataset" \
+  -F "reuse_exisiting_dataset=true")
 TASK_ID=$(echo $RESPONSE | jq -r '.task_id')
 echo "Task ID: $TASK_ID"
 

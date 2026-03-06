@@ -210,6 +210,13 @@ async def start_assessment(
         ..., description="Evidence documents (PDF, PPTX, XLSX, DOCX, etc.)"
     ),
     dataset_name: Optional[str] = Form(None, description="Custom dataset name in RAGFlow"),
+    reuse_exisiting_dataset: bool = Form(
+        True,
+        description=(
+            "If true (default) and dataset_name is provided, reuse that dataset by name "
+            "and upsert docs/options instead of deleting/recreating it."
+        ),
+    ),
     chat_name: Optional[str] = Form(None, description="Custom chat assistant name in RAGFlow"),
     dataset_options: Optional[str] = Form(None, description="JSON string of additional options for dataset creation"),
     chat_options: Optional[str] = Form(None, description="JSON string of additional options for chat creation"),
@@ -296,6 +303,7 @@ async def start_assessment(
         ev_files,
         dataset_name,
         chat_name,
+        reuse_exisiting_dataset,
         dataset_opts,
         chat_opts,
         process_vendor_response,
@@ -324,7 +332,7 @@ async def start_assessment_from_dataset(
         ),
     ),
     chat_name: Optional[str] = Form(None, description="Custom chat assistant name in RAGFlow"),
-    dataset_options: Optional[str] = Form(None, description="JSON string of additional options for dataset creation"),
+    dataset_options: Optional[str] = Form(None, description="JSON string of additional options for dataset update"),
     chat_options: Optional[str] = Form(None, description="JSON string of additional options for chat creation"),
     question_id_column: Optional[str] = Form(
         None,
@@ -406,6 +414,7 @@ async def start_assessment_from_dataset(
         parsed_ids,
         chat_name,
         chat_opts,
+        dataset_opts,
         process_vendor_response,
         only_cited_references,
     )
@@ -423,6 +432,13 @@ async def create_assessment_session(
         ..., description="Excel file with columns A=Question_Serial_No, B=Question"
     ),
     dataset_name: Optional[str] = Form(None, description="Custom dataset name in RAGFlow"),
+    reuse_exisiting_dataset: bool = Form(
+        True,
+        description=(
+            "If true (default) and dataset_name is provided, reuse that dataset by name "
+            "and upsert docs/options instead of deleting/recreating it."
+        ),
+    ),
     dataset_options: Optional[str] = Form(None, description="JSON string of additional options for dataset creation"),
     chat_options: Optional[str] = Form(None, description="JSON string of additional options for chat creation"),
     question_id_column: Optional[str] = Form(
@@ -473,7 +489,7 @@ async def create_assessment_session(
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON in dataset_options")
 
-    return await create_session(questions, dataset_name, dataset_opts)
+    return await create_session(questions, dataset_name, reuse_exisiting_dataset, dataset_opts)
 
 
 @router.post(
@@ -512,7 +528,7 @@ async def start_session_assessment(
     task_id: str,
     background_tasks: BackgroundTasks,
     chat_name: Optional[str] = Form(None, description="Custom chat assistant name in RAGFlow"),
-    dataset_options: Optional[str] = Form(None, description="JSON string of additional options for dataset creation"),
+    dataset_options: Optional[str] = Form(None, description="JSON string of additional options for dataset update"),
     chat_options: Optional[str] = Form(None, description="JSON string of additional options for chat creation"),
     process_vendor_response: bool = Form(
         settings.process_vendor_response,
