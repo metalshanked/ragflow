@@ -1,0 +1,1244 @@
+﻿from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import shutil
+import statistics
+import threading
+import time
+import uuid
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import requests
+from quart import Quart, jsonify, request
+
+
+APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = APP_DIR / "data"
+RUNS_DIR = DATA_DIR / "runs"
+UPLOADS_DIR = DATA_DIR / "uploads"
+
+for directory in (DATA_DIR, RUNS_DIR, UPLOADS_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
+
+
+app = Quart(__name__)
+
+RUNS_LOCK = threading.Lock()
+RUNS: dict[str, dict[str, Any]] = {}
+RUN_SECRETS: dict[str, dict[str, Any]] = {}
+
+TERMINAL_DOCUMENT_STATES = {"DONE", "FAIL", "CANCEL"}
+STOPWORDS = {
+    "about", "after", "again", "against", "also", "among", "because", "before",
+    "being", "below", "between", "could", "document", "documents", "each", "from",
+    "have", "into", "more", "most", "other", "same", "some", "such", "than",
+    "that", "their", "them", "then", "there", "these", "they", "this", "those",
+    "through", "under", "very", "what", "when", "where", "which", "while", "with",
+    "would", "your",
+}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def slugify(value: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip())
+    cleaned = cleaned.strip("-._")
+    return cleaned or "file"
+
+
+def sanitize_filename(name: str) -> str:
+    return slugify(Path(name).name)
+
+
+def normalize_root_url(raw_url: str) -> str:
+    url = raw_url.strip().rstrip("/")
+    if not url:
+        raise ValueError("RAGFlow base URL is required.")
+    if url.endswith("/api/v1"):
+        return url[: -len("/api/v1")]
+    if url.endswith("/v1"):
+        return url[: -len("/v1")]
+    return url
+
+
+def auth_header(api_key: str) -> str:
+    api_key = api_key.strip()
+    if not api_key:
+        raise ValueError("API key is required.")
+    return api_key if api_key.lower().startswith("bearer ") else f"Bearer {api_key}"
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def merge_dicts(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(base)
+    for key, value in (updates or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def parse_json_object(raw_value: str | None, label: str, default: dict[str, Any] | None = None) -> dict[str, Any]:
+    text = (raw_value or "").strip()
+    if not text:
+        return deepcopy(default or {})
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} must be valid JSON: {exc.msg}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{label} must be a JSON object.")
+    return parsed
+
+
+def normalize_dataset_options_for_kb_ui(options: dict[str, Any] | None) -> dict[str, Any]:
+    payload = deepcopy(options or {})
+    if "chunk_method" in payload and "parser_id" not in payload:
+        payload["parser_id"] = payload.pop("chunk_method")
+    else:
+        payload.pop("chunk_method", None)
+    if "embedding_model" in payload and "embd_id" not in payload:
+        payload["embd_id"] = payload.pop("embedding_model")
+    else:
+        payload.pop("embedding_model", None)
+    return payload
+
+
+def percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = (len(ordered) - 1) * pct
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    if lower == upper:
+        return ordered[int(rank)]
+    fraction = rank - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def histogram(values: list[float], bins: int = 10) -> list[dict[str, Any]]:
+    if not values:
+        return []
+    low = min(values)
+    high = max(values)
+    if math.isclose(low, high):
+        return [{"label": f"{low:.1f}", "count": len(values)}]
+    step = (high - low) / bins
+    counts = [0 for _ in range(bins)]
+    for value in values:
+        index = min(int((value - low) / step), bins - 1)
+        counts[index] += 1
+    result = []
+    for index, count in enumerate(counts):
+        start = low + step * index
+        end = start + step
+        result.append({"label": f"{start:.0f}-{end:.0f}", "count": count})
+    return result
+
+
+def json_clone(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def chunks_content(chunks: list[dict[str, Any]]) -> str:
+    parts = []
+    for chunk in chunks:
+        content = chunk.get("content") or chunk.get("content_with_weight") or chunk.get("text") or ""
+        if content:
+            parts.append(content)
+    return "\n".join(parts)
+
+
+def pick_first_sentence(text: str, max_words: int = 14) -> str:
+    if not text:
+        return ""
+    sentences = re.split(r"(?<=[.!?])\s+", re.sub(r"\s+", " ", text).strip())
+    for sentence in sentences:
+        words = sentence.split()
+        if len(words) >= 5:
+            return " ".join(words[:max_words]).strip(" ,.;:")
+    words = text.split()
+    return " ".join(words[:max_words]).strip(" ,.;:")
+
+
+def top_keywords(text: str, limit: int = 5) -> list[str]:
+    words = re.findall(r"\b[A-Za-z][A-Za-z0-9_-]{3,}\b", text.lower())
+    counter = Counter(word for word in words if word not in STOPWORDS)
+    return [word for word, _ in counter.most_common(limit)]
+
+
+def build_prompt_set(
+    documents: list[dict[str, Any]],
+    chunk_samples: dict[str, list[dict[str, Any]]],
+    prompts_per_document: int,
+    shared_prompts: int,
+) -> list[dict[str, Any]]:
+    prompts: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_prompt(kind: str, prompt: str, document: dict[str, Any] | None = None) -> None:
+        normalized = prompt.strip()
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        prompts.append(
+            {
+                "id": str(uuid.uuid4()),
+                "kind": kind,
+                "prompt": normalized,
+                "document_id": document.get("id") if document else None,
+                "document_name": document.get("name") if document else None,
+            }
+        )
+
+    for document in documents:
+        sample_chunks = chunk_samples.get(document["id"], [])
+        sample_text = chunks_content(sample_chunks)
+        keywords = top_keywords(sample_text)
+        sentence = pick_first_sentence(sample_text)
+
+        candidates = [
+            ("doc-summary", f"Summarize the most important ideas in the uploaded document '{document['name']}'."),
+            ("doc-bullets", f"List the key topics, entities, and claims discussed in '{document['name']}'."),
+        ]
+        if keywords:
+            candidates.append(("doc-keyword", f"What does '{document['name']}' say about {keywords[0]}?"))
+        if len(keywords) > 1:
+            candidates.append(("doc-keywords", f"Explain how '{document['name']}' covers {keywords[0]}, {keywords[1]}, and any related details."))
+        if sentence:
+            candidates.append(("doc-grounded", f"Using only the uploaded knowledge, explain this topic in detail: {sentence}."))
+
+        for kind, prompt in candidates[: max(1, prompts_per_document)]:
+            add_prompt(kind, prompt, document)
+
+    if len(documents) > 1:
+        shared_candidates = [
+            ("multi-summary", "Provide an executive summary across all uploaded documents and call out the most important differences."),
+            ("multi-compare", "Compare the uploaded documents and explain where they reinforce or contradict each other."),
+            ("multi-themes", "Identify the recurring themes across the uploaded documents and support them with concrete details."),
+        ]
+        for kind, prompt in shared_candidates[: max(0, shared_prompts)]:
+            add_prompt(kind, prompt)
+
+    return prompts
+
+
+class RAGFlowError(RuntimeError):
+    pass
+
+
+class RAGFlowClient:
+    def __init__(self, base_url: str, api_key: str, timeout: int = 180, tls_config: dict[str, Any] | None = None):
+        self.root = normalize_root_url(base_url)
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({"Authorization": auth_header(api_key)})
+        tls = tls_config or {}
+        self.session.verify = bool(tls.get("verify", True))
+
+    def _api_url(self, path: str) -> str:
+        return f"{self.root}/api/v1{path}"
+
+    def _web_url(self, path: str) -> str:
+        return f"{self.root}/v1{path}"
+
+    def _request(self, method: str, url: str, *, timeout: int | None = None, **kwargs: Any) -> dict[str, Any]:
+        response = self.session.request(method, url, timeout=timeout or self.timeout, **kwargs)
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RAGFlowError(f"Non-JSON response from {url}: {response.status_code}") from exc
+
+        if response.status_code >= 400:
+            raise RAGFlowError(payload.get("message") or response.text or f"HTTP {response.status_code}")
+        if isinstance(payload, dict) and "code" in payload and payload.get("code") != 0:
+            raise RAGFlowError(payload.get("message") or "RAGFlow request failed")
+        return payload
+
+    def create_dataset(self, name: str, options: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = {"name": name}
+        payload = merge_dicts(payload, normalize_dataset_options_for_kb_ui(options))
+        response = self._request("POST", self._web_url("/kb/create"), json=payload)
+        kb_id = response.get("data", {}).get("kb_id")
+        if not kb_id:
+            raise RAGFlowError("KB create response did not include kb_id")
+        return {"id": kb_id, "name": name}
+
+    def delete_dataset(self, dataset_id: str) -> None:
+        self._request("POST", self._web_url("/kb/rm"), json={"kb_id": dataset_id})
+
+    def upload_documents(self, dataset_id: str, files: list[Path]) -> list[dict[str, Any]]:
+        multipart = []
+        handles = []
+        try:
+            for file_path in files:
+                handle = file_path.open("rb")
+                handles.append(handle)
+                multipart.append(("file", (file_path.name, handle)))
+            response = self._request("POST", self._api_url(f"/datasets/{dataset_id}/documents"), files=multipart, timeout=max(self.timeout, 600))
+            return response["data"]
+        finally:
+            for handle in handles:
+                handle.close()
+
+    def list_documents(self, dataset_id: str, page: int = 1, page_size: int = 100, document_id: str | None = None) -> dict[str, Any]:
+        params = {"page": page, "page_size": page_size}
+        if document_id:
+            params["id"] = document_id
+        response = self._request("GET", self._api_url(f"/datasets/{dataset_id}/documents"), params=params)
+        return response["data"]
+
+    def list_all_documents(self, dataset_id: str) -> list[dict[str, Any]]:
+        documents = []
+        page = 1
+        while True:
+            payload = self.list_documents(dataset_id, page=page, page_size=100)
+            batch = payload.get("docs", [])
+            documents.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+        return documents
+
+    def parse_documents(self, dataset_id: str, document_ids: list[str], options: dict[str, Any] | None = None) -> None:
+        payload = {"document_ids": document_ids}
+        payload = merge_dicts(payload, options or {})
+        self._request("POST", self._api_url(f"/datasets/{dataset_id}/chunks"), json=payload, timeout=max(self.timeout, 300))
+
+    def list_chunks(self, dataset_id: str, document_id: str, page: int = 1, page_size: int = 10) -> list[dict[str, Any]]:
+        response = self._request("GET", self._api_url(f"/datasets/{dataset_id}/documents/{document_id}/chunks"), params={"page": page, "page_size": page_size})
+        return response["data"].get("chunks", [])
+
+    def retrieval(self, dataset_id: str, question: str, options: dict[str, Any] | None = None) -> dict[str, Any]:
+        config = merge_dicts(
+            {
+                "top_k": 8,
+                "highlight": True,
+                "similarity_threshold": 0.2,
+                "vector_similarity_weight": 0.7,
+            },
+            options or {},
+        )
+        payload = {"dataset_ids": [dataset_id], "question": question}
+        payload = merge_dicts(payload, config)
+        payload["dataset_ids"] = [dataset_id]
+        payload["question"] = question
+        payload.setdefault("page", 1)
+        payload.setdefault("page_size", payload.get("top_k", 8))
+        response = self._request("POST", self._api_url("/retrieval"), json=payload)
+        return response["data"]
+
+    def create_chat(self, name: str, dataset_id: str, options: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"name": name, "dataset_ids": [dataset_id]}
+        payload = merge_dicts(payload, options or {})
+        payload["name"] = name
+        payload["dataset_ids"] = [dataset_id]
+        response = self._request("POST", self._api_url("/chats"), json=payload)
+        return response["data"]
+
+    def delete_chat(self, chat_id: str) -> None:
+        self._request("DELETE", self._api_url("/chats"), json={"ids": [chat_id]})
+
+    def completion(self, chat_id: str, prompt: str, options: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = {
+            "model": "ragflow-loadtest",
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "extra_body": {"reference": True},
+        }
+        payload = merge_dicts(payload, options or {})
+        payload["messages"] = [{"role": "user", "content": prompt}]
+        return self._request("POST", self._api_url(f"/chats_openai/{chat_id}/chat/completions"), json=payload, timeout=max(self.timeout, 300))
+
+    def list_pipeline_logs(self, dataset_id: str) -> list[dict[str, Any]]:
+        response = self._request("POST", self._web_url("/kb/list_pipeline_logs"), params={"kb_id": dataset_id, "page": 1, "page_size": 500}, json={})
+        return response["data"].get("logs", [])
+
+    def list_pipeline_dataset_logs(self, dataset_id: str) -> list[dict[str, Any]]:
+        response = self._request("POST", self._web_url("/kb/list_pipeline_dataset_logs"), params={"kb_id": dataset_id, "page": 1, "page_size": 500}, json={})
+        return response["data"].get("logs", [])
+
+
+def persist_run_snapshot(run_id: str) -> None:
+    with RUNS_LOCK:
+        snapshot = json_clone(RUNS[run_id])
+    (RUNS_DIR / f"{run_id}.json").write_text(json.dumps(snapshot, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def set_run_fields(run_id: str, **fields: Any) -> None:
+    with RUNS_LOCK:
+        RUNS[run_id].update(fields)
+    persist_run_snapshot(run_id)
+
+
+def append_run_event(run_id: str, message: str, *, level: str = "info") -> None:
+    event = {"ts": utc_now(), "level": level, "message": message}
+    with RUNS_LOCK:
+        RUNS[run_id]["events"].append(event)
+        RUNS[run_id]["events"] = RUNS[run_id]["events"][-200:]
+    persist_run_snapshot(run_id)
+
+
+def patch_run(run_id: str, callback) -> None:
+    with RUNS_LOCK:
+        callback(RUNS[run_id])
+    persist_run_snapshot(run_id)
+
+
+def summarize_documents(documents: list[dict[str, Any]], pipeline_logs: list[dict[str, Any]]) -> dict[str, Any]:
+    durations = [safe_float(doc.get("process_duration")) for doc in documents if safe_float(doc.get("process_duration")) > 0]
+    chunks = [safe_int(doc.get("chunk_count")) for doc in documents]
+    tokens = [safe_int(doc.get("token_count")) for doc in documents]
+    status_breakdown = Counter(doc.get("run", "UNKNOWN") for doc in documents)
+    pipeline_by_document = []
+    for log in pipeline_logs:
+        dsl = log.get("dsl") or {}
+        component_path = dsl.get("path") if isinstance(dsl, dict) else []
+        pipeline_by_document.append(
+            {
+                "document_id": log.get("document_id"),
+                "document_name": log.get("document_name"),
+                "duration_sec": round(safe_float(log.get("process_duration")), 3),
+                "status": log.get("operation_status"),
+                "progress": safe_float(log.get("progress")),
+                "progress_msg": log.get("progress_msg") or "",
+                "task_type": log.get("task_type") or "",
+                "components": component_path or [],
+            }
+        )
+    total_duration = round(sum(durations), 3)
+    total_tokens = sum(tokens)
+    return {
+        "documents": documents,
+        "status_breakdown": dict(status_breakdown),
+        "total_documents": len(documents),
+        "total_chunks": sum(chunks),
+        "total_tokens": total_tokens,
+        "total_parse_duration_sec": total_duration,
+        "avg_parse_duration_sec": round(statistics.mean(durations), 3) if durations else 0.0,
+        "p95_parse_duration_sec": round(percentile(durations, 0.95), 3) if durations else 0.0,
+        "token_throughput_per_sec": round(total_tokens / total_duration, 3) if total_duration > 0 else 0.0,
+        "pipeline_logs": pipeline_by_document,
+    }
+
+
+def summarize_benchmark(results: list[dict[str, Any]], wall_time_sec: float) -> dict[str, Any]:
+    latencies = [result["latency_ms"] for result in results if result["ok"]]
+    errors = [result for result in results if not result["ok"]]
+    prompt_tokens = sum(result.get("prompt_tokens", 0) for result in results if result["ok"])
+    completion_tokens = sum(result.get("completion_tokens", 0) for result in results if result["ok"])
+    total_tokens = prompt_tokens + completion_tokens
+    references = [result.get("reference_count", 0) for result in results if result["ok"]]
+    return {
+        "count": len(results),
+        "ok": len(results) - len(errors),
+        "errors": len(errors),
+        "error_rate": round(len(errors) / len(results), 4) if results else 0.0,
+        "wall_time_sec": round(wall_time_sec, 3),
+        "throughput_rps": round(len(results) / wall_time_sec, 3) if wall_time_sec > 0 else 0.0,
+        "avg_latency_ms": round(statistics.mean(latencies), 3) if latencies else 0.0,
+        "p50_latency_ms": round(percentile(latencies, 0.50), 3) if latencies else 0.0,
+        "p95_latency_ms": round(percentile(latencies, 0.95), 3) if latencies else 0.0,
+        "p99_latency_ms": round(percentile(latencies, 0.99), 3) if latencies else 0.0,
+        "max_latency_ms": round(max(latencies), 3) if latencies else 0.0,
+        "min_latency_ms": round(min(latencies), 3) if latencies else 0.0,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "tokens_per_sec": round(total_tokens / wall_time_sec, 3) if wall_time_sec > 0 else 0.0,
+        "avg_reference_count": round(statistics.mean(references), 3) if references else 0.0,
+        "latency_histogram": histogram(latencies, bins=10),
+    }
+
+
+def benchmark_retrieval(
+    client: RAGFlowClient,
+    dataset_id: str,
+    prompts: list[dict[str, Any]],
+    concurrency: int,
+    retrieval_options: dict[str, Any],
+    run_id: str,
+) -> dict[str, Any]:
+    results: list[dict[str, Any]] = []
+    started = time.perf_counter()
+    total = len(prompts)
+
+    def worker(item: dict[str, Any]) -> dict[str, Any]:
+        started_at = time.perf_counter()
+        try:
+            payload = client.retrieval(dataset_id, item["prompt"], retrieval_options)
+            elapsed_ms = round((time.perf_counter() - started_at) * 1000, 3)
+            chunks = payload.get("chunks", [])
+            doc_aggs = payload.get("doc_aggs", [])
+            return {
+                "prompt_id": item["id"],
+                "prompt": item["prompt"],
+                "kind": item["kind"],
+                "document_name": item.get("document_name"),
+                "ok": True,
+                "latency_ms": elapsed_ms,
+                "chunk_count": len(chunks),
+                "top_documents": [agg.get("doc_name") for agg in doc_aggs[:3] if agg.get("doc_name")],
+                "top_chunk_preview": (chunks[0].get("content_with_weight") or chunks[0].get("content") or "")[:240] if chunks else "",
+                "error": "",
+            }
+        except Exception as exc:
+            elapsed_ms = round((time.perf_counter() - started_at) * 1000, 3)
+            return {
+                "prompt_id": item["id"],
+                "prompt": item["prompt"],
+                "kind": item["kind"],
+                "document_name": item.get("document_name"),
+                "ok": False,
+                "latency_ms": elapsed_ms,
+                "chunk_count": 0,
+                "top_documents": [],
+                "top_chunk_preview": "",
+                "error": str(exc),
+            }
+
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        future_map = {pool.submit(worker, item): item for item in prompts}
+        completed = 0
+        for future in as_completed(future_map):
+            result = future.result()
+            results.append(result)
+            completed += 1
+            patch_run(
+                run_id,
+                lambda run: run["live"].update(
+                    {
+                        "retrieval_completed": completed,
+                        "retrieval_total": total,
+                        "last_retrieval": {
+                            "prompt": result["prompt"][:120],
+                            "ok": result["ok"],
+                            "latency_ms": result["latency_ms"],
+                        },
+                    }
+                ),
+            )
+
+    results.sort(key=lambda item: item["prompt"])
+    return {"results": results, "summary": summarize_benchmark(results, time.perf_counter() - started)}
+
+
+def benchmark_chat(
+    client: RAGFlowClient,
+    chat_id: str,
+    prompts: list[dict[str, Any]],
+    concurrency: int,
+    completion_options: dict[str, Any],
+    run_id: str,
+) -> dict[str, Any]:
+    results: list[dict[str, Any]] = []
+    started = time.perf_counter()
+    total = len(prompts)
+
+    def worker(item: dict[str, Any]) -> dict[str, Any]:
+        started_at = time.perf_counter()
+        try:
+            payload = client.completion(chat_id, item["prompt"], options=completion_options)
+            elapsed_ms = round((time.perf_counter() - started_at) * 1000, 3)
+            choice = (payload.get("choices") or [{}])[0]
+            message = choice.get("message") or {}
+            usage = payload.get("usage") or {}
+            reference = message.get("reference") or []
+            answer = message.get("content") or ""
+            return {
+                "prompt_id": item["id"],
+                "prompt": item["prompt"],
+                "kind": item["kind"],
+                "document_name": item.get("document_name"),
+                "ok": True,
+                "latency_ms": elapsed_ms,
+                "prompt_tokens": safe_int(usage.get("prompt_tokens")),
+                "completion_tokens": safe_int(usage.get("completion_tokens")),
+                "total_tokens": safe_int(usage.get("total_tokens")),
+                "reference_count": len(reference),
+                "referenced_documents": list(
+                    {
+                        chunk.get("document_name") or chunk.get("doc_name") or chunk.get("document_id")
+                        for chunk in reference
+                        if chunk.get("document_name") or chunk.get("doc_name") or chunk.get("document_id")
+                    }
+                ),
+                "answer_preview": answer[:360],
+                "finish_reason": choice.get("finish_reason"),
+                "error": "",
+            }
+        except Exception as exc:
+            elapsed_ms = round((time.perf_counter() - started_at) * 1000, 3)
+            return {
+                "prompt_id": item["id"],
+                "prompt": item["prompt"],
+                "kind": item["kind"],
+                "document_name": item.get("document_name"),
+                "ok": False,
+                "latency_ms": elapsed_ms,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "reference_count": 0,
+                "referenced_documents": [],
+                "answer_preview": "",
+                "finish_reason": "error",
+                "error": str(exc),
+            }
+
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        future_map = {pool.submit(worker, item): item for item in prompts}
+        completed = 0
+        for future in as_completed(future_map):
+            result = future.result()
+            results.append(result)
+            completed += 1
+            patch_run(
+                run_id,
+                lambda run: run["live"].update(
+                    {
+                        "chat_completed": completed,
+                        "chat_total": total,
+                        "last_chat": {
+                            "prompt": result["prompt"][:120],
+                            "ok": result["ok"],
+                            "latency_ms": result["latency_ms"],
+                        },
+                    }
+                ),
+            )
+
+    results.sort(key=lambda item: item["prompt"])
+    return {"results": results, "summary": summarize_benchmark(results, time.perf_counter() - started)}
+
+
+def cleanup_remote_resources(client: RAGFlowClient, resource_ids: dict[str, str], run_id: str) -> None:
+    chat_id = resource_ids.get("chat_id")
+    dataset_id = resource_ids.get("dataset_id")
+    if chat_id:
+        try:
+            client.delete_chat(chat_id)
+            append_run_event(run_id, f"Deleted remote chat assistant {chat_id}.")
+        except Exception as exc:
+            append_run_event(run_id, f"Chat cleanup failed: {exc}", level="warning")
+    if dataset_id:
+        try:
+            client.delete_dataset(dataset_id)
+            append_run_event(run_id, f"Deleted remote dataset {dataset_id}.")
+        except Exception as exc:
+            append_run_event(run_id, f"Dataset cleanup failed: {exc}", level="warning")
+
+
+def execute_run(run_id: str) -> None:
+    with RUNS_LOCK:
+        config = deepcopy(RUN_SECRETS[run_id])
+
+    client = RAGFlowClient(config["base_url"], config["api_key"], timeout=config["http_timeout_sec"], tls_config=config.get("tls"))
+    resource_ids: dict[str, str] = {}
+
+    try:
+        set_run_fields(run_id, status="running", phase="provisioning", started_at=utc_now())
+        append_run_event(run_id, f"Run started against {normalize_root_url(config['base_url'])}.")
+
+        batch = config.get("batch", {})
+        run_suffix = f"-r{safe_int(batch.get('run_index'), 1):02d}" if safe_int(batch.get("run_count"), 1) > 1 else ""
+        dataset_name = f"{config['dataset_prefix']}-{datetime.now().strftime('%Y%m%d-%H%M%S')}{run_suffix}"
+        dataset_options = merge_dicts(
+            {
+                "chunk_method": "naive",
+                "description": "Generated by performance load tester",
+                "parser_config": {"layout_recognize": "DeepDOC"},
+            },
+            config["dataset_options"],
+        )
+        dataset = client.create_dataset(dataset_name, dataset_options)
+        dataset_id = dataset["id"]
+        resource_ids["dataset_id"] = dataset_id
+        set_run_fields(run_id, dataset={"id": dataset_id, "name": dataset_name})
+        append_run_event(run_id, f"Created dataset {dataset_name} ({dataset_id}).")
+        set_run_fields(run_id, progress=10)
+
+        uploaded_documents = client.upload_documents(dataset_id, [Path(path) for path in config["local_files"]])
+        uploaded_ids = [document["id"] for document in uploaded_documents]
+        patch_run(run_id, lambda run: run["documents"].update({"uploaded": uploaded_documents}))
+        append_run_event(run_id, f"Uploaded {len(uploaded_documents)} document(s).")
+        set_run_fields(run_id, progress=20)
+
+        enable_parsing = config["stages"]["parsing"]["enabled"]
+        enable_retrieval = config["stages"]["retrieval"]["enabled"]
+        enable_chat = config["stages"]["chat"]["enabled"]
+
+        parse_stage = config["stages"]["parsing"]
+        retrieval_stage = config["stages"]["retrieval"]
+        chat_stage = config["stages"]["chat"]
+
+        parse_summary: dict[str, Any] = {}
+        last_snapshot: list[dict[str, Any]] = []
+        parse_wall_time = 0.0
+
+        if enable_parsing:
+            set_run_fields(run_id, phase="parsing")
+            client.parse_documents(dataset_id, uploaded_ids, parse_stage["request_options"])
+            append_run_event(run_id, "Document parsing queued.")
+
+            parse_started = time.perf_counter()
+            while True:
+                documents = client.list_all_documents(dataset_id)
+                tracked = [document for document in documents if document["id"] in uploaded_ids]
+                last_snapshot = tracked
+                done_count = sum(1 for document in tracked if document.get("run") in TERMINAL_DOCUMENT_STATES)
+                patch_run(run_id, lambda run: run["live"].update({"parse_completed": done_count, "parse_total": len(uploaded_ids), "documents": tracked}))
+                if tracked and done_count == len(uploaded_ids):
+                    break
+                time.sleep(parse_stage["poll_interval_sec"])
+
+            parse_wall_time = round(time.perf_counter() - parse_started, 3)
+            file_logs = client.list_pipeline_logs(dataset_id) if parse_stage["collect_pipeline_logs"] else []
+            dataset_logs = client.list_pipeline_dataset_logs(dataset_id) if parse_stage["collect_pipeline_logs"] else []
+            parse_summary = summarize_documents(last_snapshot, file_logs)
+            parse_summary["wall_time_sec"] = parse_wall_time
+            parse_summary["dataset_logs"] = dataset_logs
+            set_run_fields(run_id, parse=parse_summary, progress=50)
+            append_run_event(run_id, "Parsing completed and pipeline logs collected.")
+        else:
+            last_snapshot = client.list_all_documents(dataset_id)
+            set_run_fields(run_id, phase="uploaded", parse={"skipped": True, "documents": last_snapshot}, progress=40)
+            append_run_event(run_id, "Parsing stage skipped.")
+
+        prompts: list[dict[str, Any]] = []
+        if enable_retrieval or enable_chat:
+            set_run_fields(run_id, phase="prompt_generation")
+            chunk_samples = {}
+            sample_size = max(3, parse_stage["chunk_sample_size"], config["prompts_per_document"])
+            for document in last_snapshot:
+                if document.get("run") == "DONE":
+                    chunk_samples[document["id"]] = client.list_chunks(dataset_id, document["id"], page=1, page_size=sample_size)
+            prompts = build_prompt_set(last_snapshot, chunk_samples, prompts_per_document=config["prompts_per_document"], shared_prompts=config["shared_prompts"])
+            if not prompts:
+                prompts = [{"id": str(uuid.uuid4()), "kind": "fallback", "prompt": "Summarize the uploaded knowledge base and highlight the most important facts.", "document_id": None, "document_name": None}]
+            set_run_fields(run_id, prompts=prompts, progress=55)
+            append_run_event(run_id, f"Generated {len(prompts)} automatic prompt(s).")
+        else:
+            append_run_event(run_id, "Prompt generation skipped because retrieval and chat are disabled.")
+
+        retrieval: dict[str, Any] = {"summary": {"skipped": not enable_retrieval}, "results": []}
+        chat_results: dict[str, Any] = {"summary": {"skipped": not enable_chat}, "results": []}
+
+        if enable_retrieval:
+            set_run_fields(run_id, phase="retrieval_benchmark", progress=65)
+            retrieval = benchmark_retrieval(
+                client,
+                dataset_id,
+                prompts,
+                retrieval_stage["concurrency"],
+                retrieval_stage["request_options"],
+                run_id,
+            )
+            set_run_fields(run_id, retrieval=retrieval, progress=78)
+            append_run_event(run_id, "Retrieval benchmark completed.")
+        else:
+            set_run_fields(run_id, retrieval=retrieval)
+            append_run_event(run_id, "Retrieval stage skipped.")
+
+        if enable_chat:
+            set_run_fields(run_id, phase="assistant_setup", progress=80)
+            chat_name = f"{config['chat_prefix']}-{datetime.now().strftime('%H%M%S')}{run_suffix}"
+            chat = client.create_chat(chat_name, dataset_id, options=chat_stage["create_options"])
+            chat_id = chat["id"]
+            resource_ids["chat_id"] = chat_id
+            set_run_fields(run_id, chat={"id": chat_id, "name": chat_name})
+            append_run_event(run_id, f"Created chat assistant {chat_name} ({chat_id}).")
+
+            set_run_fields(run_id, phase="chat_benchmark", progress=85)
+            chat_results = benchmark_chat(
+                client,
+                chat_id,
+                prompts,
+                chat_stage["concurrency"],
+                chat_stage["completion_options"],
+                run_id,
+            )
+            set_run_fields(run_id, chat_results=chat_results, progress=95)
+            append_run_event(run_id, "Chat benchmark completed.")
+        else:
+            set_run_fields(run_id, chat_results=chat_results)
+            append_run_event(run_id, "Chat stage skipped.")
+
+        set_run_fields(
+            run_id,
+            summary={
+                "documents": parse_summary.get("total_documents", len(last_snapshot)),
+                "prompts": len(prompts),
+                "parse_wall_time_sec": parse_wall_time,
+                "parse_total_tokens": parse_summary.get("total_tokens", 0),
+                "retrieval_p95_ms": retrieval.get("summary", {}).get("p95_latency_ms", 0),
+                "chat_p95_ms": chat_results.get("summary", {}).get("p95_latency_ms", 0),
+                "chat_error_rate": chat_results.get("summary", {}).get("error_rate", 0),
+                "chat_tokens_per_sec": chat_results.get("summary", {}).get("tokens_per_sec", 0),
+            },
+            progress=100,
+            phase="completed",
+            status="completed",
+            completed_at=utc_now(),
+        )
+        append_run_event(run_id, "Run completed successfully.")
+    except Exception as exc:
+        set_run_fields(run_id, status="failed", phase="failed", completed_at=utc_now(), error=str(exc))
+        append_run_event(run_id, f"Run failed: {exc}", level="error")
+    finally:
+        if config.get("cleanup_remote"):
+            cleanup_remote_resources(client, resource_ids, run_id)
+        upload_dir = Path(config["upload_dir"])
+        if upload_dir.exists():
+            shutil.rmtree(upload_dir, ignore_errors=True)
+        batch_root_raw = config.get("batch_root")
+        if batch_root_raw:
+            batch_root = Path(batch_root_raw)
+            try:
+                batch_root.rmdir()
+            except OSError:
+                pass
+        with RUNS_LOCK:
+            RUN_SECRETS.pop(run_id, None)
+        persist_run_snapshot(run_id)
+
+
+def build_run_response(run_id: str) -> dict[str, Any]:
+    with RUNS_LOCK:
+        return json_clone(RUNS[run_id])
+
+
+def queue_run(run_id: str, config: dict[str, Any], filenames: list[str]) -> None:
+    batch = config.get("batch", {})
+    run_count = safe_int(batch.get("run_count"), 1)
+    run_index = safe_int(batch.get("run_index"), 1)
+    batch_note = f" ({run_index}/{run_count})" if run_count > 1 else ""
+    run = {
+        "id": run_id,
+        "created_at": utc_now(),
+        "started_at": None,
+        "completed_at": None,
+        "status": "queued",
+        "phase": "queued",
+        "progress": 0,
+        "error": "",
+        "config": {
+            "base_url": normalize_root_url(config["base_url"]),
+            "api_key_hint": config["api_key_hint"],
+            "tls": {"verify_ssl": bool(config["tls"].get("verify", True))},
+            "dataset_options": config["dataset_options"],
+            "prompts_per_document": config["prompts_per_document"],
+            "shared_prompts": config["shared_prompts"],
+            "dataset_prefix": config["dataset_prefix"],
+            "chat_prefix": config["chat_prefix"],
+            "cleanup_remote": config["cleanup_remote"],
+            "stages": config["stages"],
+            "batch": batch,
+        },
+        "dataset": {},
+        "chat": {},
+        "documents": {"filenames": filenames, "uploaded": []},
+        "parse": {},
+        "prompts": [],
+        "retrieval": {},
+        "chat_results": {},
+        "summary": {},
+        "live": {"parse_completed": 0, "parse_total": len(filenames), "retrieval_completed": 0, "retrieval_total": 0, "chat_completed": 0, "chat_total": 0, "documents": []},
+        "events": [{"ts": utc_now(), "level": "info", "message": f"Run queued{batch_note} with {len(filenames)} file(s)."}],
+    }
+
+    with RUNS_LOCK:
+        RUNS[run_id] = run
+        RUN_SECRETS[run_id] = config
+    persist_run_snapshot(run_id)
+    threading.Thread(target=execute_run, args=(run_id,), daemon=True).start()
+
+
+def load_existing_runs() -> None:
+    for json_file in sorted(RUNS_DIR.glob("*.json")):
+        try:
+            payload = json.loads(json_file.read_text(encoding="utf-8"))
+            run_id = payload.get("id")
+            if run_id:
+                RUNS[run_id] = payload
+        except Exception:
+            continue
+
+INDEX_HTML = """<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <title>RAGFlow Performance Lab</title>
+  <style>
+    :root { --bg:#f4efe6; --panel:#fffaf0; --ink:#1d232a; --muted:#6d726f; --line:#d9cfbe; --accent:#0f766e; --accent2:#c2410c; --good:#166534; --bad:#b91c1c; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:radial-gradient(circle at top left, rgba(15,118,110,.12), transparent 28%), radial-gradient(circle at top right, rgba(194,65,12,.12), transparent 24%), var(--bg); color:var(--ink); font-family:\"Segoe UI\",sans-serif; }
+    .page { display:grid; grid-template-columns:380px minmax(0,1fr); min-height:100vh; }
+    .sidebar, .content { padding:20px; }
+    .sidebar { border-right:1px solid var(--line); background:rgba(255,250,240,.82); backdrop-filter:blur(8px); }
+    .panel, .brand, .card { border:1px solid var(--line); background:var(--panel); border-radius:18px; box-shadow:0 6px 24px rgba(29,35,42,.05); }
+    .brand, .panel, .card { padding:16px; }
+    .brand { margin-bottom:16px; }
+    .brand h1 { margin:0 0 6px; font-size:26px; letter-spacing:-.04em; }
+    .brand p, .subtle { color:var(--muted); line-height:1.45; }
+    .panel { margin-bottom:16px; }
+    h2, h3 { margin:0 0 12px; letter-spacing:-.02em; }
+    .form-grid { display:grid; gap:12px; }
+    .row2 { display:grid; gap:12px; grid-template-columns:repeat(2,minmax(0,1fr)); }
+    label { display:grid; gap:6px; font-size:13px; color:var(--muted); }
+    input, select, textarea, button { font:inherit; }
+    input, select, textarea { width:100%; border:1px solid var(--line); background:#fff; border-radius:12px; padding:10px 12px; color:var(--ink); }
+    textarea { min-height:96px; resize:vertical; font-family:Consolas,monospace; font-size:12px; }
+    button { border:0; border-radius:12px; padding:12px 14px; cursor:pointer; background:var(--accent); color:white; font-weight:600; }
+    button.secondary { background:#e7ddd0; color:var(--ink); }
+    .check { display:flex; align-items:center; gap:10px; color:var(--ink); }
+    .check input { width:auto; }
+    .run-list { display:grid; gap:10px; max-height:38vh; overflow:auto; }
+    .run-item { border:1px solid var(--line); border-radius:14px; padding:12px; background:#fff; cursor:pointer; }
+    .run-item.active { border-color:var(--accent); box-shadow:inset 0 0 0 1px var(--accent); }
+    .meta { display:flex; justify-content:space-between; gap:8px; font-size:12px; color:var(--muted); }
+    .badge { display:inline-flex; padding:4px 10px; border-radius:999px; font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
+    .badge.completed { background:rgba(22,101,52,.1); color:var(--good); }
+    .badge.running { background:rgba(15,118,110,.1); color:var(--accent); }
+    .badge.failed { background:rgba(185,28,28,.1); color:var(--bad); }
+    .grid { display:grid; gap:16px; grid-template-columns:repeat(12,minmax(0,1fr)); }
+    .span3 { grid-column:span 3; } .span6 { grid-column:span 6; } .span12 { grid-column:span 12; }
+    .metric .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.06em; }
+    .metric .value { font-size:28px; font-weight:800; letter-spacing:-.05em; }
+    .progress { height:12px; border-radius:999px; background:#e8dfd4; overflow:hidden; margin:10px 0 8px; }
+    .progress > div { height:100%; background:linear-gradient(90deg, var(--accent), #14b8a6); }
+    .bars { display:grid; gap:10px; margin-top:12px; }
+    .bar-row { display:grid; gap:8px; grid-template-columns:180px 1fr 70px; align-items:center; font-size:13px; }
+    .bar-track { width:100%; height:12px; border-radius:999px; background:#ede3d5; overflow:hidden; }
+    .bar-fill { height:100%; background:linear-gradient(90deg, var(--accent), #2dd4bf); }
+    .bar-fill.orange { background:linear-gradient(90deg, var(--accent2), #fb923c); }
+    .histogram { display:grid; grid-template-columns:repeat(auto-fit,minmax(48px,1fr)); align-items:end; gap:8px; min-height:180px; margin-top:12px; }
+    .bin { display:grid; gap:6px; justify-items:center; font-size:11px; color:var(--muted); }
+    .stick { width:100%; border-radius:10px 10px 2px 2px; background:linear-gradient(180deg,var(--accent),#2dd4bf); min-height:4px; }
+    table { width:100%; border-collapse:collapse; font-size:13px; } th, td { border-bottom:1px solid var(--line); padding:10px 8px; text-align:left; vertical-align:top; }
+    th { font-size:11px; text-transform:uppercase; color:var(--muted); letter-spacing:.08em; }
+    pre { margin:0; white-space:pre-wrap; word-break:break-word; font-family:Consolas,monospace; font-size:12px; background:#fff; border:1px solid var(--line); border-radius:12px; padding:12px; max-height:280px; overflow:auto; }
+    .empty { padding:18px; border:1px dashed var(--line); border-radius:16px; color:var(--muted); background:rgba(255,255,255,.5); text-align:center; }
+    @media (max-width:1100px) { .page { grid-template-columns:1fr; } .sidebar { border-right:0; border-bottom:1px solid var(--line); } .row2 { grid-template-columns:1fr; } .span3, .span6, .span12 { grid-column:span 12; } .bar-row { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <div class=\"page\">
+    <aside class=\"sidebar\">
+      <section class=\"brand\"><h1>RAGFlow Performance Lab</h1><p>Uploads files, creates a dataset, measures parsing, benchmarks retrieval and chat, and reuses the same KB pipeline logs surfaced in the current RAGFlow UI.</p></section>
+      <section class=\"panel\">
+        <h2>New Run</h2>
+        <form id=\"run-form\" class=\"form-grid\">
+          <label>RAGFlow Base URL<input name=\"base_url\" value=\"http://127.0.0.1\" required /></label>
+          <label>API Key<input name=\"api_key\" type=\"password\" required /></label>
+          <label class=\"check\"><input name=\"verify_ssl\" type=\"checkbox\" checked />Verify SSL certificates</label>
+          <div class=\"row2\"><label>HTTP Timeout (sec)<input name=\"http_timeout_sec\" type=\"number\" min=\"30\" max=\"1800\" value=\"180\" /></label><label>Run Count<input name=\"run_count\" type=\"number\" min=\"1\" max=\"50\" value=\"1\" /></label></div>
+          <div class=\"row2\"><label>Dataset Prefix<input name=\"dataset_prefix\" value=\"perf-dataset\" /></label><label>Chat Prefix<input name=\"chat_prefix\" value=\"perf-chat\" /></label></div>
+          <label>Files<input name=\"files\" type=\"file\" multiple required /></label>
+          <label>Prompt Generation Settings
+            <textarea name=\"prompt_options\">{
+  \"prompts_per_document\": 3,
+  \"shared_prompts\": 2
+}</textarea>
+          </label>
+          <label>Dataset Options JSON
+            <textarea name=\"dataset_options\">{
+  \"chunk_method\": \"naive\",
+  \"description\": \"Generated by performance load tester\",
+  \"parser_config\": {
+    \"layout_recognize\": \"DeepDOC\"
+  }
+}</textarea>
+          </label>
+          <label class=\"check\"><input name=\"enable_parsing\" type=\"checkbox\" checked />Enable parsing stage</label>
+          <label>Parsing Config JSON
+            <textarea name=\"parsing_options\">{
+  \"poll_interval_sec\": 2,
+  \"chunk_sample_size\": 3,
+  \"collect_pipeline_logs\": true
+}</textarea>
+          </label>
+          <label class=\"check\"><input name=\"enable_retrieval\" type=\"checkbox\" checked />Enable retrieval benchmark</label>
+          <label>Retrieval Config JSON
+            <textarea name=\"retrieval_options\">{
+  \"concurrency\": 4,
+  \"top_k\": 8,
+  \"similarity_threshold\": 0.2,
+  \"vector_similarity_weight\": 0.7,
+  \"highlight\": true
+}</textarea>
+          </label>
+          <label class=\"check\"><input name=\"enable_chat\" type=\"checkbox\" checked />Enable chat benchmark</label>
+          <label>Chat Config JSON
+            <textarea name=\"chat_options\">{
+  \"concurrency\": 4,
+  \"create\": {
+    \"llm\": {
+      \"model_name\": null
+    }
+  },
+  \"completion\": {
+    \"extra_body\": {
+      \"reference\": true
+    }
+  }
+}</textarea>
+          </label>
+          <label class=\"check\"><input name=\"cleanup_remote\" type=\"checkbox\" />Delete the remote dataset and chat after the run</label>
+          <button type=\"submit\">Start Benchmark</button>
+        </form>
+      </section>
+      <section class=\"panel\"><div style=\"display:flex;justify-content:space-between;align-items:center;gap:10px;\"><h2 style=\"margin:0;\">Runs</h2><button class=\"secondary\" id=\"refresh-runs\" type=\"button\">Refresh</button></div><div id=\"run-list\" class=\"run-list\"></div></section>
+    </aside>
+    <main class=\"content\"><div id=\"run-view\" class=\"empty\">Start a run or select a previous benchmark from the left.</div></main>
+  </div>
+<script>
+const state = { activeRunId: null, pollHandle: null, runs: [] };
+function statusBadge(status) { const normalized = (status || 'queued').toLowerCase(); return `<span class=\"badge ${normalized}\">${normalized}</span>`; }
+function number(value, digits = 2) { if (value === null || value === undefined || Number.isNaN(Number(value))) return '-'; return Number(value).toFixed(digits); }
+function formatTs(value) { if (!value) return '-'; const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleString(); }
+function metricCard(label, value, hint = '') { return `<div class=\"card span3\"><div class=\"metric\"><div class=\"label\">${label}</div><div class=\"value\">${value}</div><div class=\"subtle\">${hint}</div></div></div>`; }
+function renderBars(rows, formatter = (value) => value, orange = false) { if (!rows || !rows.length) return `<div class=\"empty\">No chart data available.</div>`; const max = Math.max(...rows.map((row) => Number(row.value) || 0), 1); return `<div class=\"bars\">${rows.map((row) => `<div class=\"bar-row\"><div title=\"${row.label}\">${row.label}</div><div class=\"bar-track\"><div class=\"bar-fill ${orange ? 'orange' : ''}\" style=\"width:${Math.max(4, (Number(row.value) || 0) / max * 100)}%\"></div></div><div>${formatter(row.value)}</div></div>`).join('')}</div>`; }
+function renderHistogram(data) { if (!data || !data.length) return `<div class=\"empty\">No latency data available.</div>`; const max = Math.max(...data.map((bin) => bin.count), 1); return `<div class=\"histogram\">${data.map((bin) => `<div class=\"bin\"><div>${bin.count}</div><div class=\"stick\" style=\"height:${Math.max(8, bin.count / max * 140)}px\"></div><div>${bin.label}</div></div>`).join('')}</div>`; }
+function renderTable(headers, rows) { if (!rows || !rows.length) return `<div class=\"empty\">No rows available.</div>`; return `<table><thead><tr>${headers.map((header) => `<th>${header}</th>`).join('')}</tr></thead><tbody>${rows.map((row) => `<tr>${row.map((cell) => `<td>${cell}</td>`).join('')}</tr>`).join('')}</tbody></table>`; }
+async function fetchRuns() { const response = await fetch('/api/runs'); const payload = await response.json(); state.runs = payload.runs || []; renderRunList(); }
+async function fetchRun(runId, options = {}) { if (!runId) return; const response = await fetch(`/api/runs/${runId}`); const payload = await response.json(); state.activeRunId = runId; renderRunView(payload); if (!options.silent) renderRunList(); const live = ['queued', 'running'].includes((payload.status || '').toLowerCase()); if (live) startPolling(runId); else stopPolling(); }
+function startPolling(runId) { stopPolling(); state.pollHandle = window.setInterval(() => fetchRun(runId, { silent: true }), 2500); }
+function stopPolling() { if (state.pollHandle) { window.clearInterval(state.pollHandle); state.pollHandle = null; } }
+function renderRunList() { const container = document.getElementById('run-list'); if (!state.runs.length) { container.innerHTML = `<div class=\"empty\">No runs yet.</div>`; return; } container.innerHTML = state.runs.map((run) => { const stages = []; if (run.config?.stages?.parsing?.enabled) stages.push('parse'); if (run.config?.stages?.retrieval?.enabled) stages.push('retrieval'); if (run.config?.stages?.chat?.enabled) stages.push('chat'); const batch = run.config?.batch || {}; const batchLabel = batch.run_count > 1 ? ` • run ${batch.run_index}/${batch.run_count}` : ''; return `<div class=\"run-item ${run.id === state.activeRunId ? 'active' : ''}\" data-run-id=\"${run.id}\"><div style=\"display:flex;justify-content:space-between;align-items:flex-start;gap:10px;\"><div><div style=\"font-weight:700;line-height:1.25;\">${run.dataset?.name || run.config?.dataset_prefix || 'pending run'}</div><div class=\"subtle\">${run.summary?.prompts || 0} prompts • ${(stages.join(' + ') || 'upload-only')}${batchLabel}</div></div>${statusBadge(run.status)}</div><div class=\"meta\" style=\"margin-top:8px;\"><span>${formatTs(run.started_at || run.created_at)}</span><span>${run.phase || '-'}</span></div></div>`; }).join(''); container.querySelectorAll('.run-item').forEach((element) => element.addEventListener('click', () => fetchRun(element.dataset.runId))); }
+function renderRunView(run) {
+  const container = document.getElementById('run-view');
+  const parse = run.parse || {}; const retrieval = run.retrieval || { summary: {}, results: [] }; const chat = run.chat_results || { summary: {}, results: [] }; const live = run.live || {}; const prompts = run.prompts || []; const events = run.events || [];
+  const stages = run.config?.stages || {};
+  const batch = run.config?.batch || {};
+  const batchLabel = batch.run_count > 1 ? ` • run ${batch.run_index}/${batch.run_count}` : '';
+  const parsingEnabled = Boolean(stages.parsing?.enabled);
+  const retrievalEnabled = Boolean(stages.retrieval?.enabled);
+  const chatEnabled = Boolean(stages.chat?.enabled);
+  const metricValue = (enabled, value, digits = 2, suffix = '') => enabled ? `${number(value, digits)}${suffix}` : 'skipped';
+  const metricHint = (enabled, hint) => enabled ? hint : 'stage disabled';
+  const parseBars = (parse.documents || []).map((doc) => ({ label: doc.name, value: Number(doc.process_duration || 0) })).sort((a,b) => b.value - a.value).slice(0, 12);
+  const pipelineBars = (parse.pipeline_logs || []).map((log) => ({ label: log.document_name || log.document_id || 'unknown', value: Number(log.duration_sec || 0) })).sort((a,b) => b.value - a.value).slice(0, 12);
+  const retrievalRows = (retrieval.results || []).slice(0, 25).map((item) => [item.ok ? 'ok' : `<span style=\"color:var(--bad);\">error</span>`, item.kind, item.document_name || '-', item.prompt, `${number(item.latency_ms, 1)} ms`, String(item.chunk_count), item.top_documents?.join(', ') || '-']);
+  const chatRows = (chat.results || []).slice(0, 25).map((item) => [item.ok ? 'ok' : `<span style=\"color:var(--bad);\">error</span>`, item.kind, item.document_name || '-', item.prompt, `${number(item.latency_ms, 1)} ms`, `${item.total_tokens || 0}`, `${item.reference_count || 0}`, item.referenced_documents?.join(', ') || '-']);
+  const pipelineRows = (parse.pipeline_logs || []).slice(0, 25).map((item) => [item.document_name || '-', item.task_type || '-', item.status || '-', `${number(item.duration_sec, 2)} s`, item.components?.join(' -> ') || '-', item.progress_msg || '-']);
+  container.innerHTML = `
+    <div style=\"display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:18px;\"><div><div style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap;\"><h2 style=\"margin:0;font-size:34px;letter-spacing:-.06em;\">${run.dataset?.name || 'Pending run'}</h2>${statusBadge(run.status)}</div><div class=\"subtle\" style=\"margin-top:6px;\">${run.dataset?.id || '-'} • ${run.phase || '-'}${batchLabel} • ${run.error ? `<span style=\"color:var(--bad);\">${run.error}</span>` : 'no fatal error'}</div></div><div class=\"subtle\" style=\"text-align:right;\"><div>Started: ${formatTs(run.started_at || run.created_at)}</div><div>Completed: ${formatTs(run.completed_at)}</div><div>Host: ${run.config?.base_url || '-'}</div></div></div>
+    <section class=\"card\" style=\"margin-bottom:16px;\"><div style=\"display:flex;justify-content:space-between;gap:10px;align-items:center;\"><div><h3 style=\"margin:0 0 6px;\">Live Progress</h3><div class=\"subtle\">${live.parse_completed || 0}/${live.parse_total || 0} parsed • ${live.retrieval_completed || 0}/${live.retrieval_total || 0} retrievals • ${live.chat_completed || 0}/${live.chat_total || 0} chats</div></div><div style=\"font-size:30px;font-weight:800;letter-spacing:-.05em;\">${Number(run.progress || 0)}%</div></div><div class=\"progress\"><div style=\"width:${Math.max(2, Number(run.progress || 0))}%\"></div></div><div class=\"subtle\">${events.length ? events[events.length - 1].message : 'Waiting for updates.'}</div></section>
+    <section class=\"grid\">
+      ${metricCard('Documents', run.summary?.documents || parse.total_documents || 0, parsingEnabled ? `${parse.total_chunks || 0} chunks • ${parse.total_tokens || 0} tokens indexed` : 'uploaded files only')}
+      ${metricCard('Prompts', run.summary?.prompts || prompts.length || 0, `${run.config?.prompts_per_document || 0}/doc + ${run.config?.shared_prompts || 0} shared`)}
+      ${metricCard('Parse P95', metricValue(parsingEnabled, parse.p95_parse_duration_sec || 0, 2, ' s'), metricHint(parsingEnabled, `wall ${number(run.summary?.parse_wall_time_sec || parse.wall_time_sec || 0)} s`))}
+      ${metricCard('Chat P95', metricValue(chatEnabled, chat.summary?.p95_latency_ms || 0, 2, ' ms'), metricHint(chatEnabled, `${number(chat.summary?.throughput_rps || 0)} req/s`))}
+      ${metricCard('Retrieval P95', metricValue(retrievalEnabled, retrieval.summary?.p95_latency_ms || 0, 2, ' ms'), metricHint(retrievalEnabled, `${number(retrieval.summary?.throughput_rps || 0)} req/s`))}
+      ${metricCard('Chat Error Rate', chatEnabled ? `${number((chat.summary?.error_rate || 0) * 100)}%` : 'skipped', metricHint(chatEnabled, `${chat.summary?.errors || 0} failed calls`))}
+      ${metricCard('Token Throughput', metricValue(chatEnabled, chat.summary?.tokens_per_sec || 0, 2, ' tok/s'), metricHint(chatEnabled, `${chat.summary?.total_tokens || 0} total tokens`))}
+      ${metricCard('Parse Token Rate', metricValue(parsingEnabled, parse.token_throughput_per_sec || 0, 2, ' tok/s'), metricHint(parsingEnabled, `${parse.status_breakdown ? Object.entries(parse.status_breakdown).map(([k,v]) => `${k}:${v}`).join(' • ') : '-'}`))}
+      <div class=\"card span6\"><h3>Parse Duration by Document</h3><div class=\"subtle\">Derived from document metrics after parsing completes.</div>${renderBars(parseBars, (value) => `${number(value)} s`)}</div>
+      <div class=\"card span6\"><h3>Pipeline Log Durations</h3><div class=\"subtle\">Uses the same KB pipeline log surface the current RAGFlow UI reads.</div>${renderBars(pipelineBars, (value) => `${number(value)} s`, true)}</div>
+      <div class=\"card span6\"><h3>Retrieval Latency Histogram</h3><div class=\"subtle\">Official /api/v1/retrieval benchmark on the generated prompts.</div>${renderHistogram(retrieval.summary?.latency_histogram || [])}</div>
+      <div class=\"card span6\"><h3>Chat Latency Histogram</h3><div class=\"subtle\">Official OpenAI-compatible chat completions.</div>${renderHistogram(chat.summary?.latency_histogram || [])}</div>
+      <div class=\"card span12\"><h3>Pipeline Log Table</h3>${renderTable(['document','task','status','duration','components','progress message'], pipelineRows)}</div>
+      <div class=\"card span12\"><h3>Retrieval Sample Results</h3>${renderTable(['status','kind','document','prompt','latency','chunks','top docs'], retrievalRows)}</div>
+      <div class=\"card span12\"><h3>Chat Sample Results</h3>${renderTable(['status','kind','document','prompt','latency','tokens','refs','referenced docs'], chatRows)}</div>
+      <div class=\"card span6\"><h3>Generated Prompts</h3><pre>${JSON.stringify(prompts, null, 2)}</pre></div>
+      <div class=\"card span6\"><h3>Event Log</h3><pre>${events.map((event) => `[${formatTs(event.ts)}] ${event.level.toUpperCase()} ${event.message}`).join('\n')}</pre></div>
+    </section>`;
+}
+document.getElementById('refresh-runs').addEventListener('click', fetchRuns);
+document.getElementById('run-form').addEventListener('submit', async (event) => { event.preventDefault(); const formData = new FormData(event.currentTarget); const response = await fetch('/api/start', { method: 'POST', body: formData }); const payload = await response.json(); if (!response.ok || payload.error) { alert(payload.error || 'Run creation failed.'); return; } const targetRunId = payload.run_id || (payload.run_ids && payload.run_ids[0]); event.currentTarget.reset(); await fetchRuns(); if (targetRunId) await fetchRun(targetRunId); });
+fetchRuns();
+</script>
+</body>
+</html>"""
+
+@app.get("/")
+async def index() -> str:
+    return INDEX_HTML
+
+
+@app.get("/api/runs")
+async def list_runs() -> Any:
+    with RUNS_LOCK:
+        runs = sorted((json_clone(run) for run in RUNS.values()), key=lambda item: item.get("created_at", ""), reverse=True)
+    return jsonify({"runs": runs})
+
+
+@app.get("/api/runs/<run_id>")
+async def get_run(run_id: str) -> Any:
+    with RUNS_LOCK:
+        if run_id not in RUNS:
+            return jsonify({"error": "Run not found"}), 404
+    return jsonify(build_run_response(run_id))
+
+
+@app.post("/api/start")
+async def start_run() -> Any:
+    form = await request.form
+    files = await request.files
+    uploaded_files = files.getlist("files")
+    if not uploaded_files:
+        return jsonify({"error": "Please upload at least one file."}), 400
+
+    try:
+        base_url = form.get("base_url", "").strip()
+        api_key = form.get("api_key", "").strip()
+        normalize_root_url(base_url)
+        auth_header(api_key)
+        prompt_options = parse_json_object(form.get("prompt_options"), "Prompt generation settings", {"prompts_per_document": 3, "shared_prompts": 2})
+        dataset_options = parse_json_object(
+            form.get("dataset_options"),
+            "Dataset options",
+            {
+                "chunk_method": "naive",
+                "description": "Generated by performance load tester",
+                "parser_config": {"layout_recognize": "DeepDOC"},
+            },
+        )
+        parsing_options_raw = parse_json_object(form.get("parsing_options"), "Parsing config", {"poll_interval_sec": 2, "chunk_sample_size": 3, "collect_pipeline_logs": True})
+        retrieval_options_raw = parse_json_object(form.get("retrieval_options"), "Retrieval config", {"concurrency": 4, "top_k": 8, "similarity_threshold": 0.2, "vector_similarity_weight": 0.7, "highlight": True})
+        chat_options_raw = parse_json_object(
+            form.get("chat_options"),
+            "Chat config",
+            {"concurrency": 4, "create": {"llm": {"model_name": None}}, "completion": {"extra_body": {"reference": True}}},
+        )
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    enable_parsing = form.get("enable_parsing") == "on"
+    enable_retrieval = form.get("enable_retrieval") == "on"
+    enable_chat = form.get("enable_chat") == "on"
+
+    if (enable_retrieval or enable_chat) and not enable_parsing:
+        return jsonify({"error": "Retrieval and chat require parsing to be enabled in this upload-based workflow."}), 400
+
+    parsing_request_options = deepcopy(parsing_options_raw)
+    parsing_poll_interval = max(1, safe_int(parsing_request_options.pop("poll_interval_sec"), 2))
+    chunk_sample_size = max(3, safe_int(parsing_request_options.pop("chunk_sample_size"), 3))
+    collect_pipeline_logs = parsing_request_options.pop("collect_pipeline_logs", True)
+
+    retrieval_options = deepcopy(retrieval_options_raw)
+    retrieval_concurrency = max(1, safe_int(retrieval_options.pop("concurrency"), 4))
+    run_count = min(50, max(1, safe_int(form.get("run_count"), 1)))
+
+    chat_options = deepcopy(chat_options_raw)
+    chat_concurrency = max(1, safe_int(chat_options.pop("concurrency"), 4))
+    chat_create_options = chat_options.pop("create", {})
+    chat_completion_options = chat_options.pop("completion", {})
+    if not isinstance(chat_create_options, dict) or not isinstance(chat_completion_options, dict):
+        return jsonify({"error": "Chat config must contain object values for 'create' and 'completion'."}), 400
+    verify_ssl = form.get("verify_ssl") == "on"
+
+    batch_id = str(uuid.uuid4())
+    batch_root = UPLOADS_DIR / f"batch-{batch_id}"
+    source_dir = batch_root / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    source_paths = []
+    filenames = []
+    for file_storage in uploaded_files:
+        filename = sanitize_filename(file_storage.filename or f"upload-{uuid.uuid4().hex[:8]}")
+        target = source_dir / filename
+        await file_storage.save(target)
+        source_paths.append(target)
+        filenames.append(filename)
+    tls_config = {
+        "verify": verify_ssl,
+    }
+
+    common_config = {
+        "base_url": base_url,
+        "api_key": api_key,
+        "api_key_hint": f"...{api_key[-4:]}" if len(api_key) >= 4 else "***",
+        "dataset_options": dataset_options,
+        "prompts_per_document": max(1, safe_int(prompt_options.get("prompts_per_document"), 3)),
+        "shared_prompts": max(0, safe_int(prompt_options.get("shared_prompts"), 2)),
+        "http_timeout_sec": max(30, safe_int(form.get("http_timeout_sec"), 180)),
+        "dataset_prefix": form.get("dataset_prefix", "perf-dataset").strip() or "perf-dataset",
+        "chat_prefix": form.get("chat_prefix", "perf-chat").strip() or "perf-chat",
+        "cleanup_remote": form.get("cleanup_remote") == "on",
+        "tls": tls_config,
+        "batch_root": str(batch_root),
+        "stages": {
+            "parsing": {
+                "enabled": enable_parsing,
+                "poll_interval_sec": parsing_poll_interval,
+                "chunk_sample_size": chunk_sample_size,
+                "collect_pipeline_logs": bool(collect_pipeline_logs),
+                "request_options": parsing_request_options,
+                "raw": parsing_options_raw,
+            },
+            "retrieval": {
+                "enabled": enable_retrieval,
+                "concurrency": retrieval_concurrency,
+                "request_options": retrieval_options,
+                "raw": retrieval_options_raw,
+            },
+            "chat": {
+                "enabled": enable_chat,
+                "concurrency": chat_concurrency,
+                "create_options": chat_create_options,
+                "completion_options": chat_completion_options,
+                "raw": chat_options_raw,
+            },
+        },
+    }
+
+    run_ids: list[str] = []
+    for run_index in range(1, run_count + 1):
+        run_id = str(uuid.uuid4())
+        upload_dir = batch_root / run_id
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        local_paths = []
+        for source_path in source_paths:
+            target = upload_dir / source_path.name
+            shutil.copy2(source_path, target)
+            local_paths.append(str(target))
+        config = deepcopy(common_config)
+        config["local_files"] = local_paths
+        config["upload_dir"] = str(upload_dir)
+        config["batch"] = {"batch_id": batch_id, "run_index": run_index, "run_count": run_count}
+        queue_run(run_id, config, filenames)
+        run_ids.append(run_id)
+
+    shutil.rmtree(source_dir, ignore_errors=True)
+    return jsonify({"run_id": run_ids[0], "run_ids": run_ids})
+
+
+load_existing_runs()
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PERFORMANCE_APP_PORT", "8787"))
+    app.run(host="0.0.0.0", port=port, debug=False)
