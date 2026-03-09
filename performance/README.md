@@ -33,10 +33,11 @@ What it does:
 
 Config model:
 
-- `Dataset Options JSON` is merged into the UI KB create payload (`/v1/kb/create`)
+- `Dataset Options JSON` is applied through the UI KB flow: create (`/v1/kb/create`) and then detail/update (`/v1/kb/detail`, `/v1/kb/update`)
   - default example includes `parser_config.layout_recognize: "DeepDOC"`
   - layout values used by the main UI include `DeepDOC`, `Plain Text`, `Docling`, and `TCADP Parser`
   - compatibility remapping is applied so `chunk_method` becomes `parser_id` and `embedding_model` becomes `embd_id`
+  - if `embd_id` is omitted, the app fetches the tenant default from `/v1/user/tenant_info`
 - `Parsing Config JSON` controls parse request options plus local stage controls like `poll_interval_sec`, `chunk_sample_size`, and `collect_pipeline_logs`
 - `Retrieval Config JSON` controls retrieval request options plus local stage controls like `concurrency`
 - `Chat Config JSON` controls chat creation under `create`, chat completion under `completion`, and local stage controls like `concurrency`

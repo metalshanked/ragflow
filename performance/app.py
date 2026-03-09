@@ -287,16 +287,68 @@ class RAGFlowClient:
         return payload
 
     def create_dataset(self, name: str, options: dict[str, Any] | None = None) -> dict[str, Any]:
+        normalized = normalize_dataset_options_for_kb_ui(options)
+        if not normalized.get("embd_id"):
+            tenant_info = self.get_tenant_info()
+            embd_id = tenant_info.get("embd_id")
+            if not embd_id:
+                raise RAGFlowError("Tenant info did not include a default embd_id for KB create.")
+            normalized["embd_id"] = embd_id
         payload = {"name": name}
-        payload = merge_dicts(payload, normalize_dataset_options_for_kb_ui(options))
+        payload = merge_dicts(payload, normalized)
         response = self._request("POST", self._web_url("/kb/create"), json=payload)
         kb_id = response.get("data", {}).get("kb_id")
         if not kb_id:
             raise RAGFlowError("KB create response did not include kb_id")
+        self.update_dataset(kb_id, **normalized)
         return {"id": kb_id, "name": name}
 
     def delete_dataset(self, dataset_id: str) -> None:
         self._request("POST", self._web_url("/kb/rm"), json={"kb_id": dataset_id})
+
+    def get_tenant_info(self) -> dict[str, Any]:
+        response = self._request("GET", self._web_url("/user/tenant_info"))
+        data = response.get("data", {})
+        if not isinstance(data, dict):
+            raise RAGFlowError("Tenant info response was not an object.")
+        return data
+
+    def get_dataset_detail(self, dataset_id: str) -> dict[str, Any]:
+        response = self._request("GET", self._web_url("/kb/detail"), params={"kb_id": dataset_id})
+        data = response.get("data", {})
+        if not isinstance(data, dict) or not data:
+            raise RAGFlowError(f"Dataset detail not found for id={dataset_id}")
+        return data
+
+    def update_dataset(self, dataset_id: str, **kwargs: Any) -> dict[str, Any]:
+        detail = self.get_dataset_detail(dataset_id)
+        payload: dict[str, Any] = {
+            "kb_id": dataset_id,
+            "name": detail.get("name", ""),
+            "description": detail.get("description") or "",
+            "parser_id": detail.get("parser_id") or "naive",
+        }
+        for key in ("embd_id", "permission", "language", "avatar", "pagerank", "pipeline_id"):
+            if detail.get(key) is not None:
+                payload[key] = detail.get(key)
+
+        updates = deepcopy(kwargs)
+        parser_updates = updates.get("parser_config")
+        if isinstance(parser_updates, dict) and isinstance(detail.get("parser_config"), dict):
+            updates["parser_config"] = merge_dicts(detail["parser_config"], parser_updates)
+
+        payload = merge_dicts(payload, updates)
+        payload["kb_id"] = dataset_id
+        payload["name"] = str(payload.get("name") or detail.get("name") or "").strip()
+        if not payload["name"]:
+            raise RAGFlowError(f"Cannot update dataset {dataset_id}: dataset name is empty")
+        if payload.get("description") is None:
+            payload["description"] = ""
+        payload["parser_id"] = payload.get("parser_id") or detail.get("parser_id") or "naive"
+
+        response = self._request("POST", self._web_url("/kb/update"), json=payload)
+        data = response.get("data", {})
+        return data if isinstance(data, dict) else {}
 
     def upload_documents(self, dataset_id: str, files: list[Path]) -> list[dict[str, Any]]:
         multipart = []
