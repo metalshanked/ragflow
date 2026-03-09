@@ -201,6 +201,27 @@ def strip_internal_model_suffix(model_name: str) -> str:
     return value
 
 
+def model_name_aliases(model_name: Any) -> set[str]:
+    text = str(model_name or "").strip()
+    if not text:
+        return set()
+
+    aliases = {text}
+    base, has_provider, provider = text.partition("@")
+    stripped = strip_internal_model_suffix(base)
+    aliases.add(stripped)
+    if has_provider:
+        aliases.add(f"{stripped}@{provider}")
+        aliases.add(f"{base}@{provider}")
+    return {alias.lower() for alias in aliases if alias}
+
+
+def model_names_equivalent(left: Any, right: Any) -> bool:
+    if left is None or right is None:
+        return False
+    return bool(model_name_aliases(left) & model_name_aliases(right))
+
+
 def percentile(values: list[float], pct: float) -> float:
     if not values:
         return 0.0
@@ -532,20 +553,34 @@ class RAGFlowClient:
                     models.append(f"{llm_name}@{fid}")
         return models
 
+    def get_default_chat_model_name(self) -> str | None:
+        info = self.get_tenant_info()
+        value = info.get("llm_id") if isinstance(info, dict) else None
+        text = str(value or "").strip()
+        return text or None
+
     def resolve_chat_model_name(self, requested: Any) -> str | None:
-        model_name = normalize_chat_model_name(requested)
-        if not model_name:
+        raw_model_name = str(requested or "").strip()
+        if not raw_model_name:
             return None
+        model_name = normalize_chat_model_name(raw_model_name) or raw_model_name
+        default_model = self.get_default_chat_model_name()
+
+        if default_model and model_names_equivalent(model_name, default_model):
+            return default_model
 
         available = self.list_chat_models()
         if not available:
-            return model_name
+            return default_model if default_model and model_names_equivalent(raw_model_name, default_model) else None
 
         by_exact = {item.lower(): item for item in available}
         if model_name.lower() in by_exact:
             return by_exact[model_name.lower()]
+        if raw_model_name.lower() in by_exact:
+            return by_exact[raw_model_name.lower()]
 
         aliases = {model_name}
+        aliases.add(raw_model_name)
         base, has_provider, provider = model_name.partition("@")
         if has_provider:
             stripped = strip_internal_model_suffix(base)
@@ -562,7 +597,9 @@ class RAGFlowClient:
             if strip_internal_model_suffix(item_base).lower() == strip_internal_model_suffix(base).lower():
                 return item
 
-        return model_name
+        if default_model and model_names_equivalent(raw_model_name, default_model):
+            return default_model
+        return None
 
     def get_dataset_detail(self, dataset_id: str) -> dict[str, Any]:
         response = self._request("GET", self._web_url("/kb/detail"), params={"kb_id": dataset_id})
@@ -665,12 +702,31 @@ class RAGFlowClient:
     def create_chat(self, name: str, dataset_id: str | None, options: dict[str, Any] | None = None) -> dict[str, Any]:
         normalized_options = normalize_chat_create_options(options)
         llm = normalized_options.get("llm")
+        llm_id = None
         if isinstance(llm, dict) and llm.get("model_name"):
-            llm["model_name"] = self.resolve_chat_model_name(llm.get("model_name"))
+            requested_model_name = llm.get("model_name")
+            default_model_name = self.get_default_chat_model_name()
+            if default_model_name and model_names_equivalent(requested_model_name, default_model_name):
+                llm.pop("model_name", None)
+            else:
+                llm_id = self.resolve_chat_model_name(requested_model_name)
+                if not llm_id:
+                    available_models = self.list_chat_models()
+                    available_hint = ", ".join(available_models[:8]) if available_models else "none returned by /v1/llm/list?model_type=chat"
+                    raise RAGFlowError(
+                        f"Unable to resolve chat model '{requested_model_name}'. "
+                        f"Tenant default: {default_model_name or 'unknown'}. "
+                        f"Available chat models: {available_hint}"
+                    )
+            llm.pop("model_name", None)
+            if not llm:
+                normalized_options.pop("llm", None)
         payload: dict[str, Any] = {"name": name, "dataset_ids": [dataset_id] if dataset_id else []}
         payload = merge_dicts(payload, normalized_options)
         payload["name"] = name
         payload["dataset_ids"] = [dataset_id] if dataset_id else []
+        if llm_id:
+            payload["llm_id"] = llm_id
         response = self._request("POST", self._api_url("/chats"), json=payload)
         return response["data"]
 
@@ -1621,15 +1677,16 @@ INDEX_HTML = """<!doctype html>
           <button type=\"submit\">Start Benchmark</button>
         </form>
       </section>
-      <section class=\"panel\"><div style=\"display:flex;justify-content:space-between;align-items:center;gap:10px;\"><h2 style=\"margin:0;\">Runs</h2><div style=\"display:flex;gap:8px;\"><button class=\"secondary\" id=\"refresh-runs\" type=\"button\">Refresh</button><button class=\"secondary\" id=\"reset-runs\" type=\"button\">Reset</button></div></div><div id=\"run-list\" class=\"run-list\"></div></section>
+      <section class=\"panel\"><div style=\"display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;\"><h2 style=\"margin:0;\">Runs</h2><div style=\"display:flex;gap:8px;align-items:center;flex-wrap:wrap;\"><label style=\"display:flex;align-items:center;gap:8px;color:var(--muted);\">Auto Refresh (sec)<input id=\"auto-refresh-sec\" type=\"number\" min=\"0\" max=\"3600\" value=\"0\" style=\"width:92px;\" /></label><button class=\"secondary\" id=\"refresh-runs\" type=\"button\">Refresh</button><button class=\"secondary\" id=\"reset-runs\" type=\"button\">Reset</button></div></div><div id=\"run-list\" class=\"run-list\"></div></section>
     </aside>
     <main class=\"content\"><div id=\"run-view\" class=\"empty\">Start a run or select a previous benchmark from the left.</div></main>
   </div>
 <script>
-const state = { activeRunId: null, activeBatchTabs: {}, tablePages: {}, pollHandle: null, runs: [] };
+const state = { activeRunId: null, activeBatchTabs: {}, tablePages: {}, chartPages: {}, pollHandle: null, autoRefreshHandle: null, runs: [] };
 const BASE_PATH = '__BASE_PATH__';
 const FORM_STORAGE_KEY = 'ragflow-performance-form-v1';
 const ACTIVE_RUN_STORAGE_KEY = 'ragflow-performance-active-run-v1';
+const AUTO_REFRESH_STORAGE_KEY = 'ragflow-performance-auto-refresh-v1';
 const FORM_FIELDS = ['base_url', 'api_key', 'verify_ssl', 'http_timeout_sec', 'parallel_runs', 'dataset_prefix', 'chat_prefix', 'prompt_options', 'dataset_options', 'enable_parsing', 'parsing_options', 'enable_retrieval', 'retrieval_options', 'enable_chat', 'chat_options', 'enable_llm_summary', 'cleanup_remote'];
 function statusBadge(status) { const normalized = (status || 'queued').toLowerCase(); return `<span class=\"badge ${normalized}\">${normalized}</span>`; }
 function number(value, digits = 2) { if (value === null || value === undefined || Number.isNaN(Number(value))) return '-'; return Number(value).toFixed(digits); }
@@ -1639,6 +1696,7 @@ function renderBars(rows, formatter = (value) => value, orange = false) { if (!r
 function renderHistogram(data) { if (!data || !data.length) return `<div class=\"empty\">No latency data available.</div>`; const max = Math.max(...data.map((bin) => bin.count), 1); return `<div class=\"histogram\">${data.map((bin) => `<div class=\"bin\"><div>${bin.count}</div><div class=\"stick\" style=\"height:${Math.max(8, bin.count / max * 140)}px\"></div><div>${bin.label}</div></div>`).join('')}</div>`; }
 function renderTable(headers, rows) { if (!rows || !rows.length) return `<div class=\"empty\">No rows available.</div>`; return `<table><thead><tr>${headers.map((header) => `<th>${header}</th>`).join('')}</tr></thead><tbody>${rows.map((row) => `<tr>${row.map((cell) => `<td>${cell}</td>`).join('')}</tr>`).join('')}</tbody></table>`; }
 function renderPaginatedTable(tableId, headers, rows, pageSize = 10) { if (!rows || !rows.length) return `<div class=\"empty\">No rows available.</div>`; const totalPages = Math.max(1, Math.ceil(rows.length / pageSize)); const currentPage = Math.min(totalPages, Math.max(1, Number(state.tablePages[tableId] || 1))); state.tablePages[tableId] = currentPage; const start = (currentPage - 1) * pageSize; const pagedRows = rows.slice(start, start + pageSize); const pager = totalPages > 1 ? `<div class=\"pager\"><button class=\"secondary\" type=\"button\" data-table-page=\"${Math.max(1, currentPage - 1)}\" data-table-id=\"${tableId}\" ${currentPage === 1 ? 'disabled' : ''}>Prev</button><div class=\"subtle\">Page ${currentPage} / ${totalPages}</div><button class=\"secondary\" type=\"button\" data-table-page=\"${Math.min(totalPages, currentPage + 1)}\" data-table-id=\"${tableId}\" ${currentPage === totalPages ? 'disabled' : ''}>Next</button></div>` : ''; return `${renderTable(headers, pagedRows)}${pager}`; }
+function renderPaginatedBars(chartId, rows, pageSize = 12, formatter = (value) => value, orange = false) { if (!rows || !rows.length) return `<div class=\"empty\">No chart data available.</div>`; const totalPages = Math.max(1, Math.ceil(rows.length / pageSize)); const currentPage = Math.min(totalPages, Math.max(1, Number(state.chartPages[chartId] || 1))); state.chartPages[chartId] = currentPage; const start = (currentPage - 1) * pageSize; const pagedRows = rows.slice(start, start + pageSize); const pager = totalPages > 1 ? `<div class=\"pager\"><button class=\"secondary\" type=\"button\" data-chart-page=\"${Math.max(1, currentPage - 1)}\" data-chart-id=\"${chartId}\" ${currentPage === 1 ? 'disabled' : ''}>Prev</button><div class=\"subtle\">Page ${currentPage} / ${totalPages}</div><button class=\"secondary\" type=\"button\" data-chart-page=\"${Math.min(totalPages, currentPage + 1)}\" data-chart-id=\"${chartId}\" ${currentPage === totalPages ? 'disabled' : ''}>Next</button></div>` : ''; return `${renderBars(pagedRows, formatter, orange)}${pager}`; }
 function escapeHtml(value) { return String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('\"', '&quot;').replaceAll(\"'\", '&#39;'); }
 function renderDurationBadge(value, threshold) { const duration = Number(value) || 0; if (!duration) return '-'; const slow = threshold > 0 && duration >= threshold; return `<span class=\"duration-badge ${slow ? 'slow' : ''}\">${number(duration, 2)} s</span>`; }
 function renderPipelinePath(item) { const path = Array.isArray(item.pipeline_path) ? item.pipeline_path.filter(Boolean) : []; if (!path.length) return `<span class=\"subtle\">No pipeline path returned by this log.</span>`; return `<div class=\"pill-row\">${path.map((part) => `<span class=\"pill\">${escapeHtml(part)}</span>`).join('')}</div>`; }
@@ -1648,6 +1706,9 @@ function persistFormState() { try { const form = document.getElementById('run-fo
 function restoreFormState() { try { const raw = localStorage.getItem(FORM_STORAGE_KEY); if (!raw) return; const payload = JSON.parse(raw); const form = document.getElementById('run-form'); FORM_FIELDS.forEach((name) => { if (!(name in payload)) return; const field = form.elements.namedItem(name); if (!field) return; if (field.type === 'checkbox') field.checked = Boolean(payload[name]); else if (typeof payload[name] === 'string' || typeof payload[name] === 'number') field.value = payload[name]; }); } catch (error) { console.warn('Unable to restore form state.', error); } }
 function persistActiveRun() { try { if (state.activeRunId) localStorage.setItem(ACTIVE_RUN_STORAGE_KEY, state.activeRunId); else localStorage.removeItem(ACTIVE_RUN_STORAGE_KEY); } catch (error) { console.warn('Unable to persist active run.', error); } }
 function restoreActiveRun() { try { return localStorage.getItem(ACTIVE_RUN_STORAGE_KEY); } catch (error) { console.warn('Unable to restore active run.', error); return null; } }
+function persistAutoRefreshSetting() { try { const field = document.getElementById('auto-refresh-sec'); localStorage.setItem(AUTO_REFRESH_STORAGE_KEY, String(Math.max(0, Number(field?.value || 0) || 0))); } catch (error) { console.warn('Unable to persist auto refresh setting.', error); } }
+function restoreAutoRefreshSetting() { try { const saved = localStorage.getItem(AUTO_REFRESH_STORAGE_KEY); const field = document.getElementById('auto-refresh-sec'); if (field && saved !== null) field.value = String(Math.max(0, Number(saved) || 0)); } catch (error) { console.warn('Unable to restore auto refresh setting.', error); } }
+function configureAutoRefresh() { if (state.autoRefreshHandle) { window.clearInterval(state.autoRefreshHandle); state.autoRefreshHandle = null; } const seconds = Math.max(0, Number(document.getElementById('auto-refresh-sec')?.value || 0) || 0); if (seconds > 0) state.autoRefreshHandle = window.setInterval(() => window.location.reload(), seconds * 1000); }
 function upsertRun(run) { const index = state.runs.findIndex((item) => item.id === run.id); if (index >= 0) state.runs[index] = run; else state.runs.unshift(run); }
 function getRun(runId) { return state.runs.find((item) => item.id === runId) || null; }
 function getBatchRuns(batchId) { if (!batchId) return []; return state.runs.filter((item) => item.config?.batch?.batch_id === batchId).sort((a, b) => Number(a.config?.batch?.run_index || 0) - Number(b.config?.batch?.run_index || 0)); }
@@ -1656,6 +1717,7 @@ function renderBatchTabs(batchRuns, activeTab) { if (batchRuns.length <= 1) retu
 function renderBatchOverview(run, batchRuns) { const batch = run.config?.batch || {}; const batchSummary = batchRuns.find((item) => item.batch_summary?.aggregate || item.batch_summary?.llm_assessment)?.batch_summary || {}; const aggregate = batchSummary.aggregate || summarizeBatchRuns(batchRuns); const llm = batchSummary.llm_assessment?.content || ''; const rows = batchRuns.map((item) => [String(item.config?.batch?.run_index || '-'), statusBadge(item.status), escapeHtml(item.dataset?.name || item.config?.dataset_prefix || '-'), `${number(item.summary?.parse_wall_time_sec || 0)} s`, `${number(item.summary?.retrieval_p95_ms || 0)} ms`, `${number(item.summary?.chat_p95_ms || 0)} ms`, `${number((item.summary?.chat_error_rate || 0) * 100)}%`, item.error ? `<span style=\"color:var(--bad);\">${escapeHtml(item.error)}</span>` : '-']); return `<div style=\"display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:18px;\"><div><div style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap;\"><h2 style=\"margin:0;font-size:34px;letter-spacing:-.06em;\">${escapeHtml(run.config?.dataset_prefix || 'Batch')} batch</h2>${statusBadge(aggregate.failed_runs ? 'failed' : (aggregate.completed_runs === aggregate.total_runs ? 'completed' : 'running'))}</div><div class=\"subtle\" style=\"margin-top:6px;\">${escapeHtml(batch.batch_id || '-')} • ${batch.parallel_count || batch.run_count || batchRuns.length} runs • host ${escapeHtml(run.config?.base_url || '-')}</div></div><div class=\"subtle\" style=\"text-align:right;\"><div>First start: ${formatTs(batchRuns[0]?.started_at || batchRuns[0]?.created_at)}</div><div>Latest completion: ${formatTs(batchRuns[batchRuns.length - 1]?.completed_at)}</div></div></div><section class=\"grid\">${metricCard('Runs', aggregate.total_runs || batchRuns.length, `${aggregate.completed_runs || 0} completed • ${aggregate.failed_runs || 0} failed`)}${metricCard('Avg Parse Wall', `${number(aggregate.avg_parse_wall_time_sec || 0)} s`, 'wall time per run')}${metricCard('Avg Retrieval P95', `${number(aggregate.avg_retrieval_p95_ms || 0)} ms`, `max ${number(aggregate.max_retrieval_p95_ms || 0)} ms`)}${metricCard('Avg Chat P95', `${number(aggregate.avg_chat_p95_ms || 0)} ms`, `max ${number(aggregate.max_chat_p95_ms || 0)} ms`)}${metricCard('Avg Chat Error Rate', `${number((aggregate.avg_chat_error_rate || 0) * 100)}%`, `${number(aggregate.avg_chat_tokens_per_sec || 0)} tok/s`)}<div class=\"card span12\"><h3>Batch Executive Summary</h3><div class=\"subtle\">${llm ? 'Generated by the configured RAGFlow chat model after the batch finished.' : 'This appears after every run in the batch reaches a terminal state.'}</div>${llm ? `<div class=\"prose\">${escapeHtml(llm)}</div>` : ''}</div><div class=\"card span12\"><h3>Batch Run Table</h3>${renderPaginatedTable(`batch-${batch.batch_id || 'default'}-runs`, ['run','status','dataset','parse wall','retrieval p95','chat p95','chat errors','error'], rows, 10)}</div></section>`; }
 function attachBatchTabHandlers(container, run, batchRuns) { const batch = run.config?.batch || {}; if ((batch.run_count || 1) <= 1 || !batch.batch_id) return; container.querySelectorAll('[data-batch-tab]').forEach((element) => element.addEventListener('click', async () => { const tab = element.getAttribute('data-batch-tab'); state.activeBatchTabs[batch.batch_id] = tab; if (tab && tab !== 'overview') { state.activeRunId = tab; persistActiveRun(); const selected = getRun(tab); renderRunView(selected || run); if (selected && ['queued', 'running'].includes((selected.status || '').toLowerCase())) startPolling(tab); else stopPolling(); } else { const liveRun = batchRuns.find((item) => ['queued', 'running'].includes((item.status || '').toLowerCase())); state.activeRunId = liveRun?.id || run.id; persistActiveRun(); renderRunView(run); if (liveRun) startPolling(liveRun.id); else stopPolling(); } renderRunList(); })); }
 function attachPaginationHandlers(container) { container.querySelectorAll('[data-table-id][data-table-page]').forEach((element) => element.addEventListener('click', () => { const tableId = element.getAttribute('data-table-id'); const page = Number(element.getAttribute('data-table-page') || 1); state.tablePages[tableId] = page; const active = getRun(state.activeRunId); if (active) renderRunView(active); })); }
+function attachChartPaginationHandlers(container) { container.querySelectorAll('[data-chart-id][data-chart-page]').forEach((element) => element.addEventListener('click', () => { const chartId = element.getAttribute('data-chart-id'); const page = Number(element.getAttribute('data-chart-page') || 1); state.chartPages[chartId] = page; const active = getRun(state.activeRunId); if (active) renderRunView(active); })); }
 async function fetchRuns() { const response = await fetch(`${BASE_PATH}/api/runs`); const payload = await response.json(); state.runs = payload.runs || []; renderRunList(); const targetRunId = state.activeRunId || restoreActiveRun() || state.runs.find((run) => ['queued', 'running'].includes((run.status || '').toLowerCase()))?.id; if (targetRunId) { const active = getRun(targetRunId); if (active) { state.activeRunId = targetRunId; persistActiveRun(); renderRunView(active); if (['queued', 'running'].includes((active.status || '').toLowerCase())) startPolling(targetRunId); else stopPolling(); } else { state.activeRunId = null; persistActiveRun(); stopPolling(); document.getElementById('run-view').innerHTML = `<div class=\"empty\">Start a run or select a previous benchmark from the left.</div>`; } } }
 async function fetchRun(runId, options = {}) { if (!runId) return; const response = await fetch(`${BASE_PATH}/api/runs/${runId}`); const payload = await response.json(); if (!response.ok || payload.error) return; upsertRun(payload); state.activeRunId = runId; persistActiveRun(); renderRunView(payload); if (!options.silent) renderRunList(); const live = ['queued', 'running'].includes((payload.status || '').toLowerCase()); if (live) startPolling(runId); else stopPolling(); }
 function startPolling(runId) { stopPolling(); state.pollHandle = window.setInterval(() => fetchRun(runId, { silent: true }), 2500); }
@@ -1687,13 +1749,12 @@ function renderRunView(run) {
   const chatEnabled = Boolean(stages.chat?.enabled);
   const metricValue = (enabled, value, digits = 2, suffix = '') => enabled ? `${number(value, digits)}${suffix}` : 'skipped';
   const metricHint = (enabled, hint) => enabled ? hint : 'stage disabled';
-  const slowLogThreshold = Number(parse.pipeline_slow_log_threshold_sec || 0);
   const slowStepThreshold = Number(parse.pipeline_slow_step_threshold_sec || 0);
-  const parseBars = (parse.documents || []).map((doc) => ({ label: doc.name, value: Number(doc.process_duration || 0) })).sort((a,b) => b.value - a.value).slice(0, 12);
-  const pipelineBars = (parse.pipeline_logs || []).map((log) => ({ label: log.document_name || log.document_id || 'unknown', value: Number(log.duration_sec || 0) })).sort((a,b) => b.value - a.value).slice(0, 12);
+  const parseBars = (parse.documents || []).map((doc) => ({ label: doc.name, value: Number(doc.process_duration || 0) })).sort((a,b) => b.value - a.value);
+  const pipelineStepBars = (parse.pipeline_logs || []).flatMap((log) => (Array.isArray(log.progress_steps) ? log.progress_steps : []).map((step, index) => ({ label: `${log.document_name || log.document_id || 'unknown'}: ${step.message || `step ${index + 1}`}`.slice(0, 120), value: Number(step.duration_sec || 0) }))).filter((step) => step.value > 0).sort((a,b) => b.value - a.value);
   const retrievalRows = (retrieval.results || []).map((item) => [item.ok ? 'ok' : `<span style=\"color:var(--bad);\">error</span>`, item.kind, item.document_name || '-', item.prompt, `${number(item.latency_ms, 1)} ms`, String(item.chunk_count), item.top_documents?.join(', ') || '-']);
   const chatRows = (chat.results || []).map((item) => [item.ok ? 'ok' : `<span style=\"color:var(--bad);\">error</span>`, item.kind, item.document_name || '-', item.prompt, `${number(item.latency_ms, 1)} ms`, `${item.total_tokens || 0}`, `${item.reference_count || 0}`, item.referenced_documents?.join(', ') || '-']);
-  const pipelineRows = (parse.pipeline_logs || []).map((item) => [`<div><div style=\"font-weight:700;\">${escapeHtml(item.document_name || '-')}</div><div class=\"subtle\">${escapeHtml(item.document_id || '-')}</div></div>`, escapeHtml(item.task_type || '-'), escapeHtml(item.status || '-'), renderDurationBadge(item.duration_sec, slowLogThreshold), renderPipelineDetails(item)]);
+  const pipelineRows = (parse.pipeline_logs || []).map((item) => [`<div><div style=\"font-weight:700;\">${escapeHtml(item.document_name || '-')}</div><div class=\"subtle\">${escapeHtml(item.document_id || '-')}</div></div>`, escapeHtml(item.task_type || '-'), escapeHtml(item.status || '-'), renderDurationBadge(item.duration_sec, Number(parse.pipeline_slow_log_threshold_sec || 0)), renderPipelineDetails(item)]);
   const summaryCard = run.analysis?.llm_assessment?.content ? `<div class=\"card span12\"><h3>Executive Summary</h3><div class=\"subtle\">Generated by the configured RAGFlow chat model.</div><div class=\"prose\">${escapeHtml(run.analysis.llm_assessment.content)}</div></div>` : '';
   container.innerHTML = `
     ${renderBatchTabs(batchRuns, activeBatchTab)}
@@ -1709,8 +1770,8 @@ function renderRunView(run) {
       ${metricCard('Token Throughput', metricValue(chatEnabled, chat.summary?.tokens_per_sec || 0, 2, ' tok/s'), metricHint(chatEnabled, `${chat.summary?.total_tokens || 0} total tokens`))}
       ${metricCard('Parse Token Rate', metricValue(parsingEnabled, parse.token_throughput_per_sec || 0, 2, ' tok/s'), metricHint(parsingEnabled, `${parse.status_breakdown ? Object.entries(parse.status_breakdown).map(([k,v]) => `${k}:${v}`).join(' • ') : '-'}`))}
       ${summaryCard}
-      <div class=\"card span6\"><h3>Parse Duration by Document</h3><div class=\"subtle\">Derived from document metrics after parsing completes.</div>${renderBars(parseBars, (value) => `${number(value)} s`)}</div>
-      <div class=\"card span6\"><h3>Pipeline Log Durations</h3><div class=\"subtle\">Uses the same KB pipeline log surface the current RAGFlow UI reads.${slowLogThreshold > 0 ? ` Logs at or above ${number(slowLogThreshold, 2)} s are treated as slow.` : ''}</div>${renderBars(pipelineBars, (value) => `${number(value)} s`, true)}</div>
+      <div class=\"card span6\"><h3>Parse Duration by Document</h3><div class=\"subtle\">Total parse time per document from the final document status API. All documents are available through pagination.</div>${renderPaginatedBars(`parse-bars-${run.id}`, parseBars, 12, (value) => `${number(value)} s`)}</div>
+      <div class=\"card span6\"><h3>Pipeline Step Durations</h3><div class=\"subtle\">Time between successive KB pipeline progress steps. This shows slow internal stages, not total document parse time.${slowStepThreshold > 0 ? ` Steps at or above ${number(slowStepThreshold, 2)} s are treated as slow.` : ''}</div>${renderPaginatedBars(`pipeline-step-bars-${run.id}`, pipelineStepBars, 12, (value) => `${number(value)} s`, true)}</div>
       <div class=\"card span6\"><h3>Retrieval Latency Histogram</h3><div class=\"subtle\">Official /api/v1/retrieval benchmark on the generated prompts.</div>${renderHistogram(retrieval.summary?.latency_histogram || [])}</div>
       <div class=\"card span6\"><h3>Chat Latency Histogram</h3><div class=\"subtle\">Official OpenAI-compatible chat completions.</div>${renderHistogram(chat.summary?.latency_histogram || [])}</div>
       <div class=\"card span12\"><h3>Pipeline Log Table</h3><div class=\"subtle\">Progress messages are split into timestamped steps.${slowStepThreshold > 0 ? ` Step gaps at or above ${number(slowStepThreshold, 2)} s are highlighted.` : ''}</div>${renderPaginatedTable(`pipeline-${run.id}`, ['document','task','status','duration','details'], pipelineRows, 8)}</div>
@@ -1721,13 +1782,18 @@ function renderRunView(run) {
     </section>`;
   attachBatchTabHandlers(container, run, batchRuns);
   attachPaginationHandlers(container);
+  attachChartPaginationHandlers(container);
 }
 document.getElementById('refresh-runs').addEventListener('click', fetchRuns);
 document.getElementById('reset-runs').addEventListener('click', async () => { if (!window.confirm('Clear all stored run results from this app? Active configs in local storage will be kept.')) return; const response = await fetch(`${BASE_PATH}/api/runs/reset`, { method: 'POST' }); const payload = await response.json(); if (!response.ok || payload.error) { alert(payload.error || 'Unable to reset runs.'); return; } state.activeRunId = null; state.activeBatchTabs = {}; persistActiveRun(); stopPolling(); document.getElementById('run-view').innerHTML = `<div class=\"empty\">Start a run or select a previous benchmark from the left.</div>`; await fetchRuns(); });
 document.getElementById('run-form').addEventListener('input', persistFormState);
 document.getElementById('run-form').addEventListener('change', persistFormState);
+document.getElementById('auto-refresh-sec').addEventListener('input', () => { persistAutoRefreshSetting(); configureAutoRefresh(); });
+document.getElementById('auto-refresh-sec').addEventListener('change', () => { persistAutoRefreshSetting(); configureAutoRefresh(); });
 document.getElementById('run-form').addEventListener('submit', async (event) => { event.preventDefault(); const formData = new FormData(event.currentTarget); const response = await fetch(`${BASE_PATH}/api/start`, { method: 'POST', body: formData }); const payload = await response.json(); if (!response.ok || payload.error) { alert(payload.error || 'Run creation failed.'); return; } const targetRunId = payload.run_id || (payload.run_ids && payload.run_ids[0]); persistFormState(); await fetchRuns(); if (targetRunId) await fetchRun(targetRunId); });
 restoreFormState();
+restoreAutoRefreshSetting();
+configureAutoRefresh();
 fetchRuns();
 </script>
 </body>
