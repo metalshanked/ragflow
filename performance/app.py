@@ -1026,6 +1026,8 @@ INDEX_HTML = """<!doctype html>
   </div>
 <script>
 const state = { activeRunId: null, pollHandle: null, runs: [] };
+const FORM_STORAGE_KEY = 'ragflow-performance-form-v1';
+const FORM_FIELDS = ['base_url', 'api_key', 'verify_ssl', 'http_timeout_sec', 'run_count', 'dataset_prefix', 'chat_prefix', 'prompt_options', 'dataset_options', 'enable_parsing', 'parsing_options', 'enable_retrieval', 'retrieval_options', 'enable_chat', 'chat_options', 'cleanup_remote'];
 function statusBadge(status) { const normalized = (status || 'queued').toLowerCase(); return `<span class=\"badge ${normalized}\">${normalized}</span>`; }
 function number(value, digits = 2) { if (value === null || value === undefined || Number.isNaN(Number(value))) return '-'; return Number(value).toFixed(digits); }
 function formatTs(value) { if (!value) return '-'; const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleString(); }
@@ -1033,6 +1035,8 @@ function metricCard(label, value, hint = '') { return `<div class=\"card span3\"
 function renderBars(rows, formatter = (value) => value, orange = false) { if (!rows || !rows.length) return `<div class=\"empty\">No chart data available.</div>`; const max = Math.max(...rows.map((row) => Number(row.value) || 0), 1); return `<div class=\"bars\">${rows.map((row) => `<div class=\"bar-row\"><div title=\"${row.label}\">${row.label}</div><div class=\"bar-track\"><div class=\"bar-fill ${orange ? 'orange' : ''}\" style=\"width:${Math.max(4, (Number(row.value) || 0) / max * 100)}%\"></div></div><div>${formatter(row.value)}</div></div>`).join('')}</div>`; }
 function renderHistogram(data) { if (!data || !data.length) return `<div class=\"empty\">No latency data available.</div>`; const max = Math.max(...data.map((bin) => bin.count), 1); return `<div class=\"histogram\">${data.map((bin) => `<div class=\"bin\"><div>${bin.count}</div><div class=\"stick\" style=\"height:${Math.max(8, bin.count / max * 140)}px\"></div><div>${bin.label}</div></div>`).join('')}</div>`; }
 function renderTable(headers, rows) { if (!rows || !rows.length) return `<div class=\"empty\">No rows available.</div>`; return `<table><thead><tr>${headers.map((header) => `<th>${header}</th>`).join('')}</tr></thead><tbody>${rows.map((row) => `<tr>${row.map((cell) => `<td>${cell}</td>`).join('')}</tr>`).join('')}</tbody></table>`; }
+function persistFormState() { try { const form = document.getElementById('run-form'); const payload = {}; FORM_FIELDS.forEach((name) => { const field = form.elements.namedItem(name); if (!field) return; if (field.type === 'checkbox') payload[name] = field.checked; else payload[name] = field.value; }); localStorage.setItem(FORM_STORAGE_KEY, JSON.stringify(payload)); } catch (error) { console.warn('Unable to persist form state.', error); } }
+function restoreFormState() { try { const raw = localStorage.getItem(FORM_STORAGE_KEY); if (!raw) return; const payload = JSON.parse(raw); const form = document.getElementById('run-form'); FORM_FIELDS.forEach((name) => { if (!(name in payload)) return; const field = form.elements.namedItem(name); if (!field) return; if (field.type === 'checkbox') field.checked = Boolean(payload[name]); else if (typeof payload[name] === 'string' || typeof payload[name] === 'number') field.value = payload[name]; }); } catch (error) { console.warn('Unable to restore form state.', error); } }
 async function fetchRuns() { const response = await fetch('/api/runs'); const payload = await response.json(); state.runs = payload.runs || []; renderRunList(); }
 async function fetchRun(runId, options = {}) { if (!runId) return; const response = await fetch(`/api/runs/${runId}`); const payload = await response.json(); state.activeRunId = runId; renderRunView(payload); if (!options.silent) renderRunList(); const live = ['queued', 'running'].includes((payload.status || '').toLowerCase()); if (live) startPolling(runId); else stopPolling(); }
 function startPolling(runId) { stopPolling(); state.pollHandle = window.setInterval(() => fetchRun(runId, { silent: true }), 2500); }
@@ -1074,11 +1078,14 @@ function renderRunView(run) {
       <div class=\"card span12\"><h3>Retrieval Sample Results</h3>${renderTable(['status','kind','document','prompt','latency','chunks','top docs'], retrievalRows)}</div>
       <div class=\"card span12\"><h3>Chat Sample Results</h3>${renderTable(['status','kind','document','prompt','latency','tokens','refs','referenced docs'], chatRows)}</div>
       <div class=\"card span6\"><h3>Generated Prompts</h3><pre>${JSON.stringify(prompts, null, 2)}</pre></div>
-      <div class=\"card span6\"><h3>Event Log</h3><pre>${events.map((event) => `[${formatTs(event.ts)}] ${event.level.toUpperCase()} ${event.message}`).join('\n')}</pre></div>
+      <div class=\"card span6\"><h3>Event Log</h3><pre>${events.map((event) => `[${formatTs(event.ts)}] ${event.level.toUpperCase()} ${event.message}`).join('\\n')}</pre></div>
     </section>`;
 }
 document.getElementById('refresh-runs').addEventListener('click', fetchRuns);
-document.getElementById('run-form').addEventListener('submit', async (event) => { event.preventDefault(); const formData = new FormData(event.currentTarget); const response = await fetch('/api/start', { method: 'POST', body: formData }); const payload = await response.json(); if (!response.ok || payload.error) { alert(payload.error || 'Run creation failed.'); return; } const targetRunId = payload.run_id || (payload.run_ids && payload.run_ids[0]); event.currentTarget.reset(); await fetchRuns(); if (targetRunId) await fetchRun(targetRunId); });
+document.getElementById('run-form').addEventListener('input', persistFormState);
+document.getElementById('run-form').addEventListener('change', persistFormState);
+document.getElementById('run-form').addEventListener('submit', async (event) => { event.preventDefault(); const formData = new FormData(event.currentTarget); const response = await fetch('/api/start', { method: 'POST', body: formData }); const payload = await response.json(); if (!response.ok || payload.error) { alert(payload.error || 'Run creation failed.'); return; } const targetRunId = payload.run_id || (payload.run_ids && payload.run_ids[0]); persistFormState(); await fetchRuns(); if (targetRunId) await fetchRun(targetRunId); });
+restoreFormState();
 fetchRuns();
 </script>
 </body>

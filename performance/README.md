@@ -8,6 +8,11 @@ python performance/app.py
 
 Open `http://127.0.0.1:8787`.
 
+Browser persistence:
+
+- the form stores non-file fields in browser `localStorage`
+- uploaded files are not persisted by the browser and must be selected again after a page reload
+
 TLS:
 
 - leave `Verify SSL certificates` enabled to use the HTTP library default trust store
