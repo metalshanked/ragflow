@@ -34,8 +34,12 @@ app = Quart(__name__)
 RUNS_LOCK = threading.Lock()
 RUNS: dict[str, dict[str, Any]] = {}
 RUN_SECRETS: dict[str, dict[str, Any]] = {}
+BATCH_LIMITERS_LOCK = threading.Lock()
+BATCH_LIMITERS: dict[str, threading.Semaphore] = {}
+BATCH_ANALYSIS_STATE: dict[str, str] = {}
 
 TERMINAL_DOCUMENT_STATES = {"DONE", "FAIL", "CANCEL"}
+TERMINAL_RUN_STATES = {"completed", "failed"}
 STOPWORDS = {
     "about", "after", "again", "against", "also", "among", "because", "before",
     "being", "below", "between", "could", "document", "documents", "each", "from",
@@ -165,6 +169,126 @@ def histogram(values: list[float], bins: int = 10) -> list[dict[str, Any]]:
         end = start + step
         result.append({"label": f"{start:.0f}-{end:.0f}", "count": count})
     return result
+
+
+PIPELINE_TS_RE = re.compile(r"^\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:[.,](\d{1,6}))?\s*(.*)$")
+
+
+def _coerce_pipeline_label(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("label", "name", "title", "component_name", "id"):
+            text = str(value.get(key) or "").strip()
+            if text:
+                return text
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def extract_pipeline_path(dsl: Any) -> list[str]:
+    if not isinstance(dsl, dict):
+        return []
+
+    path = dsl.get("path")
+    graph = dsl.get("graph") if isinstance(dsl.get("graph"), dict) else {}
+    nodes = graph.get("nodes") if isinstance(graph.get("nodes"), list) else []
+    components = dsl.get("components")
+
+    node_labels: dict[str, str] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        node_id = str(node.get("id") or "").strip()
+        data = node.get("data") if isinstance(node.get("data"), dict) else {}
+        label = _coerce_pipeline_label(data) or _coerce_pipeline_label(node)
+        if node_id and label:
+            node_labels[node_id] = label
+
+    if isinstance(components, dict):
+        for key, value in components.items():
+            label = _coerce_pipeline_label(value) or str(key).strip()
+            if label:
+                node_labels[str(key).strip()] = label
+    elif isinstance(components, list):
+        for value in components:
+            label = _coerce_pipeline_label(value)
+            if label:
+                node_labels[label] = label
+
+    resolved: list[str] = []
+    if isinstance(path, list):
+        for item in path:
+            label = _coerce_pipeline_label(item)
+            mapped = node_labels.get(label, "")
+            final_label = mapped or label
+            if final_label and final_label not in resolved:
+                resolved.append(final_label)
+
+    if resolved:
+        return resolved
+
+    fallback: list[str] = []
+    for label in node_labels.values():
+        if label and label not in fallback:
+            fallback.append(label)
+    return fallback[:8]
+
+
+def parse_pipeline_progress(progress_msg: str) -> list[dict[str, Any]]:
+    lines = [line.strip() for line in (progress_msg or "").splitlines() if line.strip()]
+    if not lines:
+        return []
+
+    steps: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for line in lines:
+        match = PIPELINE_TS_RE.match(line)
+        if match:
+            timestamp = match.group(1)
+            fractional = (match.group(2) or "").ljust(6, "0")[:6]
+            message = (match.group(3) or "").strip() or "step"
+            try:
+                moment = datetime.strptime(f"{timestamp}.{fractional}", "%Y-%m-%d %H:%M:%S.%f")
+            except ValueError:
+                moment = None
+        else:
+            moment = None
+            message = line
+        key = (moment.isoformat() if moment else "", message)
+        if key in seen:
+            continue
+        seen.add(key)
+        steps.append({"message": message, "ts": moment, "duration_sec": None, "is_slow": False})
+
+    durations: list[float] = []
+    for index in range(len(steps) - 1):
+        current = steps[index].get("ts")
+        nxt = steps[index + 1].get("ts")
+        if isinstance(current, datetime) and isinstance(nxt, datetime):
+            elapsed = round(max(0.0, (nxt - current).total_seconds()), 3)
+            steps[index]["duration_sec"] = elapsed
+            if elapsed > 0:
+                durations.append(elapsed)
+
+    threshold = max(percentile(durations, 0.75), 3.0) if durations else 0.0
+    if threshold > 0:
+        for step in steps:
+            duration = safe_float(step.get("duration_sec"))
+            step["is_slow"] = duration >= threshold and duration > 0
+
+    normalized: list[dict[str, Any]] = []
+    for step in steps:
+        normalized.append(
+            {
+                "message": step["message"],
+                "timestamp": step["ts"].strftime("%Y-%m-%d %H:%M:%S") if isinstance(step.get("ts"), datetime) else "",
+                "duration_sec": step["duration_sec"],
+                "is_slow": bool(step["is_slow"]),
+            }
+        )
+    return normalized
 
 
 def json_clone(value: Any) -> Any:
@@ -468,25 +592,62 @@ def patch_run(run_id: str, callback) -> None:
     persist_run_snapshot(run_id)
 
 
+def get_batch_semaphore(batch_id: str, parallel_count: int) -> threading.Semaphore:
+    with BATCH_LIMITERS_LOCK:
+        semaphore = BATCH_LIMITERS.get(batch_id)
+        if semaphore is None:
+            semaphore = threading.Semaphore(max(1, parallel_count))
+            BATCH_LIMITERS[batch_id] = semaphore
+        return semaphore
+
+
+def list_batch_runs(batch_id: str) -> list[dict[str, Any]]:
+    with RUNS_LOCK:
+        runs = [json_clone(run) for run in RUNS.values() if run.get("config", {}).get("batch", {}).get("batch_id") == batch_id]
+    return sorted(runs, key=lambda item: safe_int(item.get("config", {}).get("batch", {}).get("run_index"), 0))
+
+
+def set_batch_fields(batch_id: str, **fields: Any) -> None:
+    snapshots: list[str] = []
+    with RUNS_LOCK:
+        for run_id, run in RUNS.items():
+            if run.get("config", {}).get("batch", {}).get("batch_id") != batch_id:
+                continue
+            run.update(fields)
+            snapshots.append(run_id)
+    for run_id in snapshots:
+        persist_run_snapshot(run_id)
+
+
 def summarize_documents(documents: list[dict[str, Any]], pipeline_logs: list[dict[str, Any]]) -> dict[str, Any]:
     durations = [safe_float(doc.get("process_duration")) for doc in documents if safe_float(doc.get("process_duration")) > 0]
     chunks = [safe_int(doc.get("chunk_count")) for doc in documents]
     tokens = [safe_int(doc.get("token_count")) for doc in documents]
     status_breakdown = Counter(doc.get("run", "UNKNOWN") for doc in documents)
     pipeline_by_document = []
+    pipeline_step_durations: list[float] = []
+    pipeline_log_durations: list[float] = []
     for log in pipeline_logs:
         dsl = log.get("dsl") or {}
-        component_path = dsl.get("path") if isinstance(dsl, dict) else []
+        progress_steps = parse_pipeline_progress(log.get("progress_msg") or "")
+        for step in progress_steps:
+            duration = safe_float(step.get("duration_sec"))
+            if duration > 0:
+                pipeline_step_durations.append(duration)
+        duration_sec = round(safe_float(log.get("process_duration")), 3)
+        if duration_sec > 0:
+            pipeline_log_durations.append(duration_sec)
         pipeline_by_document.append(
             {
                 "document_id": log.get("document_id"),
                 "document_name": log.get("document_name"),
-                "duration_sec": round(safe_float(log.get("process_duration")), 3),
+                "duration_sec": duration_sec,
                 "status": log.get("operation_status"),
                 "progress": safe_float(log.get("progress")),
                 "progress_msg": log.get("progress_msg") or "",
                 "task_type": log.get("task_type") or "",
-                "components": component_path or [],
+                "pipeline_path": extract_pipeline_path(dsl),
+                "progress_steps": progress_steps,
             }
         )
     total_duration = round(sum(durations), 3)
@@ -502,6 +663,8 @@ def summarize_documents(documents: list[dict[str, Any]], pipeline_logs: list[dic
         "p95_parse_duration_sec": round(percentile(durations, 0.95), 3) if durations else 0.0,
         "token_throughput_per_sec": round(total_tokens / total_duration, 3) if total_duration > 0 else 0.0,
         "pipeline_logs": pipeline_by_document,
+        "pipeline_slow_step_threshold_sec": round(max(percentile(pipeline_step_durations, 0.75), 3.0), 3) if pipeline_step_durations else 0.0,
+        "pipeline_slow_log_threshold_sec": round(max(percentile(pipeline_log_durations, 0.75), 10.0), 3) if pipeline_log_durations else 0.0,
     }
 
 
@@ -532,6 +695,175 @@ def summarize_benchmark(results: list[dict[str, Any]], wall_time_sec: float) -> 
         "avg_reference_count": round(statistics.mean(references), 3) if references else 0.0,
         "latency_histogram": histogram(latencies, bins=10),
     }
+
+
+def summarize_batch_metrics(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    parse_times = [safe_float(run.get("summary", {}).get("parse_wall_time_sec")) for run in runs if safe_float(run.get("summary", {}).get("parse_wall_time_sec")) > 0]
+    retrieval_p95 = [safe_float(run.get("summary", {}).get("retrieval_p95_ms")) for run in runs if safe_float(run.get("summary", {}).get("retrieval_p95_ms")) > 0]
+    chat_p95 = [safe_float(run.get("summary", {}).get("chat_p95_ms")) for run in runs if safe_float(run.get("summary", {}).get("chat_p95_ms")) > 0]
+    error_rates = [safe_float(run.get("summary", {}).get("chat_error_rate")) for run in runs if run.get("summary")]
+    tokens_per_sec = [safe_float(run.get("summary", {}).get("chat_tokens_per_sec")) for run in runs if safe_float(run.get("summary", {}).get("chat_tokens_per_sec")) > 0]
+    statuses = Counter((run.get("status") or "unknown").lower() for run in runs)
+    return {
+        "total_runs": len(runs),
+        "completed_runs": statuses.get("completed", 0),
+        "failed_runs": statuses.get("failed", 0),
+        "status_breakdown": dict(statuses),
+        "avg_parse_wall_time_sec": round(statistics.mean(parse_times), 3) if parse_times else 0.0,
+        "p95_parse_wall_time_sec": round(percentile(parse_times, 0.95), 3) if parse_times else 0.0,
+        "avg_retrieval_p95_ms": round(statistics.mean(retrieval_p95), 3) if retrieval_p95 else 0.0,
+        "max_retrieval_p95_ms": round(max(retrieval_p95), 3) if retrieval_p95 else 0.0,
+        "avg_chat_p95_ms": round(statistics.mean(chat_p95), 3) if chat_p95 else 0.0,
+        "max_chat_p95_ms": round(max(chat_p95), 3) if chat_p95 else 0.0,
+        "avg_chat_error_rate": round(statistics.mean(error_rates), 4) if error_rates else 0.0,
+        "avg_chat_tokens_per_sec": round(statistics.mean(tokens_per_sec), 3) if tokens_per_sec else 0.0,
+        "runs": [
+            {
+                "run_id": run.get("id"),
+                "run_index": safe_int(run.get("config", {}).get("batch", {}).get("run_index"), 0),
+                "status": run.get("status"),
+                "dataset_name": run.get("dataset", {}).get("name"),
+                "parse_wall_time_sec": safe_float(run.get("summary", {}).get("parse_wall_time_sec")),
+                "retrieval_p95_ms": safe_float(run.get("summary", {}).get("retrieval_p95_ms")),
+                "chat_p95_ms": safe_float(run.get("summary", {}).get("chat_p95_ms")),
+                "chat_error_rate": safe_float(run.get("summary", {}).get("chat_error_rate")),
+                "chat_tokens_per_sec": safe_float(run.get("summary", {}).get("chat_tokens_per_sec")),
+                "error": run.get("error") or "",
+            }
+            for run in sorted(runs, key=lambda item: safe_int(item.get("config", {}).get("batch", {}).get("run_index"), 0))
+        ],
+    }
+
+
+def build_run_assessment_payload(run: dict[str, Any]) -> dict[str, Any]:
+    parse = run.get("parse", {})
+    retrieval = run.get("retrieval", {}).get("summary", {})
+    chat = run.get("chat_results", {}).get("summary", {})
+    slow_logs = sorted(parse.get("pipeline_logs", []), key=lambda item: safe_float(item.get("duration_sec")), reverse=True)[:5]
+    return {
+        "run_id": run.get("id"),
+        "status": run.get("status"),
+        "dataset": run.get("dataset", {}),
+        "summary": run.get("summary", {}),
+        "parse": {
+            "documents": parse.get("total_documents", 0),
+            "chunks": parse.get("total_chunks", 0),
+            "tokens": parse.get("total_tokens", 0),
+            "wall_time_sec": parse.get("wall_time_sec", 0),
+            "p95_duration_sec": parse.get("p95_parse_duration_sec", 0),
+            "slow_log_threshold_sec": parse.get("pipeline_slow_log_threshold_sec", 0),
+            "slow_logs": [
+                {
+                    "document_name": item.get("document_name"),
+                    "task_type": item.get("task_type"),
+                    "duration_sec": item.get("duration_sec"),
+                    "pipeline_path": item.get("pipeline_path", []),
+                    "slow_steps": [step for step in item.get("progress_steps", []) if step.get("is_slow")][:5],
+                }
+                for item in slow_logs
+            ],
+        },
+        "retrieval": retrieval,
+        "chat": chat,
+    }
+
+
+def build_batch_assessment_payload(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    if not runs:
+        return {}
+    first = runs[0]
+    return {
+        "batch": first.get("config", {}).get("batch", {}),
+        "host": first.get("config", {}).get("base_url"),
+        "aggregate": summarize_batch_metrics(runs),
+    }
+
+
+def build_assessment_prompt(scope: str, payload: dict[str, Any]) -> str:
+    subject = "run" if scope == "run" else "batch of runs"
+    return (
+        "You are analyzing RAGFlow benchmark results.\n"
+        f"Focus only on the {subject} metrics in the JSON below.\n"
+        "Ignore any retrieved knowledge-base content if present.\n"
+        "Write in simple language for an engineer or operator.\n"
+        "Cover: what happened, whether the performance looks healthy, the biggest risks or bottlenecks, and 3 concrete next actions.\n"
+        "If the data is incomplete, say that explicitly instead of guessing.\n\n"
+        f"{json.dumps(payload, indent=2, ensure_ascii=False)}"
+    )
+
+
+def generate_llm_assessment(
+    client: RAGFlowClient,
+    dataset_id: str,
+    create_options: dict[str, Any],
+    completion_options: dict[str, Any],
+    prompt: str,
+    name_prefix: str,
+) -> dict[str, Any]:
+    analysis_chat = client.create_chat(f"{name_prefix}-{datetime.now().strftime('%H%M%S')}", dataset_id, options=create_options)
+    chat_id = analysis_chat["id"]
+    try:
+        payload = merge_dicts({"extra_body": {"reference": False}}, completion_options or {})
+        payload["extra_body"] = merge_dicts(payload.get("extra_body") or {}, {"reference": False})
+        response = client.completion(chat_id, prompt, payload)
+        choice = ((response.get("choices") or [{}])[0]) if isinstance(response, dict) else {}
+        message = choice.get("message") or {}
+        return {
+            "generated_at": utc_now(),
+            "chat_id": chat_id,
+            "content": message.get("content") or "",
+            "model_name": (analysis_chat.get("llm") or {}).get("model_name") or ((create_options.get("llm") or {}).get("model_name")),
+        }
+    finally:
+        try:
+            client.delete_chat(chat_id)
+        except Exception:
+            pass
+
+
+def maybe_generate_batch_assessment(
+    client: RAGFlowClient,
+    run_id: str,
+    dataset_id: str,
+    create_options: dict[str, Any],
+    completion_options: dict[str, Any],
+) -> None:
+    with RUNS_LOCK:
+        run = RUNS.get(run_id)
+        if not run:
+            return
+        batch = run.get("config", {}).get("batch", {})
+        batch_id = batch.get("batch_id")
+        if not batch_id:
+            return
+        runs = [json_clone(item) for item in RUNS.values() if item.get("config", {}).get("batch", {}).get("batch_id") == batch_id]
+        if not runs or any((item.get("status") or "").lower() not in TERMINAL_RUN_STATES for item in runs):
+            return
+        if BATCH_ANALYSIS_STATE.get(batch_id) in {"in_progress", "done"}:
+            return
+        BATCH_ANALYSIS_STATE[batch_id] = "in_progress"
+
+    try:
+        payload = build_batch_assessment_payload(runs)
+        if not payload:
+            return
+        assessment = generate_llm_assessment(
+            client,
+            dataset_id,
+            create_options,
+            completion_options,
+            build_assessment_prompt("batch", payload),
+            "perf-batch-summary",
+        )
+        summary = {"aggregate": payload.get("aggregate", {}), "llm_assessment": assessment}
+        set_batch_fields(batch_id, batch_summary=summary)
+    except Exception:
+        with RUNS_LOCK:
+            BATCH_ANALYSIS_STATE.pop(batch_id, None)
+        raise
+    else:
+        with RUNS_LOCK:
+            BATCH_ANALYSIS_STATE[batch_id] = "done"
 
 
 def benchmark_retrieval(
@@ -718,12 +1050,21 @@ def execute_run(run_id: str) -> None:
 
     client = RAGFlowClient(config["base_url"], config["api_key"], timeout=config["http_timeout_sec"], tls_config=config.get("tls"))
     resource_ids: dict[str, str] = {}
+    batch_semaphore: threading.Semaphore | None = None
 
     try:
+        batch = config.get("batch", {})
+        batch_id = batch.get("batch_id")
+        parallel_count = max(1, safe_int(batch.get("parallel_count"), 1))
+        if batch_id:
+            batch_semaphore = get_batch_semaphore(batch_id, parallel_count)
+            if safe_int(batch.get("run_count"), 1) > parallel_count:
+                set_run_fields(run_id, phase="waiting_for_slot")
+                append_run_event(run_id, f"Waiting for a batch execution slot ({parallel_count} parallel run(s) allowed).")
+            batch_semaphore.acquire()
         set_run_fields(run_id, status="running", phase="provisioning", started_at=utc_now())
         append_run_event(run_id, f"Run started against {normalize_root_url(config['base_url'])}.")
 
-        batch = config.get("batch", {})
         run_suffix = f"-r{safe_int(batch.get('run_index'), 1):02d}" if safe_int(batch.get("run_count"), 1) > 1 else ""
         dataset_name = f"{config['dataset_prefix']}-{datetime.now().strftime('%Y%m%d-%H%M%S')}{run_suffix}"
         dataset_options = merge_dicts(
@@ -847,28 +1188,64 @@ def execute_run(run_id: str) -> None:
             set_run_fields(run_id, chat_results=chat_results)
             append_run_event(run_id, "Chat stage skipped.")
 
+        final_summary = {
+            "documents": parse_summary.get("total_documents", len(last_snapshot)),
+            "prompts": len(prompts),
+            "parse_wall_time_sec": parse_wall_time,
+            "parse_total_tokens": parse_summary.get("total_tokens", 0),
+            "retrieval_p95_ms": retrieval.get("summary", {}).get("p95_latency_ms", 0),
+            "chat_p95_ms": chat_results.get("summary", {}).get("p95_latency_ms", 0),
+            "chat_error_rate": chat_results.get("summary", {}).get("error_rate", 0),
+            "chat_tokens_per_sec": chat_results.get("summary", {}).get("tokens_per_sec", 0),
+        }
+        set_run_fields(run_id, summary=final_summary)
+
+        if config["analysis"]["enabled"]:
+            try:
+                set_run_fields(run_id, phase="llm_summary", progress=97)
+                run_payload = build_run_response(run_id)
+                assessment = generate_llm_assessment(
+                    client,
+                    dataset_id,
+                    chat_stage["create_options"],
+                    chat_stage["completion_options"],
+                    build_assessment_prompt("run", build_run_assessment_payload(run_payload)),
+                    "perf-run-summary",
+                )
+                set_run_fields(run_id, analysis={"enabled": True, "llm_assessment": assessment})
+                append_run_event(run_id, "Generated executive summary with the configured RAGFlow LLM.")
+            except Exception as exc:
+                set_run_fields(run_id, analysis={"enabled": True, "error": str(exc)})
+                append_run_event(run_id, f"Executive summary skipped: {exc}", level="warning")
+        else:
+            set_run_fields(run_id, analysis={"enabled": False, "skipped": True})
+
         set_run_fields(
             run_id,
-            summary={
-                "documents": parse_summary.get("total_documents", len(last_snapshot)),
-                "prompts": len(prompts),
-                "parse_wall_time_sec": parse_wall_time,
-                "parse_total_tokens": parse_summary.get("total_tokens", 0),
-                "retrieval_p95_ms": retrieval.get("summary", {}).get("p95_latency_ms", 0),
-                "chat_p95_ms": chat_results.get("summary", {}).get("p95_latency_ms", 0),
-                "chat_error_rate": chat_results.get("summary", {}).get("error_rate", 0),
-                "chat_tokens_per_sec": chat_results.get("summary", {}).get("tokens_per_sec", 0),
-            },
+            summary=final_summary,
             progress=100,
             phase="completed",
             status="completed",
             completed_at=utc_now(),
         )
         append_run_event(run_id, "Run completed successfully.")
+        if config["analysis"]["enabled"] and resource_ids.get("dataset_id"):
+            try:
+                maybe_generate_batch_assessment(
+                    client,
+                    run_id,
+                    resource_ids["dataset_id"],
+                    chat_stage["create_options"],
+                    chat_stage["completion_options"],
+                )
+            except Exception as exc:
+                append_run_event(run_id, f"Batch executive summary skipped: {exc}", level="warning")
     except Exception as exc:
         set_run_fields(run_id, status="failed", phase="failed", completed_at=utc_now(), error=str(exc))
         append_run_event(run_id, f"Run failed: {exc}", level="error")
     finally:
+        if batch_semaphore is not None:
+            batch_semaphore.release()
         if config.get("cleanup_remote"):
             cleanup_remote_resources(client, resource_ids, run_id)
         upload_dir = Path(config["upload_dir"])
@@ -916,6 +1293,7 @@ def queue_run(run_id: str, config: dict[str, Any], filenames: list[str]) -> None
             "chat_prefix": config["chat_prefix"],
             "cleanup_remote": config["cleanup_remote"],
             "stages": config["stages"],
+            "analysis": config["analysis"],
             "batch": batch,
         },
         "dataset": {},
@@ -925,6 +1303,8 @@ def queue_run(run_id: str, config: dict[str, Any], filenames: list[str]) -> None
         "prompts": [],
         "retrieval": {},
         "chat_results": {},
+        "analysis": {},
+        "batch_summary": {},
         "summary": {},
         "live": {"parse_completed": 0, "parse_total": len(filenames), "retrieval_completed": 0, "retrieval_total": 0, "chat_completed": 0, "chat_total": 0, "documents": []},
         "events": [{"ts": utc_now(), "level": "info", "message": f"Run queued{batch_note} with {len(filenames)} file(s)."}],
@@ -987,6 +1367,9 @@ INDEX_HTML = """<!doctype html>
     .badge.failed { background:rgba(185,28,28,.1); color:var(--bad); }
     .grid { display:grid; gap:16px; grid-template-columns:repeat(12,minmax(0,1fr)); }
     .span3 { grid-column:span 3; } .span6 { grid-column:span 6; } .span12 { grid-column:span 12; }
+    .tabs { display:flex; flex-wrap:wrap; gap:8px; margin:0 0 16px; }
+    .tab { border:1px solid var(--line); border-radius:999px; padding:8px 12px; background:#fff; color:var(--ink); cursor:pointer; }
+    .tab.active { border-color:var(--accent); color:var(--accent); box-shadow:inset 0 0 0 1px var(--accent); }
     .metric .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.06em; }
     .metric .value { font-size:28px; font-weight:800; letter-spacing:-.05em; }
     .progress { height:12px; border-radius:999px; background:#e8dfd4; overflow:hidden; margin:10px 0 8px; }
@@ -1001,6 +1384,19 @@ INDEX_HTML = """<!doctype html>
     .stick { width:100%; border-radius:10px 10px 2px 2px; background:linear-gradient(180deg,var(--accent),#2dd4bf); min-height:4px; }
     table { width:100%; border-collapse:collapse; font-size:13px; } th, td { border-bottom:1px solid var(--line); padding:10px 8px; text-align:left; vertical-align:top; }
     th { font-size:11px; text-transform:uppercase; color:var(--muted); letter-spacing:.08em; }
+    .pill-row { display:flex; flex-wrap:wrap; gap:6px; }
+    .pill { display:inline-flex; align-items:center; border-radius:999px; padding:4px 10px; font-size:12px; background:#efe4d5; color:var(--ink); }
+    .step-list { display:grid; gap:8px; min-width:280px; }
+    .step-row { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:10px; padding:8px 10px; border:1px solid var(--line); border-radius:12px; background:#fff; }
+    .step-row.slow { border-color:rgba(194,65,12,.35); background:rgba(251,146,60,.08); }
+    .step-main { display:grid; gap:4px; }
+    .step-message { font-weight:600; line-height:1.35; }
+    .step-meta { font-size:11px; color:var(--muted); }
+    .step-duration { align-self:start; white-space:nowrap; font-weight:700; color:var(--accent); }
+    .step-duration.slow { color:var(--accent2); }
+    .duration-badge { display:inline-flex; border-radius:999px; padding:4px 8px; background:rgba(15,118,110,.1); color:var(--accent); font-weight:700; }
+    .duration-badge.slow { background:rgba(194,65,12,.12); color:var(--accent2); }
+    .prose { line-height:1.6; white-space:pre-wrap; }
     pre { margin:0; white-space:pre-wrap; word-break:break-word; font-family:Consolas,monospace; font-size:12px; background:#fff; border:1px solid var(--line); border-radius:12px; padding:12px; max-height:280px; overflow:auto; }
     .empty { padding:18px; border:1px dashed var(--line); border-radius:16px; color:var(--muted); background:rgba(255,255,255,.5); text-align:center; }
     @media (max-width:1100px) { .page { grid-template-columns:1fr; } .sidebar { border-right:0; border-bottom:1px solid var(--line); } .row2 { grid-template-columns:1fr; } .span3, .span6, .span12 { grid-column:span 12; } .bar-row { grid-template-columns:1fr; } }
@@ -1016,7 +1412,8 @@ INDEX_HTML = """<!doctype html>
           <label>RAGFlow Base URL<input name=\"base_url\" value=\"http://127.0.0.1\" required /></label>
           <label>API Key<input name=\"api_key\" type=\"password\" required /></label>
           <label class=\"check\"><input name=\"verify_ssl\" type=\"checkbox\" checked />Verify SSL certificates</label>
-          <div class=\"row2\"><label>HTTP Timeout (sec)<input name=\"http_timeout_sec\" type=\"number\" min=\"30\" max=\"1800\" value=\"180\" /></label><label>Run Count<input name=\"run_count\" type=\"number\" min=\"1\" max=\"50\" value=\"1\" /></label></div>
+          <div class=\"row2\"><label>HTTP Timeout (sec)<input name=\"http_timeout_sec\" type=\"number\" min=\"30\" max=\"1800\" value=\"180\" /></label><label>Total Runs<input name=\"run_count\" type=\"number\" min=\"1\" max=\"50\" value=\"1\" /></label></div>
+          <label>Parallel Runs<input name=\"parallel_runs\" type=\"number\" min=\"1\" max=\"50\" value=\"1\" /></label>
           <div class=\"row2\"><label>Dataset Prefix<input name=\"dataset_prefix\" value=\"perf-dataset\" /></label><label>Chat Prefix<input name=\"chat_prefix\" value=\"perf-chat\" /></label></div>
           <label>Files<input name=\"files\" type=\"file\" multiple required /></label>
           <label>Prompt Generation Settings
@@ -1068,18 +1465,19 @@ INDEX_HTML = """<!doctype html>
   }
 }</textarea>
           </label>
+          <label class=\"check\"><input name=\"enable_llm_summary\" type=\"checkbox\" checked />Generate executive results summary with the configured RAGFlow LLM</label>
           <label class=\"check\"><input name=\"cleanup_remote\" type=\"checkbox\" />Delete the remote dataset and chat after the run</label>
           <button type=\"submit\">Start Benchmark</button>
         </form>
       </section>
-      <section class=\"panel\"><div style=\"display:flex;justify-content:space-between;align-items:center;gap:10px;\"><h2 style=\"margin:0;\">Runs</h2><button class=\"secondary\" id=\"refresh-runs\" type=\"button\">Refresh</button></div><div id=\"run-list\" class=\"run-list\"></div></section>
+      <section class=\"panel\"><div style=\"display:flex;justify-content:space-between;align-items:center;gap:10px;\"><h2 style=\"margin:0;\">Runs</h2><div style=\"display:flex;gap:8px;\"><button class=\"secondary\" id=\"refresh-runs\" type=\"button\">Refresh</button><button class=\"secondary\" id=\"reset-runs\" type=\"button\">Reset</button></div></div><div id=\"run-list\" class=\"run-list\"></div></section>
     </aside>
     <main class=\"content\"><div id=\"run-view\" class=\"empty\">Start a run or select a previous benchmark from the left.</div></main>
   </div>
 <script>
-const state = { activeRunId: null, pollHandle: null, runs: [] };
+const state = { activeRunId: null, activeBatchTabs: {}, pollHandle: null, runs: [] };
 const FORM_STORAGE_KEY = 'ragflow-performance-form-v1';
-const FORM_FIELDS = ['base_url', 'api_key', 'verify_ssl', 'http_timeout_sec', 'run_count', 'dataset_prefix', 'chat_prefix', 'prompt_options', 'dataset_options', 'enable_parsing', 'parsing_options', 'enable_retrieval', 'retrieval_options', 'enable_chat', 'chat_options', 'cleanup_remote'];
+const FORM_FIELDS = ['base_url', 'api_key', 'verify_ssl', 'http_timeout_sec', 'run_count', 'parallel_runs', 'dataset_prefix', 'chat_prefix', 'prompt_options', 'dataset_options', 'enable_parsing', 'parsing_options', 'enable_retrieval', 'retrieval_options', 'enable_chat', 'chat_options', 'enable_llm_summary', 'cleanup_remote'];
 function statusBadge(status) { const normalized = (status || 'queued').toLowerCase(); return `<span class=\"badge ${normalized}\">${normalized}</span>`; }
 function number(value, digits = 2) { if (value === null || value === undefined || Number.isNaN(Number(value))) return '-'; return Number(value).toFixed(digits); }
 function formatTs(value) { if (!value) return '-'; const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleString(); }
@@ -1087,15 +1485,40 @@ function metricCard(label, value, hint = '') { return `<div class=\"card span3\"
 function renderBars(rows, formatter = (value) => value, orange = false) { if (!rows || !rows.length) return `<div class=\"empty\">No chart data available.</div>`; const max = Math.max(...rows.map((row) => Number(row.value) || 0), 1); return `<div class=\"bars\">${rows.map((row) => `<div class=\"bar-row\"><div title=\"${row.label}\">${row.label}</div><div class=\"bar-track\"><div class=\"bar-fill ${orange ? 'orange' : ''}\" style=\"width:${Math.max(4, (Number(row.value) || 0) / max * 100)}%\"></div></div><div>${formatter(row.value)}</div></div>`).join('')}</div>`; }
 function renderHistogram(data) { if (!data || !data.length) return `<div class=\"empty\">No latency data available.</div>`; const max = Math.max(...data.map((bin) => bin.count), 1); return `<div class=\"histogram\">${data.map((bin) => `<div class=\"bin\"><div>${bin.count}</div><div class=\"stick\" style=\"height:${Math.max(8, bin.count / max * 140)}px\"></div><div>${bin.label}</div></div>`).join('')}</div>`; }
 function renderTable(headers, rows) { if (!rows || !rows.length) return `<div class=\"empty\">No rows available.</div>`; return `<table><thead><tr>${headers.map((header) => `<th>${header}</th>`).join('')}</tr></thead><tbody>${rows.map((row) => `<tr>${row.map((cell) => `<td>${cell}</td>`).join('')}</tr>`).join('')}</tbody></table>`; }
+function escapeHtml(value) { return String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('\"', '&quot;').replaceAll(\"'\", '&#39;'); }
+function renderDurationBadge(value, threshold) { const duration = Number(value) || 0; if (!duration) return '-'; const slow = threshold > 0 && duration >= threshold; return `<span class=\"duration-badge ${slow ? 'slow' : ''}\">${number(duration, 2)} s</span>`; }
+function renderPipelinePath(item) { const path = Array.isArray(item.pipeline_path) ? item.pipeline_path.filter(Boolean) : []; if (!path.length) return `<span class=\"subtle\">No pipeline path returned by this log.</span>`; return `<div class=\"pill-row\">${path.map((part) => `<span class=\"pill\">${escapeHtml(part)}</span>`).join('')}</div>`; }
+function renderProgressSteps(item) { const steps = Array.isArray(item.progress_steps) ? item.progress_steps : []; if (!steps.length) { const fallback = item.progress_msg ? escapeHtml(item.progress_msg) : 'No progress steps returned.'; return `<div class=\"subtle\">${fallback}</div>`; } return `<div class=\"step-list\">${steps.map((step) => { const slow = Boolean(step.is_slow); const duration = Number(step.duration_sec); const timestamp = step.timestamp ? escapeHtml(step.timestamp) : 'timestamp unavailable'; const meta = duration > 0 ? `${timestamp} • next step in ${number(duration, 2)} s` : timestamp; return `<div class=\"step-row ${slow ? 'slow' : ''}\"><div class=\"step-main\"><div class=\"step-message\">${escapeHtml(step.message || 'step')}</div><div class=\"step-meta\">${meta}</div></div><div class=\"step-duration ${slow ? 'slow' : ''}\">${duration > 0 ? `${number(duration, 2)} s` : '-'}</div></div>`; }).join('')}</div>`; }
 function persistFormState() { try { const form = document.getElementById('run-form'); const payload = {}; FORM_FIELDS.forEach((name) => { const field = form.elements.namedItem(name); if (!field) return; if (field.type === 'checkbox') payload[name] = field.checked; else payload[name] = field.value; }); localStorage.setItem(FORM_STORAGE_KEY, JSON.stringify(payload)); } catch (error) { console.warn('Unable to persist form state.', error); } }
 function restoreFormState() { try { const raw = localStorage.getItem(FORM_STORAGE_KEY); if (!raw) return; const payload = JSON.parse(raw); const form = document.getElementById('run-form'); FORM_FIELDS.forEach((name) => { if (!(name in payload)) return; const field = form.elements.namedItem(name); if (!field) return; if (field.type === 'checkbox') field.checked = Boolean(payload[name]); else if (typeof payload[name] === 'string' || typeof payload[name] === 'number') field.value = payload[name]; }); } catch (error) { console.warn('Unable to restore form state.', error); } }
-async function fetchRuns() { const response = await fetch('/api/runs'); const payload = await response.json(); state.runs = payload.runs || []; renderRunList(); }
-async function fetchRun(runId, options = {}) { if (!runId) return; const response = await fetch(`/api/runs/${runId}`); const payload = await response.json(); state.activeRunId = runId; renderRunView(payload); if (!options.silent) renderRunList(); const live = ['queued', 'running'].includes((payload.status || '').toLowerCase()); if (live) startPolling(runId); else stopPolling(); }
+function upsertRun(run) { const index = state.runs.findIndex((item) => item.id === run.id); if (index >= 0) state.runs[index] = run; else state.runs.unshift(run); }
+function getRun(runId) { return state.runs.find((item) => item.id === runId) || null; }
+function getBatchRuns(batchId) { if (!batchId) return []; return state.runs.filter((item) => item.config?.batch?.batch_id === batchId).sort((a, b) => Number(a.config?.batch?.run_index || 0) - Number(b.config?.batch?.run_index || 0)); }
+function summarizeBatchRuns(batchRuns) { const average = (values) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0; const valuesFor = (field) => batchRuns.map((run) => Number(run.summary?.[field] || 0)).filter((value) => value > 0); return { total_runs: batchRuns.length, completed_runs: batchRuns.filter((run) => (run.status || '').toLowerCase() === 'completed').length, failed_runs: batchRuns.filter((run) => (run.status || '').toLowerCase() === 'failed').length, avg_parse_wall_time_sec: average(valuesFor('parse_wall_time_sec')), avg_retrieval_p95_ms: average(valuesFor('retrieval_p95_ms')), max_retrieval_p95_ms: valuesFor('retrieval_p95_ms').length ? Math.max(...valuesFor('retrieval_p95_ms')) : 0, avg_chat_p95_ms: average(valuesFor('chat_p95_ms')), max_chat_p95_ms: valuesFor('chat_p95_ms').length ? Math.max(...valuesFor('chat_p95_ms')) : 0, avg_chat_error_rate: average(batchRuns.map((run) => Number(run.summary?.chat_error_rate || 0))), avg_chat_tokens_per_sec: average(valuesFor('chat_tokens_per_sec')) }; }
+function renderBatchTabs(batchRuns, activeTab) { if (batchRuns.length <= 1) return ''; return `<div class=\"tabs\"><button class=\"tab ${activeTab === 'overview' ? 'active' : ''}\" data-batch-tab=\"overview\" type=\"button\">Batch Overview</button>${batchRuns.map((run) => `<button class=\"tab ${activeTab === run.id ? 'active' : ''}\" data-batch-tab=\"${run.id}\" type=\"button\">Run ${run.config?.batch?.run_index || '?'}</button>`).join('')}</div>`; }
+function renderBatchOverview(run, batchRuns) { const batch = run.config?.batch || {}; const batchSummary = batchRuns.find((item) => item.batch_summary?.aggregate || item.batch_summary?.llm_assessment)?.batch_summary || {}; const aggregate = batchSummary.aggregate || summarizeBatchRuns(batchRuns); const llm = batchSummary.llm_assessment?.content || ''; const rows = batchRuns.map((item) => [String(item.config?.batch?.run_index || '-'), statusBadge(item.status), escapeHtml(item.dataset?.name || item.config?.dataset_prefix || '-'), `${number(item.summary?.parse_wall_time_sec || 0)} s`, `${number(item.summary?.retrieval_p95_ms || 0)} ms`, `${number(item.summary?.chat_p95_ms || 0)} ms`, `${number((item.summary?.chat_error_rate || 0) * 100)}%`, item.error ? `<span style=\"color:var(--bad);\">${escapeHtml(item.error)}</span>` : '-']); return `<div style=\"display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:18px;\"><div><div style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap;\"><h2 style=\"margin:0;font-size:34px;letter-spacing:-.06em;\">${escapeHtml(run.config?.dataset_prefix || 'Batch')} batch</h2>${statusBadge(aggregate.failed_runs ? 'failed' : (aggregate.completed_runs === aggregate.total_runs ? 'completed' : 'running'))}</div><div class=\"subtle\" style=\"margin-top:6px;\">${escapeHtml(batch.batch_id || '-')} • ${batch.run_count || batchRuns.length} total runs • ${batch.parallel_count || 1} parallel runs • host ${escapeHtml(run.config?.base_url || '-')}</div></div><div class=\"subtle\" style=\"text-align:right;\"><div>First start: ${formatTs(batchRuns[0]?.started_at || batchRuns[0]?.created_at)}</div><div>Latest completion: ${formatTs(batchRuns[batchRuns.length - 1]?.completed_at)}</div></div></div><section class=\"grid\">${metricCard('Total Runs', aggregate.total_runs || batchRuns.length, `${aggregate.completed_runs || 0} completed • ${aggregate.failed_runs || 0} failed`)}${metricCard('Parallel Runs', batch.parallel_count || 1, 'simultaneous batch execution slots')}${metricCard('Avg Parse Wall', `${number(aggregate.avg_parse_wall_time_sec || 0)} s`, 'wall time per run')}${metricCard('Avg Retrieval P95', `${number(aggregate.avg_retrieval_p95_ms || 0)} ms`, `max ${number(aggregate.max_retrieval_p95_ms || 0)} ms`)}${metricCard('Avg Chat P95', `${number(aggregate.avg_chat_p95_ms || 0)} ms`, `max ${number(aggregate.max_chat_p95_ms || 0)} ms`)}${metricCard('Avg Chat Error Rate', `${number((aggregate.avg_chat_error_rate || 0) * 100)}%`, `${number(aggregate.avg_chat_tokens_per_sec || 0)} tok/s`)}<div class=\"card span12\"><h3>Batch Executive Summary</h3><div class=\"subtle\">${llm ? 'Generated by the configured RAGFlow chat model after the batch finished.' : 'This appears after every run in the batch reaches a terminal state.'}</div>${llm ? `<div class=\"prose\">${escapeHtml(llm)}</div>` : ''}</div><div class=\"card span12\"><h3>Batch Run Table</h3>${renderTable(['run','status','dataset','parse wall','retrieval p95','chat p95','chat errors','error'], rows)}</div></section>`; }
+function attachBatchTabHandlers(container, run, batchRuns) { const batch = run.config?.batch || {}; if ((batch.run_count || 1) <= 1 || !batch.batch_id) return; container.querySelectorAll('[data-batch-tab]').forEach((element) => element.addEventListener('click', async () => { const tab = element.getAttribute('data-batch-tab'); state.activeBatchTabs[batch.batch_id] = tab; if (tab && tab !== 'overview') { state.activeRunId = tab; const selected = getRun(tab); renderRunView(selected || run); if (selected && ['queued', 'running'].includes((selected.status || '').toLowerCase())) startPolling(tab); else stopPolling(); } else { renderRunView(run); const liveRun = batchRuns.find((item) => ['queued', 'running'].includes((item.status || '').toLowerCase())); if (liveRun) startPolling(liveRun.id); else stopPolling(); } renderRunList(); })); }
+async function fetchRuns() { const response = await fetch('/api/runs'); const payload = await response.json(); state.runs = payload.runs || []; renderRunList(); if (state.activeRunId) { const active = getRun(state.activeRunId); if (active) renderRunView(active); else { state.activeRunId = null; stopPolling(); document.getElementById('run-view').innerHTML = `<div class=\"empty\">Start a run or select a previous benchmark from the left.</div>`; } } }
+async function fetchRun(runId, options = {}) { if (!runId) return; const response = await fetch(`/api/runs/${runId}`); const payload = await response.json(); if (!response.ok || payload.error) return; upsertRun(payload); state.activeRunId = runId; renderRunView(payload); if (!options.silent) renderRunList(); const live = ['queued', 'running'].includes((payload.status || '').toLowerCase()); if (live) startPolling(runId); else stopPolling(); }
 function startPolling(runId) { stopPolling(); state.pollHandle = window.setInterval(() => fetchRun(runId, { silent: true }), 2500); }
 function stopPolling() { if (state.pollHandle) { window.clearInterval(state.pollHandle); state.pollHandle = null; } }
-function renderRunList() { const container = document.getElementById('run-list'); if (!state.runs.length) { container.innerHTML = `<div class=\"empty\">No runs yet.</div>`; return; } container.innerHTML = state.runs.map((run) => { const stages = []; if (run.config?.stages?.parsing?.enabled) stages.push('parse'); if (run.config?.stages?.retrieval?.enabled) stages.push('retrieval'); if (run.config?.stages?.chat?.enabled) stages.push('chat'); const batch = run.config?.batch || {}; const batchLabel = batch.run_count > 1 ? ` • run ${batch.run_index}/${batch.run_count}` : ''; return `<div class=\"run-item ${run.id === state.activeRunId ? 'active' : ''}\" data-run-id=\"${run.id}\"><div style=\"display:flex;justify-content:space-between;align-items:flex-start;gap:10px;\"><div><div style=\"font-weight:700;line-height:1.25;\">${run.dataset?.name || run.config?.dataset_prefix || 'pending run'}</div><div class=\"subtle\">${run.summary?.prompts || 0} prompts • ${(stages.join(' + ') || 'upload-only')}${batchLabel}</div></div>${statusBadge(run.status)}</div><div class=\"meta\" style=\"margin-top:8px;\"><span>${formatTs(run.started_at || run.created_at)}</span><span>${run.phase || '-'}</span></div></div>`; }).join(''); container.querySelectorAll('.run-item').forEach((element) => element.addEventListener('click', () => fetchRun(element.dataset.runId))); }
+function renderRunList() { const container = document.getElementById('run-list'); if (!state.runs.length) { container.innerHTML = `<div class=\"empty\">No runs yet.</div>`; return; } container.innerHTML = state.runs.map((run) => { const stages = []; if (run.config?.stages?.parsing?.enabled) stages.push('parse'); if (run.config?.stages?.retrieval?.enabled) stages.push('retrieval'); if (run.config?.stages?.chat?.enabled) stages.push('chat'); const batch = run.config?.batch || {}; const batchLabel = batch.run_count > 1 ? ` • run ${batch.run_index}/${batch.run_count} • parallel ${batch.parallel_count || 1}` : ''; return `<div class=\"run-item ${run.id === state.activeRunId ? 'active' : ''}\" data-run-id=\"${run.id}\"><div style=\"display:flex;justify-content:space-between;align-items:flex-start;gap:10px;\"><div><div style=\"font-weight:700;line-height:1.25;\">${escapeHtml(run.dataset?.name || run.config?.dataset_prefix || 'pending run')}</div><div class=\"subtle\">${run.summary?.prompts || 0} prompts • ${(stages.join(' + ') || 'upload-only')}${batchLabel}</div></div>${statusBadge(run.status)}</div><div class=\"meta\" style=\"margin-top:8px;\"><span>${formatTs(run.started_at || run.created_at)}</span><span>${escapeHtml(run.phase || '-')}</span></div></div>`; }).join(''); container.querySelectorAll('.run-item').forEach((element) => element.addEventListener('click', () => { const run = getRun(element.dataset.runId); const batchId = run?.config?.batch?.batch_id; if (batchId && (run?.config?.batch?.run_count || 1) > 1) state.activeBatchTabs[batchId] = run.id; fetchRun(element.dataset.runId); })); }
 function renderRunView(run) {
+  upsertRun(run);
   const container = document.getElementById('run-view');
+  const batchRuns = getBatchRuns(run.config?.batch?.batch_id);
+  const hasBatch = (run.config?.batch?.run_count || 1) > 1 && batchRuns.length > 0;
+  if (hasBatch && !state.activeBatchTabs[run.config.batch.batch_id]) state.activeBatchTabs[run.config.batch.batch_id] = 'overview';
+  const activeBatchTab = hasBatch ? state.activeBatchTabs[run.config.batch.batch_id] || 'overview' : run.id;
+  if (hasBatch && activeBatchTab === 'overview') {
+    container.innerHTML = `${renderBatchTabs(batchRuns, activeBatchTab)}${renderBatchOverview(run, batchRuns)}`;
+    attachBatchTabHandlers(container, run, batchRuns);
+    return;
+  }
+  if (hasBatch && activeBatchTab && activeBatchTab !== run.id) {
+    const selectedRun = getRun(activeBatchTab);
+    if (selectedRun) run = selectedRun;
+  }
   const parse = run.parse || {}; const retrieval = run.retrieval || { summary: {}, results: [] }; const chat = run.chat_results || { summary: {}, results: [] }; const live = run.live || {}; const prompts = run.prompts || []; const events = run.events || [];
   const stages = run.config?.stages || {};
   const batch = run.config?.batch || {};
@@ -1105,12 +1528,16 @@ function renderRunView(run) {
   const chatEnabled = Boolean(stages.chat?.enabled);
   const metricValue = (enabled, value, digits = 2, suffix = '') => enabled ? `${number(value, digits)}${suffix}` : 'skipped';
   const metricHint = (enabled, hint) => enabled ? hint : 'stage disabled';
+  const slowLogThreshold = Number(parse.pipeline_slow_log_threshold_sec || 0);
+  const slowStepThreshold = Number(parse.pipeline_slow_step_threshold_sec || 0);
   const parseBars = (parse.documents || []).map((doc) => ({ label: doc.name, value: Number(doc.process_duration || 0) })).sort((a,b) => b.value - a.value).slice(0, 12);
   const pipelineBars = (parse.pipeline_logs || []).map((log) => ({ label: log.document_name || log.document_id || 'unknown', value: Number(log.duration_sec || 0) })).sort((a,b) => b.value - a.value).slice(0, 12);
   const retrievalRows = (retrieval.results || []).slice(0, 25).map((item) => [item.ok ? 'ok' : `<span style=\"color:var(--bad);\">error</span>`, item.kind, item.document_name || '-', item.prompt, `${number(item.latency_ms, 1)} ms`, String(item.chunk_count), item.top_documents?.join(', ') || '-']);
   const chatRows = (chat.results || []).slice(0, 25).map((item) => [item.ok ? 'ok' : `<span style=\"color:var(--bad);\">error</span>`, item.kind, item.document_name || '-', item.prompt, `${number(item.latency_ms, 1)} ms`, `${item.total_tokens || 0}`, `${item.reference_count || 0}`, item.referenced_documents?.join(', ') || '-']);
-  const pipelineRows = (parse.pipeline_logs || []).slice(0, 25).map((item) => [item.document_name || '-', item.task_type || '-', item.status || '-', `${number(item.duration_sec, 2)} s`, item.components?.join(' -> ') || '-', item.progress_msg || '-']);
+  const pipelineRows = (parse.pipeline_logs || []).slice(0, 25).map((item) => [`<div><div style=\"font-weight:700;\">${escapeHtml(item.document_name || '-')}</div><div class=\"subtle\">${escapeHtml(item.document_id || '-')}</div></div>`, escapeHtml(item.task_type || '-'), escapeHtml(item.status || '-'), renderDurationBadge(item.duration_sec, slowLogThreshold), renderPipelinePath(item), renderProgressSteps(item)]);
+  const summaryCard = run.analysis?.llm_assessment?.content ? `<div class=\"card span12\"><h3>Executive Summary</h3><div class=\"subtle\">Generated by the configured RAGFlow chat model.</div><div class=\"prose\">${escapeHtml(run.analysis.llm_assessment.content)}</div></div>` : '';
   container.innerHTML = `
+    ${renderBatchTabs(batchRuns, activeBatchTab)}
     <div style=\"display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:18px;\"><div><div style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap;\"><h2 style=\"margin:0;font-size:34px;letter-spacing:-.06em;\">${run.dataset?.name || 'Pending run'}</h2>${statusBadge(run.status)}</div><div class=\"subtle\" style=\"margin-top:6px;\">${run.dataset?.id || '-'} • ${run.phase || '-'}${batchLabel} • ${run.error ? `<span style=\"color:var(--bad);\">${run.error}</span>` : 'no fatal error'}</div></div><div class=\"subtle\" style=\"text-align:right;\"><div>Started: ${formatTs(run.started_at || run.created_at)}</div><div>Completed: ${formatTs(run.completed_at)}</div><div>Host: ${run.config?.base_url || '-'}</div></div></div>
     <section class=\"card\" style=\"margin-bottom:16px;\"><div style=\"display:flex;justify-content:space-between;gap:10px;align-items:center;\"><div><h3 style=\"margin:0 0 6px;\">Live Progress</h3><div class=\"subtle\">${live.parse_completed || 0}/${live.parse_total || 0} parsed • ${live.retrieval_completed || 0}/${live.retrieval_total || 0} retrievals • ${live.chat_completed || 0}/${live.chat_total || 0} chats</div></div><div style=\"font-size:30px;font-weight:800;letter-spacing:-.05em;\">${Number(run.progress || 0)}%</div></div><div class=\"progress\"><div style=\"width:${Math.max(2, Number(run.progress || 0))}%\"></div></div><div class=\"subtle\">${events.length ? events[events.length - 1].message : 'Waiting for updates.'}</div></section>
     <section class=\"grid\">
@@ -1122,18 +1549,21 @@ function renderRunView(run) {
       ${metricCard('Chat Error Rate', chatEnabled ? `${number((chat.summary?.error_rate || 0) * 100)}%` : 'skipped', metricHint(chatEnabled, `${chat.summary?.errors || 0} failed calls`))}
       ${metricCard('Token Throughput', metricValue(chatEnabled, chat.summary?.tokens_per_sec || 0, 2, ' tok/s'), metricHint(chatEnabled, `${chat.summary?.total_tokens || 0} total tokens`))}
       ${metricCard('Parse Token Rate', metricValue(parsingEnabled, parse.token_throughput_per_sec || 0, 2, ' tok/s'), metricHint(parsingEnabled, `${parse.status_breakdown ? Object.entries(parse.status_breakdown).map(([k,v]) => `${k}:${v}`).join(' • ') : '-'}`))}
+      ${summaryCard}
       <div class=\"card span6\"><h3>Parse Duration by Document</h3><div class=\"subtle\">Derived from document metrics after parsing completes.</div>${renderBars(parseBars, (value) => `${number(value)} s`)}</div>
-      <div class=\"card span6\"><h3>Pipeline Log Durations</h3><div class=\"subtle\">Uses the same KB pipeline log surface the current RAGFlow UI reads.</div>${renderBars(pipelineBars, (value) => `${number(value)} s`, true)}</div>
+      <div class=\"card span6\"><h3>Pipeline Log Durations</h3><div class=\"subtle\">Uses the same KB pipeline log surface the current RAGFlow UI reads.${slowLogThreshold > 0 ? ` Logs at or above ${number(slowLogThreshold, 2)} s are treated as slow.` : ''}</div>${renderBars(pipelineBars, (value) => `${number(value)} s`, true)}</div>
       <div class=\"card span6\"><h3>Retrieval Latency Histogram</h3><div class=\"subtle\">Official /api/v1/retrieval benchmark on the generated prompts.</div>${renderHistogram(retrieval.summary?.latency_histogram || [])}</div>
       <div class=\"card span6\"><h3>Chat Latency Histogram</h3><div class=\"subtle\">Official OpenAI-compatible chat completions.</div>${renderHistogram(chat.summary?.latency_histogram || [])}</div>
-      <div class=\"card span12\"><h3>Pipeline Log Table</h3>${renderTable(['document','task','status','duration','components','progress message'], pipelineRows)}</div>
+      <div class=\"card span12\"><h3>Pipeline Log Table</h3><div class=\"subtle\">Progress messages are split into timestamped steps.${slowStepThreshold > 0 ? ` Step gaps at or above ${number(slowStepThreshold, 2)} s are highlighted.` : ''}</div>${renderTable(['document','task','status','duration','pipeline path','progress steps'], pipelineRows)}</div>
       <div class=\"card span12\"><h3>Retrieval Sample Results</h3>${renderTable(['status','kind','document','prompt','latency','chunks','top docs'], retrievalRows)}</div>
       <div class=\"card span12\"><h3>Chat Sample Results</h3>${renderTable(['status','kind','document','prompt','latency','tokens','refs','referenced docs'], chatRows)}</div>
       <div class=\"card span6\"><h3>Generated Prompts</h3><pre>${JSON.stringify(prompts, null, 2)}</pre></div>
       <div class=\"card span6\"><h3>Event Log</h3><pre>${events.map((event) => `[${formatTs(event.ts)}] ${event.level.toUpperCase()} ${event.message}`).join('\\n')}</pre></div>
     </section>`;
+  attachBatchTabHandlers(container, run, batchRuns);
 }
 document.getElementById('refresh-runs').addEventListener('click', fetchRuns);
+document.getElementById('reset-runs').addEventListener('click', async () => { if (!window.confirm('Clear all stored run results from this app? Active configs in local storage will be kept.')) return; const response = await fetch('/api/runs/reset', { method: 'POST' }); const payload = await response.json(); if (!response.ok || payload.error) { alert(payload.error || 'Unable to reset runs.'); return; } state.activeRunId = null; state.activeBatchTabs = {}; stopPolling(); document.getElementById('run-view').innerHTML = `<div class=\"empty\">Start a run or select a previous benchmark from the left.</div>`; await fetchRuns(); });
 document.getElementById('run-form').addEventListener('input', persistFormState);
 document.getElementById('run-form').addEventListener('change', persistFormState);
 document.getElementById('run-form').addEventListener('submit', async (event) => { event.preventDefault(); const formData = new FormData(event.currentTarget); const response = await fetch('/api/start', { method: 'POST', body: formData }); const payload = await response.json(); if (!response.ok || payload.error) { alert(payload.error || 'Run creation failed.'); return; } const targetRunId = payload.run_id || (payload.run_ids && payload.run_ids[0]); persistFormState(); await fetchRuns(); if (targetRunId) await fetchRun(targetRunId); });
@@ -1161,6 +1591,26 @@ async def get_run(run_id: str) -> Any:
         if run_id not in RUNS:
             return jsonify({"error": "Run not found"}), 404
     return jsonify(build_run_response(run_id))
+
+
+@app.post("/api/runs/reset")
+async def reset_runs() -> Any:
+    with RUNS_LOCK:
+        active = [run_id for run_id, run in RUNS.items() if (run.get("status") or "").lower() in {"queued", "running"}]
+        if active:
+            return jsonify({"error": "Cannot reset while runs are still queued or running."}), 409
+        removed = list(RUNS.keys())
+        RUNS.clear()
+        RUN_SECRETS.clear()
+    with BATCH_LIMITERS_LOCK:
+        BATCH_LIMITERS.clear()
+        BATCH_ANALYSIS_STATE.clear()
+    for json_file in RUNS_DIR.glob("*.json"):
+        try:
+            json_file.unlink()
+        except OSError:
+            continue
+    return jsonify({"ok": True, "cleared_runs": len(removed)})
 
 
 @app.post("/api/start")
@@ -1211,6 +1661,7 @@ async def start_run() -> Any:
     retrieval_options = deepcopy(retrieval_options_raw)
     retrieval_concurrency = max(1, safe_int(retrieval_options.pop("concurrency"), 4))
     run_count = min(50, max(1, safe_int(form.get("run_count"), 1)))
+    parallel_runs = min(run_count, max(1, safe_int(form.get("parallel_runs"), 1)))
 
     chat_options = deepcopy(chat_options_raw)
     chat_concurrency = max(1, safe_int(chat_options.pop("concurrency"), 4))
@@ -1219,6 +1670,7 @@ async def start_run() -> Any:
     if not isinstance(chat_create_options, dict) or not isinstance(chat_completion_options, dict):
         return jsonify({"error": "Chat config must contain object values for 'create' and 'completion'."}), 400
     verify_ssl = form.get("verify_ssl") == "on"
+    enable_llm_summary = form.get("enable_llm_summary") == "on"
 
     batch_id = str(uuid.uuid4())
     batch_root = UPLOADS_DIR / f"batch-{batch_id}"
@@ -1249,6 +1701,7 @@ async def start_run() -> Any:
         "cleanup_remote": form.get("cleanup_remote") == "on",
         "tls": tls_config,
         "batch_root": str(batch_root),
+        "analysis": {"enabled": enable_llm_summary},
         "stages": {
             "parsing": {
                 "enabled": enable_parsing,
@@ -1287,7 +1740,7 @@ async def start_run() -> Any:
         config = deepcopy(common_config)
         config["local_files"] = local_paths
         config["upload_dir"] = str(upload_dir)
-        config["batch"] = {"batch_id": batch_id, "run_index": run_index, "run_count": run_count}
+        config["batch"] = {"batch_id": batch_id, "run_index": run_index, "run_count": run_count, "parallel_count": parallel_runs}
         queue_run(run_id, config, filenames)
         run_ids.append(run_id)
 
