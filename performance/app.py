@@ -9,6 +9,7 @@ import statistics
 import threading
 import time
 import uuid
+from io import BytesIO
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
@@ -16,8 +17,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import matplotlib
 import requests
-from quart import Quart, jsonify, request
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Inches, Pt
+from quart import Quart, Response, jsonify, request
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -779,6 +787,34 @@ def patch_run(run_id: str, callback) -> None:
     persist_run_snapshot(run_id)
 
 
+def set_stage_status(
+    run_id: str,
+    key: str,
+    label: str,
+    *,
+    status: str,
+    started_at: str | None = None,
+    completed_at: str | None = None,
+    duration_sec: float | None = None,
+) -> None:
+    def mutate(run: dict[str, Any]) -> None:
+        timeline = run.setdefault("timeline", [])
+        stage = next((item for item in timeline if item.get("key") == key), None)
+        if stage is None:
+            stage = {"key": key, "label": label}
+            timeline.append(stage)
+        stage["label"] = label
+        stage["status"] = status
+        if started_at is not None:
+            stage["started_at"] = started_at
+        if completed_at is not None:
+            stage["completed_at"] = completed_at
+        if duration_sec is not None:
+            stage["duration_sec"] = round(max(0.0, safe_float(duration_sec)), 3)
+
+    patch_run(run_id, mutate)
+
+
 def get_batch_semaphore(batch_id: str, parallel_count: int) -> threading.Semaphore:
     with BATCH_LIMITERS_LOCK:
         semaphore = BATCH_LIMITERS.get(batch_id)
@@ -811,29 +847,86 @@ def summarize_documents(documents: list[dict[str, Any]], pipeline_logs: list[dic
     chunks = [safe_int(doc.get("chunk_count")) for doc in documents]
     tokens = [safe_int(doc.get("token_count")) for doc in documents]
     status_breakdown = Counter(doc.get("run", "UNKNOWN") for doc in documents)
+    documents_by_id = {str(doc.get("id") or ""): doc for doc in documents if doc.get("id")}
     pipeline_by_document = []
     pipeline_step_durations: list[float] = []
     pipeline_log_durations: list[float] = []
+    seen_document_ids: set[str] = set()
+
+    def build_progress_steps(progress_msg: str, duration_sec: float) -> list[dict[str, Any]]:
+        steps = parse_pipeline_progress(progress_msg or "")
+        if any(safe_float(step.get("duration_sec")) > 0 for step in steps):
+            return steps
+        if steps and duration_sec > 0:
+            steps[-1]["duration_sec"] = duration_sec
+            return steps
+        if progress_msg and duration_sec > 0:
+            first_line = next((line.strip() for line in progress_msg.splitlines() if line.strip()), "pipeline task")
+            return [{"message": first_line, "timestamp": "", "duration_sec": duration_sec, "is_slow": False}]
+        return steps
+
     for log in pipeline_logs:
+        document_id = str(log.get("document_id") or "")
+        matched_document = documents_by_id.get(document_id, {})
         dsl = log.get("dsl") or {}
-        progress_steps = parse_pipeline_progress(log.get("progress_msg") or "")
+        duration_sec = round(max(safe_float(log.get("process_duration")), safe_float(matched_document.get("process_duration"))), 3)
+        progress_msg = log.get("progress_msg") or matched_document.get("progress_msg") or ""
+        progress_steps = build_progress_steps(progress_msg, duration_sec)
         for step in progress_steps:
             duration = safe_float(step.get("duration_sec"))
             if duration > 0:
                 pipeline_step_durations.append(duration)
-        duration_sec = round(safe_float(log.get("process_duration")), 3)
+        if duration_sec > 0:
+            pipeline_log_durations.append(duration_sec)
+        pipeline_path = extract_pipeline_path(dsl)
+        if not pipeline_path:
+            fallback_parts = [
+                str(log.get("pipeline_title") or "").strip(),
+                str(log.get("parser_id") or "").strip(),
+                str(matched_document.get("parser_id") or "").strip(),
+            ]
+            pipeline_path = [part for part in fallback_parts if part]
+        pipeline_by_document.append(
+            {
+                "document_id": document_id or matched_document.get("id"),
+                "document_name": log.get("document_name") or matched_document.get("name"),
+                "duration_sec": duration_sec,
+                "status": log.get("operation_status") or matched_document.get("run"),
+                "progress": safe_float(log.get("progress")),
+                "progress_msg": progress_msg,
+                "task_type": log.get("task_type") or matched_document.get("parser_id") or "",
+                "pipeline_path": pipeline_path,
+                "progress_steps": progress_steps,
+            }
+        )
+        if document_id:
+            seen_document_ids.add(document_id)
+
+    for document in documents:
+        document_id = str(document.get("id") or "")
+        if not document_id or document_id in seen_document_ids:
+            continue
+        duration_sec = round(safe_float(document.get("process_duration")), 3)
+        progress_msg = document.get("progress_msg") or ""
+        if duration_sec <= 0 and not progress_msg:
+            continue
+        progress_steps = build_progress_steps(progress_msg, duration_sec)
+        for step in progress_steps:
+            duration = safe_float(step.get("duration_sec"))
+            if duration > 0:
+                pipeline_step_durations.append(duration)
         if duration_sec > 0:
             pipeline_log_durations.append(duration_sec)
         pipeline_by_document.append(
             {
-                "document_id": log.get("document_id"),
-                "document_name": log.get("document_name"),
+                "document_id": document_id,
+                "document_name": document.get("name"),
                 "duration_sec": duration_sec,
-                "status": log.get("operation_status"),
-                "progress": safe_float(log.get("progress")),
-                "progress_msg": log.get("progress_msg") or "",
-                "task_type": log.get("task_type") or "",
-                "pipeline_path": extract_pipeline_path(dsl),
+                "status": document.get("run"),
+                "progress": safe_float(document.get("progress")),
+                "progress_msg": progress_msg,
+                "task_type": document.get("parser_id") or "parse",
+                "pipeline_path": [str(document.get("parser_id") or "parse")],
                 "progress_steps": progress_steps,
             }
         )
@@ -882,6 +975,236 @@ def summarize_benchmark(results: list[dict[str, Any]], wall_time_sec: float) -> 
         "avg_reference_count": round(statistics.mean(references), 3) if references else 0.0,
         "latency_histogram": histogram(latencies, bins=10),
     }
+
+
+def report_safe_text(value: Any) -> str:
+    if value is None:
+        return "-"
+    text = str(value)
+    return text if text.strip() else "-"
+
+
+def chart_label(value: Any, limit: int = 56) -> str:
+    text = re.sub(r"\s+", " ", report_safe_text(value)).strip()
+    return text if len(text) <= limit else text[: limit - 1] + "..."
+
+
+def build_horizontal_bar_chart(rows: list[dict[str, Any]], title: str, color: str = "#0f766e") -> BytesIO | None:
+    items = [{"label": chart_label(item.get("label")), "value": safe_float(item.get("value"))} for item in rows if safe_float(item.get("value")) > 0]
+    if not items:
+        return None
+    top = items[:12]
+    fig_height = max(2.4, 0.45 * len(top) + 1.2)
+    fig, ax = plt.subplots(figsize=(8.2, fig_height))
+    labels = [item["label"] for item in reversed(top)]
+    values = [item["value"] for item in reversed(top)]
+    ax.barh(range(len(values)), values, color=color)
+    ax.set_yticks(range(len(labels)))
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.set_title(title, fontsize=12)
+    ax.grid(axis="x", alpha=0.25)
+    fig.tight_layout()
+    buffer = BytesIO()
+    fig.savefig(buffer, format="png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer
+
+
+def build_histogram_chart(histogram_bins: list[dict[str, Any]], title: str, color: str = "#c2410c") -> BytesIO | None:
+    items = [{"label": chart_label(item.get("label"), 20), "count": safe_int(item.get("count"))} for item in histogram_bins if safe_int(item.get("count")) >= 0]
+    if not items:
+        return None
+    fig, ax = plt.subplots(figsize=(8.2, 3.4))
+    labels = [item["label"] for item in items]
+    counts = [item["count"] for item in items]
+    ax.bar(range(len(counts)), counts, color=color)
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+    ax.set_title(title, fontsize=12)
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    buffer = BytesIO()
+    fig.savefig(buffer, format="png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer
+
+
+def add_table(document: Document, headers: list[str], rows: list[list[Any]]) -> None:
+    table = document.add_table(rows=1, cols=len(headers))
+    table.style = "Table Grid"
+    header_cells = table.rows[0].cells
+    for index, header in enumerate(headers):
+        header_cells[index].text = report_safe_text(header)
+    for row in rows:
+        cells = table.add_row().cells
+        for index, value in enumerate(row):
+            cells[index].text = report_safe_text(value)
+
+
+def add_report_chart(document: Document, image_buffer: BytesIO | None) -> None:
+    if image_buffer is None:
+        document.add_paragraph("No chart data available.")
+        return
+    document.add_picture(image_buffer, width=Inches(6.7))
+
+
+def build_run_report(run: dict[str, Any]) -> bytes:
+    document = Document()
+    document.core_properties.title = f"RAGFlow Performance Report - {run.get('id')}"
+    document.core_properties.subject = "Performance benchmark results"
+
+    title = document.add_heading("RAGFlow Performance Report", level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    subtitle = document.add_paragraph(f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    document.add_heading("Run Overview", level=1)
+    add_table(
+        document,
+        ["Field", "Value"],
+        [
+            ["Run ID", run.get("id")],
+            ["Status", run.get("status")],
+            ["Phase", run.get("phase")],
+            ["Started", run.get("started_at")],
+            ["Completed", run.get("completed_at")],
+            ["Dataset", (run.get("dataset") or {}).get("name")],
+            ["Dataset ID", (run.get("dataset") or {}).get("id")],
+            ["Host", (run.get("config") or {}).get("base_url")],
+        ],
+    )
+
+    summary = run.get("summary") or {}
+    parse = run.get("parse") or {}
+    retrieval = run.get("retrieval") or {"summary": {}}
+    chat = run.get("chat_results") or {"summary": {}}
+    document.add_heading("Key Metrics", level=1)
+    add_table(
+        document,
+        ["Metric", "Value"],
+        [
+            ["Documents", summary.get("documents", 0)],
+            ["Prompts", summary.get("prompts", 0)],
+            ["Parse Wall Time (s)", summary.get("parse_wall_time_sec", 0)],
+            ["Parse P95 by Document (s)", parse.get("p95_parse_duration_sec", 0)],
+            ["Retrieval P95 (ms)", (retrieval.get("summary") or {}).get("p95_latency_ms", 0)],
+            ["Chat P95 (ms)", (chat.get("summary") or {}).get("p95_latency_ms", 0)],
+            ["Chat Error Rate", f"{safe_float(summary.get('chat_error_rate')) * 100:.2f}%"],
+            ["Chat Token Throughput (tok/s)", summary.get("chat_tokens_per_sec", 0)],
+        ],
+    )
+
+    assessment = ((run.get("analysis") or {}).get("llm_assessment") or {}).get("content")
+    if assessment:
+        document.add_heading("Executive Summary", level=1)
+        document.add_paragraph(assessment)
+
+    parse_rows = [{"label": doc.get("name"), "value": safe_float(doc.get("process_duration"))} for doc in (parse.get("documents") or [])]
+    stage_rows = [{"label": stage.get("label") or stage.get("key"), "value": safe_float(stage.get("duration_sec"))} for stage in (run.get("timeline") or [])]
+    document.add_heading("Visualizations", level=1)
+    document.add_paragraph("Parse Duration by Document")
+    add_report_chart(document, build_horizontal_bar_chart(sorted(parse_rows, key=lambda item: item["value"], reverse=True), "Parse Duration by Document"))
+    document.add_paragraph("Execution Stage Durations")
+    add_report_chart(document, build_horizontal_bar_chart(sorted(stage_rows, key=lambda item: item["value"], reverse=True), "Execution Stage Durations", color="#c2410c"))
+    document.add_paragraph("Retrieval Latency Histogram")
+    add_report_chart(document, build_histogram_chart((retrieval.get("summary") or {}).get("latency_histogram") or [], "Retrieval Latency Histogram"))
+    document.add_paragraph("Chat Latency Histogram")
+    add_report_chart(document, build_histogram_chart((chat.get("summary") or {}).get("latency_histogram") or [], "Chat Latency Histogram", color="#0f766e"))
+
+    document.add_heading("Execution Stage Timeline", level=1)
+    add_table(
+        document,
+        ["Stage", "Status", "Duration (s)", "Started", "Completed"],
+        [
+            [
+                stage.get("label") or stage.get("key"),
+                stage.get("status"),
+                safe_float(stage.get("duration_sec")),
+                stage.get("started_at"),
+                stage.get("completed_at"),
+            ]
+            for stage in (run.get("timeline") or [])
+        ],
+    )
+
+    if parse.get("documents"):
+        document.add_heading("Parsed Documents", level=1)
+        add_table(
+            document,
+            ["Document", "Status", "Chunks", "Tokens", "Duration (s)"],
+            [
+                [
+                    doc.get("name"),
+                    doc.get("run"),
+                    safe_int(doc.get("chunk_count")),
+                    safe_int(doc.get("token_count")),
+                    safe_float(doc.get("process_duration")),
+                ]
+                for doc in parse.get("documents", [])
+            ],
+        )
+
+    prompts = run.get("prompts") or []
+    if prompts:
+        document.add_heading("Generated Prompts", level=1)
+        for item in prompts[:50]:
+            document.add_paragraph(f"[{item.get('kind')}] {item.get('prompt')}")
+
+    retrieval_results = (retrieval.get("results") or [])[:20]
+    if retrieval_results:
+        document.add_heading("Retrieval Samples", level=1)
+        add_table(
+            document,
+            ["Prompt", "Latency (ms)", "Chunks", "Top Documents", "Status"],
+            [
+                [
+                    item.get("prompt"),
+                    safe_float(item.get("latency_ms")),
+                    safe_int(item.get("chunk_count")),
+                    ", ".join(item.get("top_documents") or []),
+                    "ok" if item.get("ok") else f"error: {item.get('error')}",
+                ]
+                for item in retrieval_results
+            ],
+        )
+
+    chat_results = (chat.get("results") or [])[:20]
+    if chat_results:
+        document.add_heading("Chat Samples", level=1)
+        add_table(
+            document,
+            ["Prompt", "Latency (ms)", "Tokens", "Referenced Docs", "Status"],
+            [
+                [
+                    item.get("prompt"),
+                    safe_float(item.get("latency_ms")),
+                    safe_int(item.get("total_tokens")),
+                    ", ".join(item.get("referenced_documents") or []),
+                    "ok" if item.get("ok") else f"error: {item.get('error')}",
+                ]
+                for item in chat_results
+            ],
+        )
+
+    events = run.get("events") or []
+    if events:
+        document.add_heading("Event Log", level=1)
+        for event in events:
+            document.add_paragraph(f"[{report_safe_text(event.get('ts'))}] {report_safe_text(event.get('level')).upper()} {report_safe_text(event.get('message'))}")
+
+    for section in document.sections:
+        section.top_margin = Inches(0.6)
+        section.bottom_margin = Inches(0.6)
+        section.left_margin = Inches(0.7)
+        section.right_margin = Inches(0.7)
+    document.styles["Normal"].font.name = "Calibri"
+    document.styles["Normal"].font.size = Pt(10)
+
+    buffer = BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
 
 
 def summarize_batch_metrics(runs: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1249,6 +1572,26 @@ def execute_run(run_id: str) -> None:
     client = RAGFlowClient(config["base_url"], config["api_key"], timeout=config["http_timeout_sec"], tls_config=config.get("tls"))
     resource_ids: dict[str, str] = {}
     batch_semaphore: threading.Semaphore | None = None
+    active_stage: dict[str, Any] | None = None
+
+    def start_stage(key: str, label: str) -> None:
+        nonlocal active_stage
+        active_stage = {"key": key, "label": label, "started_at": utc_now(), "started_perf": time.perf_counter()}
+        set_stage_status(run_id, key, label, status="running", started_at=active_stage["started_at"])
+
+    def finish_stage(status: str = "completed") -> None:
+        nonlocal active_stage
+        if not active_stage:
+            return
+        set_stage_status(
+            run_id,
+            active_stage["key"],
+            active_stage["label"],
+            status=status,
+            completed_at=utc_now(),
+            duration_sec=time.perf_counter() - active_stage["started_perf"],
+        )
+        active_stage = None
 
     try:
         batch = config.get("batch", {})
@@ -1273,18 +1616,22 @@ def execute_run(run_id: str) -> None:
             },
             config["dataset_options"],
         )
+        start_stage("provisioning", "Provisioning")
         dataset = client.create_dataset(dataset_name, dataset_options)
         dataset_id = dataset["id"]
         resource_ids["dataset_id"] = dataset_id
         set_run_fields(run_id, dataset={"id": dataset_id, "name": dataset_name})
         append_run_event(run_id, f"Created dataset {dataset_name} ({dataset_id}).")
         set_run_fields(run_id, progress=10)
+        finish_stage()
 
+        start_stage("upload", "Upload Documents")
         uploaded_documents = client.upload_documents(dataset_id, [Path(path) for path in config["local_files"]])
         uploaded_ids = [document["id"] for document in uploaded_documents]
         patch_run(run_id, lambda run: run["documents"].update({"uploaded": uploaded_documents}))
         append_run_event(run_id, f"Uploaded {len(uploaded_documents)} document(s).")
         set_run_fields(run_id, progress=20)
+        finish_stage()
 
         enable_parsing = config["stages"]["parsing"]["enabled"]
         enable_retrieval = config["stages"]["retrieval"]["enabled"]
@@ -1300,6 +1647,7 @@ def execute_run(run_id: str) -> None:
 
         if enable_parsing:
             set_run_fields(run_id, phase="parsing")
+            start_stage("parsing", "Parsing")
             client.parse_documents(dataset_id, uploaded_ids, parse_stage["request_options"])
             append_run_event(run_id, "Document parsing queued.")
 
@@ -1322,14 +1670,17 @@ def execute_run(run_id: str) -> None:
             parse_summary["dataset_logs"] = dataset_logs
             set_run_fields(run_id, parse=parse_summary, progress=50)
             append_run_event(run_id, "Parsing completed and pipeline logs collected.")
+            finish_stage()
         else:
             last_snapshot = client.list_all_documents(dataset_id)
             set_run_fields(run_id, phase="uploaded", parse={"skipped": True, "documents": last_snapshot}, progress=40)
             append_run_event(run_id, "Parsing stage skipped.")
+            set_stage_status(run_id, "parsing", "Parsing", status="skipped", duration_sec=0.0)
 
         prompts: list[dict[str, Any]] = []
         if enable_retrieval or enable_chat:
             set_run_fields(run_id, phase="prompt_generation")
+            start_stage("prompt_generation", "Prompt Generation")
             chunk_samples = {}
             sample_size = max(3, parse_stage["chunk_sample_size"], config["prompts_per_document"])
             for document in last_snapshot:
@@ -1340,14 +1691,17 @@ def execute_run(run_id: str) -> None:
                 prompts = [{"id": str(uuid.uuid4()), "kind": "fallback", "prompt": "Summarize the uploaded knowledge base and highlight the most important facts.", "document_id": None, "document_name": None}]
             set_run_fields(run_id, prompts=prompts, progress=55)
             append_run_event(run_id, f"Generated {len(prompts)} automatic prompt(s).")
+            finish_stage()
         else:
             append_run_event(run_id, "Prompt generation skipped because retrieval and chat are disabled.")
+            set_stage_status(run_id, "prompt_generation", "Prompt Generation", status="skipped", duration_sec=0.0)
 
         retrieval: dict[str, Any] = {"summary": {"skipped": not enable_retrieval}, "results": []}
         chat_results: dict[str, Any] = {"summary": {"skipped": not enable_chat}, "results": []}
 
         if enable_retrieval:
             set_run_fields(run_id, phase="retrieval_benchmark", progress=65)
+            start_stage("retrieval", "Retrieval Benchmark")
             retrieval = benchmark_retrieval(
                 client,
                 dataset_id,
@@ -1358,20 +1712,25 @@ def execute_run(run_id: str) -> None:
             )
             set_run_fields(run_id, retrieval=retrieval, progress=78)
             append_run_event(run_id, "Retrieval benchmark completed.")
+            finish_stage()
         else:
             set_run_fields(run_id, retrieval=retrieval)
             append_run_event(run_id, "Retrieval stage skipped.")
+            set_stage_status(run_id, "retrieval", "Retrieval Benchmark", status="skipped", duration_sec=0.0)
 
         if enable_chat:
             set_run_fields(run_id, phase="assistant_setup", progress=80)
+            start_stage("assistant_setup", "Assistant Setup")
             chat_name = f"{config['chat_prefix']}-{datetime.now().strftime('%H%M%S')}{run_suffix}"
             chat = client.create_chat(chat_name, dataset_id, options=chat_stage["create_options"])
             chat_id = chat["id"]
             resource_ids["chat_id"] = chat_id
             set_run_fields(run_id, chat={"id": chat_id, "name": chat_name})
             append_run_event(run_id, f"Created chat assistant {chat_name} ({chat_id}).")
+            finish_stage()
 
             set_run_fields(run_id, phase="chat_benchmark", progress=85)
+            start_stage("chat", "Chat Benchmark")
             chat_results = benchmark_chat(
                 client,
                 chat_id,
@@ -1382,9 +1741,12 @@ def execute_run(run_id: str) -> None:
             )
             set_run_fields(run_id, chat_results=chat_results, progress=95)
             append_run_event(run_id, "Chat benchmark completed.")
+            finish_stage()
         else:
             set_run_fields(run_id, chat_results=chat_results)
             append_run_event(run_id, "Chat stage skipped.")
+            set_stage_status(run_id, "assistant_setup", "Assistant Setup", status="skipped", duration_sec=0.0)
+            set_stage_status(run_id, "chat", "Chat Benchmark", status="skipped", duration_sec=0.0)
 
         final_summary = {
             "documents": parse_summary.get("total_documents", len(last_snapshot)),
@@ -1401,6 +1763,7 @@ def execute_run(run_id: str) -> None:
         if config["analysis"]["enabled"]:
             try:
                 set_run_fields(run_id, phase="llm_summary", progress=97)
+                start_stage("llm_summary", "Executive Summary")
                 run_payload = build_run_response(run_id)
                 assessment = generate_llm_assessment(
                     client,
@@ -1411,11 +1774,14 @@ def execute_run(run_id: str) -> None:
                 )
                 set_run_fields(run_id, analysis={"enabled": True, "llm_assessment": assessment})
                 append_run_event(run_id, "Generated executive summary with the configured RAGFlow LLM.")
+                finish_stage()
             except Exception as exc:
+                finish_stage("failed")
                 set_run_fields(run_id, analysis={"enabled": True, "error": str(exc)})
                 append_run_event(run_id, f"Executive summary skipped: {exc}", level="warning")
         else:
             set_run_fields(run_id, analysis={"enabled": False, "skipped": True})
+            set_stage_status(run_id, "llm_summary", "Executive Summary", status="skipped", duration_sec=0.0)
 
         set_run_fields(
             run_id,
@@ -1437,13 +1803,18 @@ def execute_run(run_id: str) -> None:
             except Exception as exc:
                 append_run_event(run_id, f"Batch executive summary skipped: {exc}", level="warning")
     except Exception as exc:
+        finish_stage("failed")
         set_run_fields(run_id, status="failed", phase="failed", completed_at=utc_now(), error=str(exc))
         append_run_event(run_id, f"Run failed: {exc}", level="error")
     finally:
         if batch_semaphore is not None:
             batch_semaphore.release()
         if config.get("cleanup_remote"):
+            start_stage("cleanup", "Cleanup Remote Resources")
             cleanup_remote_resources(client, resource_ids, run_id)
+            finish_stage()
+        else:
+            set_stage_status(run_id, "cleanup", "Cleanup Remote Resources", status="skipped", duration_sec=0.0)
         upload_dir = Path(config["upload_dir"])
         if upload_dir.exists():
             shutil.rmtree(upload_dir, ignore_errors=True)
@@ -1502,6 +1873,7 @@ def queue_run(run_id: str, config: dict[str, Any], filenames: list[str]) -> None
         "analysis": {},
         "batch_summary": {},
         "summary": {},
+        "timeline": [],
         "live": {"parse_completed": 0, "parse_total": len(filenames), "retrieval_completed": 0, "retrieval_total": 0, "chat_completed": 0, "chat_total": 0, "documents": []},
         "events": [{"ts": utc_now(), "level": "info", "message": f"Run queued{batch_note} with {len(filenames)} file(s)."}],
     }
@@ -1709,6 +2081,7 @@ function restoreActiveRun() { try { return localStorage.getItem(ACTIVE_RUN_STORA
 function persistAutoRefreshSetting() { try { const field = document.getElementById('auto-refresh-sec'); localStorage.setItem(AUTO_REFRESH_STORAGE_KEY, String(Math.max(0, Number(field?.value || 0) || 0))); } catch (error) { console.warn('Unable to persist auto refresh setting.', error); } }
 function restoreAutoRefreshSetting() { try { const saved = localStorage.getItem(AUTO_REFRESH_STORAGE_KEY); const field = document.getElementById('auto-refresh-sec'); if (field && saved !== null) field.value = String(Math.max(0, Number(saved) || 0)); } catch (error) { console.warn('Unable to restore auto refresh setting.', error); } }
 function configureAutoRefresh() { if (state.autoRefreshHandle) { window.clearInterval(state.autoRefreshHandle); state.autoRefreshHandle = null; } const seconds = Math.max(0, Number(document.getElementById('auto-refresh-sec')?.value || 0) || 0); if (seconds > 0) state.autoRefreshHandle = window.setInterval(() => window.location.reload(), seconds * 1000); }
+function stopAutoRefreshIfIdle() { const hasLiveRuns = state.runs.some((run) => ['queued', 'running'].includes((run.status || '').toLowerCase())); if (hasLiveRuns) return; const field = document.getElementById('auto-refresh-sec'); if (!field) return; if (Number(field.value || 0) <= 0) return; field.value = '0'; persistAutoRefreshSetting(); configureAutoRefresh(); }
 function upsertRun(run) { const index = state.runs.findIndex((item) => item.id === run.id); if (index >= 0) state.runs[index] = run; else state.runs.unshift(run); }
 function getRun(runId) { return state.runs.find((item) => item.id === runId) || null; }
 function getBatchRuns(batchId) { if (!batchId) return []; return state.runs.filter((item) => item.config?.batch?.batch_id === batchId).sort((a, b) => Number(a.config?.batch?.run_index || 0) - Number(b.config?.batch?.run_index || 0)); }
@@ -1718,8 +2091,8 @@ function renderBatchOverview(run, batchRuns) { const batch = run.config?.batch |
 function attachBatchTabHandlers(container, run, batchRuns) { const batch = run.config?.batch || {}; if ((batch.run_count || 1) <= 1 || !batch.batch_id) return; container.querySelectorAll('[data-batch-tab]').forEach((element) => element.addEventListener('click', async () => { const tab = element.getAttribute('data-batch-tab'); state.activeBatchTabs[batch.batch_id] = tab; if (tab && tab !== 'overview') { state.activeRunId = tab; persistActiveRun(); const selected = getRun(tab); renderRunView(selected || run); if (selected && ['queued', 'running'].includes((selected.status || '').toLowerCase())) startPolling(tab); else stopPolling(); } else { const liveRun = batchRuns.find((item) => ['queued', 'running'].includes((item.status || '').toLowerCase())); state.activeRunId = liveRun?.id || run.id; persistActiveRun(); renderRunView(run); if (liveRun) startPolling(liveRun.id); else stopPolling(); } renderRunList(); })); }
 function attachPaginationHandlers(container) { container.querySelectorAll('[data-table-id][data-table-page]').forEach((element) => element.addEventListener('click', () => { const tableId = element.getAttribute('data-table-id'); const page = Number(element.getAttribute('data-table-page') || 1); state.tablePages[tableId] = page; const active = getRun(state.activeRunId); if (active) renderRunView(active); })); }
 function attachChartPaginationHandlers(container) { container.querySelectorAll('[data-chart-id][data-chart-page]').forEach((element) => element.addEventListener('click', () => { const chartId = element.getAttribute('data-chart-id'); const page = Number(element.getAttribute('data-chart-page') || 1); state.chartPages[chartId] = page; const active = getRun(state.activeRunId); if (active) renderRunView(active); })); }
-async function fetchRuns() { const response = await fetch(`${BASE_PATH}/api/runs`); const payload = await response.json(); state.runs = payload.runs || []; renderRunList(); const targetRunId = state.activeRunId || restoreActiveRun() || state.runs.find((run) => ['queued', 'running'].includes((run.status || '').toLowerCase()))?.id; if (targetRunId) { const active = getRun(targetRunId); if (active) { state.activeRunId = targetRunId; persistActiveRun(); renderRunView(active); if (['queued', 'running'].includes((active.status || '').toLowerCase())) startPolling(targetRunId); else stopPolling(); } else { state.activeRunId = null; persistActiveRun(); stopPolling(); document.getElementById('run-view').innerHTML = `<div class=\"empty\">Start a run or select a previous benchmark from the left.</div>`; } } }
-async function fetchRun(runId, options = {}) { if (!runId) return; const response = await fetch(`${BASE_PATH}/api/runs/${runId}`); const payload = await response.json(); if (!response.ok || payload.error) return; upsertRun(payload); state.activeRunId = runId; persistActiveRun(); renderRunView(payload); if (!options.silent) renderRunList(); const live = ['queued', 'running'].includes((payload.status || '').toLowerCase()); if (live) startPolling(runId); else stopPolling(); }
+async function fetchRuns() { const response = await fetch(`${BASE_PATH}/api/runs`); const payload = await response.json(); state.runs = payload.runs || []; renderRunList(); stopAutoRefreshIfIdle(); const targetRunId = state.activeRunId || restoreActiveRun() || state.runs.find((run) => ['queued', 'running'].includes((run.status || '').toLowerCase()))?.id; if (targetRunId) { const active = getRun(targetRunId); if (active) { state.activeRunId = targetRunId; persistActiveRun(); renderRunView(active); if (['queued', 'running'].includes((active.status || '').toLowerCase())) startPolling(targetRunId); else stopPolling(); } else { state.activeRunId = null; persistActiveRun(); stopPolling(); document.getElementById('run-view').innerHTML = `<div class=\"empty\">Start a run or select a previous benchmark from the left.</div>`; } } }
+async function fetchRun(runId, options = {}) { if (!runId) return; const response = await fetch(`${BASE_PATH}/api/runs/${runId}`); const payload = await response.json(); if (!response.ok || payload.error) return; upsertRun(payload); state.activeRunId = runId; persistActiveRun(); renderRunView(payload); if (!options.silent) renderRunList(); stopAutoRefreshIfIdle(); const live = ['queued', 'running'].includes((payload.status || '').toLowerCase()); if (live) startPolling(runId); else stopPolling(); }
 function startPolling(runId) { stopPolling(); state.pollHandle = window.setInterval(() => fetchRun(runId, { silent: true }), 2500); }
 function stopPolling() { if (state.pollHandle) { window.clearInterval(state.pollHandle); state.pollHandle = null; } }
 function renderRunList() { const container = document.getElementById('run-list'); if (!state.runs.length) { container.innerHTML = `<div class=\"empty\">No runs yet.</div>`; return; } container.innerHTML = state.runs.map((run) => { const stages = []; if (run.config?.stages?.parsing?.enabled) stages.push('parse'); if (run.config?.stages?.retrieval?.enabled) stages.push('retrieval'); if (run.config?.stages?.chat?.enabled) stages.push('chat'); const batch = run.config?.batch || {}; const batchLabel = batch.run_count > 1 ? ` • run ${batch.run_index}/${batch.run_count}` : ''; return `<div class=\"run-item ${run.id === state.activeRunId ? 'active' : ''}\" data-run-id=\"${run.id}\"><div style=\"display:flex;justify-content:space-between;align-items:flex-start;gap:10px;\"><div><div style=\"font-weight:700;line-height:1.25;\">${escapeHtml(run.dataset?.name || run.config?.dataset_prefix || 'pending run')}</div><div class=\"subtle\">${run.summary?.prompts || 0} prompts • ${(stages.join(' + ') || 'upload-only')}${batchLabel}</div></div>${statusBadge(run.status)}</div><div class=\"meta\" style=\"margin-top:8px;\"><span>${formatTs(run.started_at || run.created_at)}</span><span>${escapeHtml(run.phase || '-')}</span></div></div>`; }).join(''); container.querySelectorAll('.run-item').forEach((element) => element.addEventListener('click', () => { const run = getRun(element.dataset.runId); const batchId = run?.config?.batch?.batch_id; if (batchId && (run?.config?.batch?.run_count || 1) > 1) state.activeBatchTabs[batchId] = run.id; state.activeRunId = element.dataset.runId; persistActiveRun(); fetchRun(element.dataset.runId); })); }
@@ -1740,7 +2113,7 @@ function renderRunView(run) {
     const selectedRun = getRun(activeBatchTab);
     if (selectedRun) run = selectedRun;
   }
-  const parse = run.parse || {}; const retrieval = run.retrieval || { summary: {}, results: [] }; const chat = run.chat_results || { summary: {}, results: [] }; const live = run.live || {}; const prompts = run.prompts || []; const events = run.events || [];
+  const parse = run.parse || {}; const retrieval = run.retrieval || { summary: {}, results: [] }; const chat = run.chat_results || { summary: {}, results: [] }; const live = run.live || {}; const prompts = run.prompts || []; const events = run.events || []; const timeline = Array.isArray(run.timeline) ? run.timeline : [];
   const stages = run.config?.stages || {};
   const batch = run.config?.batch || {};
   const batchLabel = batch.run_count > 1 ? ` • run ${batch.run_index}/${batch.run_count}` : '';
@@ -1749,16 +2122,17 @@ function renderRunView(run) {
   const chatEnabled = Boolean(stages.chat?.enabled);
   const metricValue = (enabled, value, digits = 2, suffix = '') => enabled ? `${number(value, digits)}${suffix}` : 'skipped';
   const metricHint = (enabled, hint) => enabled ? hint : 'stage disabled';
-  const slowStepThreshold = Number(parse.pipeline_slow_step_threshold_sec || 0);
   const parseBars = (parse.documents || []).map((doc) => ({ label: doc.name, value: Number(doc.process_duration || 0) })).sort((a,b) => b.value - a.value);
-  const pipelineStepBars = (parse.pipeline_logs || []).flatMap((log) => (Array.isArray(log.progress_steps) ? log.progress_steps : []).map((step, index) => ({ label: `${log.document_name || log.document_id || 'unknown'}: ${step.message || `step ${index + 1}`}`.slice(0, 120), value: Number(step.duration_sec || 0) }))).filter((step) => step.value > 0).sort((a,b) => b.value - a.value);
+  const stageDurations = timeline.map((stage) => Number(stage.duration_sec || 0)).filter((value) => value > 0).sort((a, b) => a - b);
+  const stageSlowThreshold = stageDurations.length ? stageDurations[Math.floor((stageDurations.length - 1) * 0.75)] : 0;
+  const stageBars = timeline.filter((stage) => Number(stage.duration_sec || 0) > 0).map((stage) => ({ label: stage.label || stage.key || 'stage', value: Number(stage.duration_sec || 0) })).sort((a,b) => b.value - a.value);
   const retrievalRows = (retrieval.results || []).map((item) => [item.ok ? 'ok' : `<span style=\"color:var(--bad);\">error</span>`, item.kind, item.document_name || '-', item.prompt, `${number(item.latency_ms, 1)} ms`, String(item.chunk_count), item.top_documents?.join(', ') || '-']);
   const chatRows = (chat.results || []).map((item) => [item.ok ? 'ok' : `<span style=\"color:var(--bad);\">error</span>`, item.kind, item.document_name || '-', item.prompt, `${number(item.latency_ms, 1)} ms`, `${item.total_tokens || 0}`, `${item.reference_count || 0}`, item.referenced_documents?.join(', ') || '-']);
-  const pipelineRows = (parse.pipeline_logs || []).map((item) => [`<div><div style=\"font-weight:700;\">${escapeHtml(item.document_name || '-')}</div><div class=\"subtle\">${escapeHtml(item.document_id || '-')}</div></div>`, escapeHtml(item.task_type || '-'), escapeHtml(item.status || '-'), renderDurationBadge(item.duration_sec, Number(parse.pipeline_slow_log_threshold_sec || 0)), renderPipelineDetails(item)]);
+  const stageRows = timeline.map((stage) => [escapeHtml(stage.label || stage.key || '-'), statusBadge(stage.status || 'queued'), renderDurationBadge(stage.duration_sec, stageSlowThreshold), formatTs(stage.started_at), formatTs(stage.completed_at)]);
   const summaryCard = run.analysis?.llm_assessment?.content ? `<div class=\"card span12\"><h3>Executive Summary</h3><div class=\"subtle\">Generated by the configured RAGFlow chat model.</div><div class=\"prose\">${escapeHtml(run.analysis.llm_assessment.content)}</div></div>` : '';
   container.innerHTML = `
     ${renderBatchTabs(batchRuns, activeBatchTab)}
-    <div style=\"display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:18px;\"><div><div style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap;\"><h2 style=\"margin:0;font-size:34px;letter-spacing:-.06em;\">${run.dataset?.name || 'Pending run'}</h2>${statusBadge(run.status)}</div><div class=\"subtle\" style=\"margin-top:6px;\">${run.dataset?.id || '-'} • ${run.phase || '-'}${batchLabel} • ${run.error ? `<span style=\"color:var(--bad);\">${run.error}</span>` : 'no fatal error'}</div></div><div class=\"subtle\" style=\"text-align:right;\"><div>Started: ${formatTs(run.started_at || run.created_at)}</div><div>Completed: ${formatTs(run.completed_at)}</div><div>Host: ${run.config?.base_url || '-'}</div></div></div>
+    <div style=\"display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:18px;\"><div><div style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap;\"><h2 style=\"margin:0;font-size:34px;letter-spacing:-.06em;\">${run.dataset?.name || 'Pending run'}</h2>${statusBadge(run.status)}</div><div class=\"subtle\" style=\"margin-top:6px;\">${run.dataset?.id || '-'} • ${run.phase || '-'}${batchLabel} • ${run.error ? `<span style=\"color:var(--bad);\">${run.error}</span>` : 'no fatal error'}</div></div><div style=\"display:grid;justify-items:end;gap:8px;\"><div class=\"subtle\" style=\"text-align:right;\"><div>Started: ${formatTs(run.started_at || run.created_at)}</div><div>Completed: ${formatTs(run.completed_at)}</div><div>Host: ${run.config?.base_url || '-'}</div></div><button class=\"secondary\" type=\"button\" data-download-run=\"${run.id}\">Download Word Report</button></div></div>
     <section class=\"card\" style=\"margin-bottom:16px;\"><div style=\"display:flex;justify-content:space-between;gap:10px;align-items:center;\"><div><h3 style=\"margin:0 0 6px;\">Live Progress</h3><div class=\"subtle\">${live.parse_completed || 0}/${live.parse_total || 0} parsed • ${live.retrieval_completed || 0}/${live.retrieval_total || 0} retrievals • ${live.chat_completed || 0}/${live.chat_total || 0} chats</div></div><div style=\"font-size:30px;font-weight:800;letter-spacing:-.05em;\">${Number(run.progress || 0)}%</div></div><div class=\"progress\"><div style=\"width:${Math.max(2, Number(run.progress || 0))}%\"></div></div><div class=\"subtle\">${events.length ? events[events.length - 1].message : 'Waiting for updates.'}</div></section>
     <section class=\"grid\">
       ${metricCard('Documents', run.summary?.documents || parse.total_documents || 0, parsingEnabled ? `${parse.total_chunks || 0} chunks • ${parse.total_tokens || 0} tokens indexed` : 'uploaded files only')}
@@ -1771,10 +2145,10 @@ function renderRunView(run) {
       ${metricCard('Parse Token Rate', metricValue(parsingEnabled, parse.token_throughput_per_sec || 0, 2, ' tok/s'), metricHint(parsingEnabled, `${parse.status_breakdown ? Object.entries(parse.status_breakdown).map(([k,v]) => `${k}:${v}`).join(' • ') : '-'}`))}
       ${summaryCard}
       <div class=\"card span6\"><h3>Parse Duration by Document</h3><div class=\"subtle\">Total parse time per document from the final document status API. All documents are available through pagination.</div>${renderPaginatedBars(`parse-bars-${run.id}`, parseBars, 12, (value) => `${number(value)} s`)}</div>
-      <div class=\"card span6\"><h3>Pipeline Step Durations</h3><div class=\"subtle\">Time between successive KB pipeline progress steps. This shows slow internal stages, not total document parse time.${slowStepThreshold > 0 ? ` Steps at or above ${number(slowStepThreshold, 2)} s are treated as slow.` : ''}</div>${renderPaginatedBars(`pipeline-step-bars-${run.id}`, pipelineStepBars, 12, (value) => `${number(value)} s`, true)}</div>
+      <div class=\"card span6\"><h3>Execution Stage Durations</h3><div class=\"subtle\">Measured directly by this app from the run flow: provisioning, upload, parsing, prompt generation, retrieval, assistant setup, chat, summary, and cleanup.${stageSlowThreshold > 0 ? ` Stages at or above ${number(stageSlowThreshold, 2)} s are treated as slow.` : ''}</div>${renderPaginatedBars(`stage-bars-${run.id}`, stageBars, 12, (value) => `${number(value)} s`, true)}</div>
       <div class=\"card span6\"><h3>Retrieval Latency Histogram</h3><div class=\"subtle\">Official /api/v1/retrieval benchmark on the generated prompts.</div>${renderHistogram(retrieval.summary?.latency_histogram || [])}</div>
       <div class=\"card span6\"><h3>Chat Latency Histogram</h3><div class=\"subtle\">Official OpenAI-compatible chat completions.</div>${renderHistogram(chat.summary?.latency_histogram || [])}</div>
-      <div class=\"card span12\"><h3>Pipeline Log Table</h3><div class=\"subtle\">Progress messages are split into timestamped steps.${slowStepThreshold > 0 ? ` Step gaps at or above ${number(slowStepThreshold, 2)} s are highlighted.` : ''}</div>${renderPaginatedTable(`pipeline-${run.id}`, ['document','task','status','duration','details'], pipelineRows, 8)}</div>
+      <div class=\"card span12\"><h3>Execution Stage Timeline</h3><div class=\"subtle\">This is the app-controlled workflow, not RagFlow KB pipeline metadata.</div>${renderPaginatedTable(`timeline-${run.id}`, ['stage','status','duration','started','completed'], stageRows, 10)}</div>
       <div class=\"card span12\"><h3>Retrieval Sample Results</h3>${renderPaginatedTable(`retrieval-${run.id}`, ['status','kind','document','prompt','latency','chunks','top docs'], retrievalRows, 10)}</div>
       <div class=\"card span12\"><h3>Chat Sample Results</h3>${renderPaginatedTable(`chat-${run.id}`, ['status','kind','document','prompt','latency','tokens','refs','referenced docs'], chatRows, 10)}</div>
       <div class=\"card span6\"><h3>Generated Prompts</h3><pre>${JSON.stringify(prompts, null, 2)}</pre></div>
@@ -1783,6 +2157,7 @@ function renderRunView(run) {
   attachBatchTabHandlers(container, run, batchRuns);
   attachPaginationHandlers(container);
   attachChartPaginationHandlers(container);
+  container.querySelectorAll('[data-download-run]').forEach((element) => element.addEventListener('click', () => { window.location.href = `${BASE_PATH}/api/runs/${element.getAttribute('data-download-run')}/report.docx`; }));
 }
 document.getElementById('refresh-runs').addEventListener('click', fetchRuns);
 document.getElementById('reset-runs').addEventListener('click', async () => { if (!window.confirm('Clear all stored run results from this app? Active configs in local storage will be kept.')) return; const response = await fetch(`${BASE_PATH}/api/runs/reset`, { method: 'POST' }); const payload = await response.json(); if (!response.ok || payload.error) { alert(payload.error || 'Unable to reset runs.'); return; } state.activeRunId = null; state.activeBatchTabs = {}; persistActiveRun(); stopPolling(); document.getElementById('run-view').innerHTML = `<div class=\"empty\">Start a run or select a previous benchmark from the left.</div>`; await fetchRuns(); });
@@ -1825,6 +2200,25 @@ async def get_run(run_id: str) -> Any:
         if run_id not in RUNS:
             return jsonify({"error": "Run not found"}), 404
     return jsonify(build_run_response(run_id))
+
+
+@app.get(route_path("/api/runs/<run_id>/report.docx"))
+async def download_run_report(run_id: str) -> Any:
+    with RUNS_LOCK:
+        if run_id not in RUNS:
+            return jsonify({"error": "Run not found"}), 404
+        run = json_clone(RUNS[run_id])
+
+    report_bytes = build_run_report(run)
+    filename = f"ragflow-performance-{run_id}.docx"
+    return Response(
+        report_bytes,
+        headers={
+            "Content-Type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(report_bytes)),
+        },
+    )
 
 
 @app.post(route_path("/api/runs/reset"))
