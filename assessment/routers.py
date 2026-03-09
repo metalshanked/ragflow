@@ -3,7 +3,7 @@ FastAPI routers for the Assessment API.
 
 Endpoints
 ---------
-Single-call (legacy):
+Single-call:
   POST   /api/v1/assessments                             - Upload everything & start
 
 From existing dataset:
@@ -197,7 +197,7 @@ async def _request_ragflow_official(
 
 
 # ===========================================================================
-# Single-call workflow (legacy – upload everything at once)
+# Single-call workflow (upload everything at once)
 # ===========================================================================
 
 @router.post("/assessments", response_model=TaskStatus, status_code=202)
@@ -1002,3 +1002,4 @@ async def ragflow_official_passthrough(ragflow_path: str, request: Request):
             "Content-Type": resp.headers.get("content-type", "application/octet-stream"),
         },
     )
+
