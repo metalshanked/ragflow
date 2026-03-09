@@ -193,6 +193,14 @@ def normalize_chat_create_options(options: dict[str, Any] | None) -> dict[str, A
     return payload
 
 
+def strip_internal_model_suffix(model_name: str) -> str:
+    value = model_name or ""
+    for suffix in ("___OpenAI-API", "___LocalAI", "___HuggingFace", "___VLLM"):
+        if value.endswith(suffix):
+            return value[: -len(suffix)]
+    return value
+
+
 def percentile(values: list[float], pct: float) -> float:
     if not values:
         return 0.0
@@ -506,6 +514,56 @@ class RAGFlowClient:
             raise RAGFlowError("Tenant info response was not an object.")
         return data
 
+    def list_chat_models(self) -> list[str]:
+        response = self._request("GET", self._web_url("/llm/list"), params={"model_type": "chat"})
+        data = response.get("data", {})
+        if not isinstance(data, dict):
+            return []
+        models: list[str] = []
+        for factory, entries in data.items():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                llm_name = str(entry.get("llm_name") or entry.get("name") or "").strip()
+                fid = str(entry.get("fid") or factory or "").strip()
+                if llm_name and fid:
+                    models.append(f"{llm_name}@{fid}")
+        return models
+
+    def resolve_chat_model_name(self, requested: Any) -> str | None:
+        model_name = normalize_chat_model_name(requested)
+        if not model_name:
+            return None
+
+        available = self.list_chat_models()
+        if not available:
+            return model_name
+
+        by_exact = {item.lower(): item for item in available}
+        if model_name.lower() in by_exact:
+            return by_exact[model_name.lower()]
+
+        aliases = {model_name}
+        base, has_provider, provider = model_name.partition("@")
+        if has_provider:
+            stripped = strip_internal_model_suffix(base)
+            aliases.add(f"{stripped}@{provider}")
+            aliases.add(f"{normalize_chat_model_name(stripped + '@' + provider) or ''}")
+        for alias in aliases:
+            if alias and alias.lower() in by_exact:
+                return by_exact[alias.lower()]
+
+        for item in available:
+            item_base, _, item_provider = item.partition("@")
+            if provider and item_provider != provider:
+                continue
+            if strip_internal_model_suffix(item_base).lower() == strip_internal_model_suffix(base).lower():
+                return item
+
+        return model_name
+
     def get_dataset_detail(self, dataset_id: str) -> dict[str, Any]:
         response = self._request("GET", self._web_url("/kb/detail"), params={"kb_id": dataset_id})
         data = response.get("data", {})
@@ -604,27 +662,16 @@ class RAGFlowClient:
         response = self._request("POST", self._api_url("/retrieval"), json=payload)
         return response["data"]
 
-    def create_chat(self, name: str, dataset_id: str, options: dict[str, Any] | None = None) -> dict[str, Any]:
-        payload: dict[str, Any] = {"name": name, "dataset_ids": [dataset_id]}
-        payload = merge_dicts(payload, normalize_chat_create_options(options))
+    def create_chat(self, name: str, dataset_id: str | None, options: dict[str, Any] | None = None) -> dict[str, Any]:
+        normalized_options = normalize_chat_create_options(options)
+        llm = normalized_options.get("llm")
+        if isinstance(llm, dict) and llm.get("model_name"):
+            llm["model_name"] = self.resolve_chat_model_name(llm.get("model_name"))
+        payload: dict[str, Any] = {"name": name, "dataset_ids": [dataset_id] if dataset_id else []}
+        payload = merge_dicts(payload, normalized_options)
         payload["name"] = name
-        payload["dataset_ids"] = [dataset_id]
-        try:
-            response = self._request("POST", self._api_url("/chats"), json=payload)
-        except RAGFlowError as exc:
-            llm = payload.get("llm") if isinstance(payload.get("llm"), dict) else {}
-            model_name = llm.get("model_name")
-            if model_name and "doesn't exist" in str(exc):
-                fallback_model = str(options.get("llm", {}).get("model_name") if isinstance(options, dict) else "")
-                if fallback_model and fallback_model != model_name:
-                    retry_payload = merge_dicts({"name": name, "dataset_ids": [dataset_id]}, deepcopy(options or {}))
-                    retry_payload["name"] = name
-                    retry_payload["dataset_ids"] = [dataset_id]
-                    response = self._request("POST", self._api_url("/chats"), json=retry_payload)
-                else:
-                    raise
-            else:
-                raise
+        payload["dataset_ids"] = [dataset_id] if dataset_id else []
+        response = self._request("POST", self._api_url("/chats"), json=payload)
         return response["data"]
 
     def delete_chat(self, chat_id: str) -> None:
@@ -878,13 +925,26 @@ def build_assessment_prompt(scope: str, payload: dict[str, Any]) -> str:
 
 def generate_llm_assessment(
     client: RAGFlowClient,
-    dataset_id: str,
     create_options: dict[str, Any],
     completion_options: dict[str, Any],
     prompt: str,
     name_prefix: str,
 ) -> dict[str, Any]:
-    analysis_chat = client.create_chat(f"{name_prefix}-{datetime.now().strftime('%H%M%S')}", dataset_id, options=create_options)
+    analysis_options = merge_dicts(
+        {
+            "prompt": {
+                "system": "You analyze benchmark metrics and write concise engineering assessments. Do not say the answer is missing from a knowledge base. Use only the provided benchmark payload.",
+                "prologue": "Ready to analyze benchmark results.",
+                "parameters": [],
+                "empty_response": "No benchmark analysis could be generated.",
+                "quote": False,
+                "tts": False,
+                "refine_multiturn": False,
+            }
+        },
+        normalize_chat_create_options(create_options),
+    )
+    analysis_chat = client.create_chat(f"{name_prefix}-{datetime.now().strftime('%H%M%S')}", None, options=analysis_options)
     chat_id = analysis_chat["id"]
     try:
         payload = merge_dicts({"extra_body": {"reference": False}}, completion_options or {})
@@ -896,7 +956,7 @@ def generate_llm_assessment(
             "generated_at": utc_now(),
             "chat_id": chat_id,
             "content": message.get("content") or "",
-            "model_name": (analysis_chat.get("llm") or {}).get("model_name") or ((create_options.get("llm") or {}).get("model_name")),
+            "model_name": (analysis_chat.get("llm") or {}).get("model_name") or ((analysis_options.get("llm") or {}).get("model_name")),
         }
     finally:
         try:
@@ -908,7 +968,6 @@ def generate_llm_assessment(
 def maybe_generate_batch_assessment(
     client: RAGFlowClient,
     run_id: str,
-    dataset_id: str,
     create_options: dict[str, Any],
     completion_options: dict[str, Any],
 ) -> None:
@@ -933,7 +992,6 @@ def maybe_generate_batch_assessment(
             return
         assessment = generate_llm_assessment(
             client,
-            dataset_id,
             create_options,
             completion_options,
             build_assessment_prompt("batch", payload),
@@ -1290,7 +1348,6 @@ def execute_run(run_id: str) -> None:
                 run_payload = build_run_response(run_id)
                 assessment = generate_llm_assessment(
                     client,
-                    dataset_id,
                     chat_stage["create_options"],
                     chat_stage["completion_options"],
                     build_assessment_prompt("run", build_run_assessment_payload(run_payload)),
@@ -1318,7 +1375,6 @@ def execute_run(run_id: str) -> None:
                 maybe_generate_batch_assessment(
                     client,
                     run_id,
-                    resource_ids["dataset_id"],
                     chat_stage["create_options"],
                     chat_stage["completion_options"],
                 )
@@ -1407,6 +1463,11 @@ def load_existing_runs() -> None:
             payload = json.loads(json_file.read_text(encoding="utf-8"))
             run_id = payload.get("id")
             if run_id:
+                if (payload.get("status") or "").lower() in {"queued", "running"}:
+                    payload["status"] = "failed"
+                    payload["phase"] = "interrupted"
+                    payload["error"] = payload.get("error") or "The performance app restarted before this run finished."
+                    payload["completed_at"] = payload.get("completed_at") or utc_now()
                 RUNS[run_id] = payload
         except Exception:
             continue
@@ -1703,7 +1764,7 @@ async def get_run(run_id: str) -> Any:
 @app.post(route_path("/api/runs/reset"))
 async def reset_runs() -> Any:
     with RUNS_LOCK:
-        active = [run_id for run_id, run in RUNS.items() if (run.get("status") or "").lower() in {"queued", "running"}]
+        active = [run_id for run_id, run in RUNS.items() if (run.get("status") or "").lower() in {"queued", "running"} and run_id in RUN_SECRETS]
         if active:
             return jsonify({"error": "Cannot reset while runs are still queued or running."}), 409
         removed = list(RUNS.keys())
