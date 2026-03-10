@@ -1286,6 +1286,44 @@ def build_batch_report(batch_id: str, runs: list[dict[str, Any]]) -> bytes:
         ],
     )
 
+    document.add_heading("Batch Visualizations", level=1)
+    batch_parse_rows = [
+        {
+            "label": f"Run {safe_int(run.get('config', {}).get('batch', {}).get('run_index'), index)}",
+            "value": safe_float(run.get("summary", {}).get("parse_wall_time_sec")),
+        }
+        for index, run in enumerate(ordered_runs, start=1)
+    ]
+    batch_retrieval_rows = [
+        {
+            "label": f"Run {safe_int(run.get('config', {}).get('batch', {}).get('run_index'), index)}",
+            "value": safe_float(run.get("summary", {}).get("retrieval_p95_ms")),
+        }
+        for index, run in enumerate(ordered_runs, start=1)
+    ]
+    batch_chat_rows = [
+        {
+            "label": f"Run {safe_int(run.get('config', {}).get('batch', {}).get('run_index'), index)}",
+            "value": safe_float(run.get("summary", {}).get("chat_p95_ms")),
+        }
+        for index, run in enumerate(ordered_runs, start=1)
+    ]
+    batch_error_rows = [
+        {
+            "label": f"Run {safe_int(run.get('config', {}).get('batch', {}).get('run_index'), index)}",
+            "value": safe_float(run.get("summary", {}).get("chat_error_rate")) * 100,
+        }
+        for index, run in enumerate(ordered_runs, start=1)
+    ]
+    document.add_paragraph("Parse Wall Time by Run")
+    add_paginated_bar_charts(document, sorted(batch_parse_rows, key=lambda item: item["value"], reverse=True), "Parse Wall Time by Run")
+    document.add_paragraph("Retrieval P95 by Run")
+    add_paginated_bar_charts(document, sorted(batch_retrieval_rows, key=lambda item: item["value"], reverse=True), "Retrieval P95 by Run", color="#c2410c")
+    document.add_paragraph("Chat P95 by Run")
+    add_paginated_bar_charts(document, sorted(batch_chat_rows, key=lambda item: item["value"], reverse=True), "Chat P95 by Run", color="#0f766e")
+    document.add_paragraph("Chat Error Rate by Run (%)")
+    add_paginated_bar_charts(document, sorted(batch_error_rows, key=lambda item: item["value"], reverse=True), "Chat Error Rate by Run (%)", color="#b91c1c")
+
     for index, run in enumerate(ordered_runs, start=1):
         document.add_page_break()
         run_title = f"Run {safe_int(run.get('config', {}).get('batch', {}).get('run_index'), index)}"
@@ -1332,6 +1370,18 @@ def build_batch_report(batch_id: str, runs: list[dict[str, Any]]) -> bytes:
         if run_assessment:
             document.add_heading("Run Executive Summary", level=2)
             document.add_paragraph(run_assessment)
+
+        parse_rows = [{"label": doc.get("name"), "value": safe_float(doc.get("process_duration"))} for doc in (parse.get("documents") or [])]
+        stage_rows = [{"label": stage.get("label") or stage.get("key"), "value": safe_float(stage.get("duration_sec"))} for stage in (run.get("timeline") or [])]
+        document.add_heading("Visualizations", level=2)
+        document.add_paragraph("Parse Duration by Document")
+        add_paginated_bar_charts(document, sorted(parse_rows, key=lambda item: item["value"], reverse=True), "Parse Duration by Document")
+        document.add_paragraph("Execution Stage Durations")
+        add_paginated_bar_charts(document, sorted(stage_rows, key=lambda item: item["value"], reverse=True), "Execution Stage Durations", color="#c2410c")
+        document.add_paragraph("Retrieval Latency Histogram")
+        add_report_chart(document, build_histogram_chart((retrieval.get("summary") or {}).get("latency_histogram") or [], "Retrieval Latency Histogram"))
+        document.add_paragraph("Chat Latency Histogram")
+        add_report_chart(document, build_histogram_chart((chat.get("summary") or {}).get("latency_histogram") or [], "Chat Latency Histogram", color="#0f766e"))
 
         timeline = run.get("timeline") or []
         if timeline:
@@ -1410,6 +1460,14 @@ def build_batch_report(batch_id: str, runs: list[dict[str, Any]]) -> bytes:
                     for item in chat_results
                 ],
             )
+
+        events = run.get("events") or []
+        if events:
+            document.add_heading("Event Log", level=2)
+            for event in events:
+                document.add_paragraph(
+                    f"[{report_safe_text(event.get('ts'))}] {report_safe_text(event.get('level')).upper()} {report_safe_text(event.get('message'))}"
+                )
 
     for section in document.sections:
         section.top_margin = Inches(0.6)
