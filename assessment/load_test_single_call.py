@@ -612,28 +612,61 @@ def print_aggregate_summary(results: list[RunMetrics], wall_seconds: float) -> N
     total_result_rows = sum(item.result_rows for item in results)
 
     log("")
-    log("Aggregate benchmark summary")
-    log(f"total_calls={len(results)} accepted={accepted_count} completed={completed_count} failed={failed_count} timed_out={timeout_count}")
-    log(f"wall_time={wall_seconds:.2f}s throughput={len(results) / wall_seconds:.2f} runs/s")
+    log("=" * 60)
+    log("🏁 LOAD TEST PERFORMANCE REPORT (Layman's Summary)")
+    log("=" * 60)
+
+    log("\n📊 1. OVERALL EXECUTION")
+    log(f"  • Total Assessments Run  : {len(results)}")
+    log(f"  • Successfully Completed : {completed_count} ({(completed_count/len(results)*100 if results else 0):.1f}%)")
+    log(f"  • Failed / Errors        : {failed_count}")
+    log(f"  • Timed Out              : {timeout_count}")
+    log(f"  • Total Load Test Time   : {wall_seconds:.1f} seconds")
+    log(f"  • Average Throughput     : {len(results) / wall_seconds:.2f} runs per second")
+
+    log("\n⏱️ 2. TIME TAKEN (PER ASSESSMENT)")
+    if end_to_end_latencies:
+        import statistics
+        mean_time = statistics.mean(end_to_end_latencies)
+        p95_time = percentile(end_to_end_latencies, 0.95)
+        log(f"  • Average Time           : {mean_time:.1f} seconds")
+        log(f"  • Fastest Run            : {min(end_to_end_latencies):.1f} seconds")
+        log(f"  • Slowest Run            : {max(end_to_end_latencies):.1f} seconds")
+        log(f"  • 95% of runs finished in: {p95_time:.1f} seconds or less")
+    else:
+        log("  • No assessments completed successfully to measure time.")
+
+    log("\n📝 3. QUESTION PROCESSING")
+    log(f"  • Total Questions Given  : {total_questions}")
+    log(f"  • Questions Processed    : {processed_questions}")
+    if total_questions > 0:
+        log(f"  • Processing Success Rate: {(processed_questions / total_questions * 100.0):.1f}%")
+
+    if verdict_counts:
+        log("\n✅ 4. VERDICT BREAKDOWN")
+        for verdict, count in verdict_counts.items():
+            log(f"  • {str(verdict).capitalize()}: {count}")
+
+    if errors or cleanup_errors:
+        log("\n⚠️ 5. ERRORS & WARNINGS")
+        for err, count in errors.items():
+            log(f"  • Assessment Error ({count} times): {err}")
+        for err, count in cleanup_errors.items():
+            log(f"  • Cleanup Error ({count} times): {err}")
+
+    log("\n" + "=" * 60)
+    log("⚙️ TECHNICAL METRICS (For debugging)")
+    log("-" * 60)
     log(f"state_breakdown={dict(state_counts)}")
     log(f"submit_latency={summarize_numeric(submit_latencies)}")
     log(f"time_to_terminal={summarize_numeric(terminal_latencies)}")
     log(f"results_fetch_latency={summarize_numeric(results_latencies)}")
     log(f"end_to_end_latency={summarize_numeric(end_to_end_latencies)}")
     log(f"poll_count={summarize_counts(poll_counts)}")
-    log(
-        f"questions_total={total_questions} "
-        f"questions_processed={processed_questions} "
-        f"processing_ratio={(processed_questions / total_questions * 100.0 if total_questions else 0.0):.2f}%"
-    )
-    log(f"results_rows={total_result_rows} verdict_breakdown={dict(verdict_counts)}")
     log(f"document_status_breakdown={dict(document_status_counts)}")
     if CLEANUP_ARTIFACTS:
         log(f"cleanup_status={dict(cleanup_status)}")
-        if cleanup_errors:
-            log(f"cleanup_errors={dict(cleanup_errors)}")
-    if errors:
-        log(f"errors={dict(errors)}")
+    log("=" * 60)
 
 
 def main() -> None:
