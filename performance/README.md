@@ -1,9 +1,9 @@
-﻿`performance/app.py` is a standalone RAGFlow load-testing UI.
+﻿`performance/ragflow_benchmark_app.py` is a standalone RAGFlow load-testing UI.
 
 Run it from the repo root:
 
 ```bash
-python performance/app.py
+python performance/ragflow_benchmark_app.py
 ```
 
 Open `http://127.0.0.1:8787`.
@@ -16,10 +16,10 @@ Docker:
 docker build -f performance/Dockerfile performance -t ragflow-performance
 ```
 
-- the Dockerfile is self-contained:
-  - it inlines the current app code
-  - it inlines the Python requirements
-  - it does not copy any local files during the image build
+- the Dockerfile copies only:
+  - `ragflow_benchmark_app.py`
+
+- the Dockerfile inlines the Python requirements and installs them during build
 
 - run on the default root path:
 

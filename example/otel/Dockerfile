@@ -1,4 +1,4 @@
-# ============================================================
+﻿# ============================================================
 # RAGFlow + OpenTelemetry + Uvicorn/Gunicorn Dockerfile
 #
 # Layers OTel auto-instrumentation and production-grade servers
@@ -128,6 +128,23 @@
 #     -e OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317 \
 #     -e GUNICORN_WORKERS=2 \
 #     ragflow-otel:latest --enable-adminserver --disable-taskexecutor
+#
+# With log forwarding to OTLP collector:
+#
+#   docker run \
+#     -e OTEL_SERVICE_NAME=ragflow \
+#     -e OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317 \
+#     -e RAGFLOW_OTEL_LOG_ENABLED=true \
+#     ragflow-otel:latest
+#
+# Log forwarding with HTTP protocol:
+#
+#   docker run \
+#     -e OTEL_SERVICE_NAME=ragflow \
+#     -e OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
+#     -e OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+#     -e RAGFLOW_OTEL_LOG_ENABLED=true \
+#     ragflow-otel:latest
 #
 # ------------------------------------------------------------
 # Environment variables — Elasticsearch Index Settings
@@ -263,6 +280,42 @@
 #   https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/
 #
 # ------------------------------------------------------------
+# Environment variables — OpenTelemetry Log Forwarding
+# ------------------------------------------------------------
+#
+#   Uses the official OpenTelemetry Python SDK LoggingHandler to
+#   capture Python log records at the source and export them as
+#   OTLP log entries.  No file tailing, no sidecar, no external
+#   OTel binary.  The handler is injected via a sitecustomize
+#   import hook that wraps common.log_utils.init_root_logger.
+#
+#   RAGFLOW_OTEL_LOG_ENABLED        Enable/disable log forwarding.
+#                                   Default: false (opt-in).
+#                                   Set "true" to start forwarding.
+#
+#   RAGFLOW_OTEL_LOG_SERVICE_NAMESPACE
+#                                   service.namespace resource
+#                                   attribute value.
+#                                   Default: ragflow
+#
+#   The handler reuses OTEL_EXPORTER_OTLP_ENDPOINT,
+#   OTEL_EXPORTER_OTLP_PROTOCOL, OTEL_EXPORTER_OTLP_HEADERS,
+#   and OTEL_EXPORTER_OTLP_INSECURE for its exporter.
+#
+#   Log classification — the hook automatically sets:
+#     resource attribute  service.name     based on component
+#     resource attribute  ragflow.log_type based on component
+#
+#     ragflow_server      → service.name=ragflow-web,
+#                           ragflow.log_type=web
+#     admin_service       → service.name=ragflow-admin,
+#                           ragflow.log_type=admin
+#     task_executor_*     → service.name=ragflow-task-executor,
+#                           ragflow.log_type=task_executor
+#     data_sync_*         → service.name=ragflow-data-sync,
+#                           ragflow.log_type=data_sync
+#
+# ------------------------------------------------------------
 # LDAP Configuration (Environment Variables)
 # ------------------------------------------------------------
 #
@@ -384,7 +437,7 @@
 # Optional Docling integration (single source of truth for stage selection below).
 #   INSTALL_DOCLING=0 -> no Docling stage pull
 #   INSTALL_DOCLING=1 -> integrate Docling from DOCLING_SERVE_IMAGE
-ARG INSTALL_DOCLING=1
+ARG INSTALL_DOCLING=0
 ARG RAGFLOW_BASE_IMAGE=infiniflow/ragflow:v0.24.0
 # Proxy override example:
 #   --build-arg RAGFLOW_BASE_IMAGE=artifactory.cera.com/dockerproxy/infiniflow/ragflow:v0.24.0
@@ -1558,6 +1611,172 @@ if needle in text:
     text = text.replace(needle, insert, 1)
 
 path.write_text(text)
+PY
+
+# 12. OpenTelemetry Log Forwarding — official SDK LoggingHandler
+#     Uses the official opentelemetry-sdk LoggingHandler to capture Python
+#     log records at the source and export them as OTLP log entries.
+#     No file tailing, no sidecar, no external collector binary.
+#
+#     How it works:
+#       - A sitecustomize import hook patches common.log_utils.init_root_logger
+#       - After RAGFlow's logging setup runs, an OTel LoggingHandler is added
+#         to the root logger alongside the existing file/console handlers
+#       - Each component gets its own service.name based on its log file basename
+#       - The LoggingHandler feeds into BatchLogRecordProcessor → OTLPLogExporter
+#       - Log records are structured (severity, timestamp, PID) by the SDK itself
+#
+#     Controlled by RAGFLOW_OTEL_LOG_ENABLED (default: false).
+#     Activated automatically via sitecustomize — no separate process needed.
+
+RUN python3 - <<'PY'
+import site
+import textwrap
+from pathlib import Path
+
+hook_code = textwrap.dedent('''\
+    """RAGFlow OTel Log Hook — official SDK LoggingHandler integration.
+
+    Patches common.log_utils.init_root_logger via an import hook so that
+    after RAGFlow sets up its file/console logging, an OpenTelemetry
+    LoggingHandler is added to the root logger.  This captures every
+    Python log record at the source and exports it as an OTLP log entry.
+
+    No file tailing, no background process, no external binary.
+    Uses the same opentelemetry-sdk packages already installed for traces.
+
+    Activated only when RAGFLOW_OTEL_LOG_ENABLED is truthy.
+    """
+    import builtins
+    import functools
+    import logging
+    import os
+
+    def _truthy(value):
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    if _truthy(os.environ.get("RAGFLOW_OTEL_LOG_ENABLED", "false")):
+
+        _NAMESPACE = os.environ.get("RAGFLOW_OTEL_LOG_SERVICE_NAMESPACE", "ragflow")
+        _otel_handler_installed = False
+
+        # logfile_basename -> (service.name, ragflow.log_type)
+        _CLASSIFICATION = {
+            "ragflow_server": ("ragflow-web", "web"),
+            "admin_service":  ("ragflow-admin", "admin"),
+        }
+        _PREFIX_RULES = [
+            ("task_executor", "ragflow-task-executor", "task_executor"),
+            ("data_sync",     "ragflow-data-sync",     "data_sync"),
+        ]
+
+        def _classify(logfile_basename):
+            if logfile_basename in _CLASSIFICATION:
+                return _CLASSIFICATION[logfile_basename]
+            for prefix, svc, ltype in _PREFIX_RULES:
+                if logfile_basename.startswith(prefix):
+                    return svc, ltype
+            return f"ragflow-{logfile_basename.replace('_', '-')}", logfile_basename
+
+        def _add_otel_log_handler(logfile_basename):
+            """Add the official OTel LoggingHandler to the root logger."""
+            global _otel_handler_installed
+            if _otel_handler_installed:
+                return
+            _otel_handler_installed = True
+            try:
+                from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+                from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+                from opentelemetry.sdk.resources import Resource
+
+                protocol = os.environ.get("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
+                if protocol == "http/protobuf":
+                    from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+                else:
+                    from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
+
+                service_name, log_type = _classify(logfile_basename)
+                resource = Resource.create({
+                    "service.name": service_name,
+                    "service.namespace": _NAMESPACE,
+                    "ragflow.log_type": log_type,
+                })
+                provider = LoggerProvider(resource=resource)
+                provider.add_log_record_processor(
+                    BatchLogRecordProcessor(OTLPLogExporter())
+                )
+                handler = LoggingHandler(
+                    level=logging.NOTSET,
+                    logger_provider=provider,
+                )
+                logging.getLogger().addHandler(handler)
+                logging.getLogger().info(
+                    "OTel log forwarding enabled: service.name=%s, ragflow.log_type=%s",
+                    service_name, log_type,
+                )
+            except Exception as exc:
+                logging.getLogger().warning("OTel log hook failed: %s", exc)
+
+        def _patch_init_root_logger(module):
+            """Wrap init_root_logger to add OTel handler after it runs."""
+            original = getattr(module, "init_root_logger", None)
+            if not callable(original) or getattr(original, "_ragflow_otel_log_patch", False):
+                return
+
+            @functools.wraps(original)
+            def wrapper(logfile_basename, *args, **kwargs):
+                result = original(logfile_basename, *args, **kwargs)
+                _add_otel_log_handler(logfile_basename)
+                return result
+
+            wrapper._ragflow_otel_log_patch = True
+            module.init_root_logger = wrapper
+
+        # Install import hook — wraps builtins.__import__ to detect
+        # when common.log_utils is loaded, then patches init_root_logger.
+        _orig_import = builtins.__import__
+
+        @functools.wraps(_orig_import)
+        def _otel_log_import_hook(name, *args, **kwargs):
+            module = _orig_import(name, *args, **kwargs)
+            if name == "common.log_utils" and not _otel_handler_installed:
+                _patch_init_root_logger(module)
+            return module
+
+        builtins.__import__ = _otel_log_import_hook
+''')
+
+# Write the hook module to site-packages
+site_pkg = Path(site.getsitepackages()[0])
+hook_path = site_pkg / "ragflow_otel_log_hook.py"
+hook_path.write_text(hook_code, encoding="utf-8")
+print(f"Installed OTel log hook module: {hook_path}")
+
+# Chain the hook into sitecustomize.py (same pattern as the lang shim).
+# Also chain into OTel's own sitecustomize if present.
+import importlib.util
+
+marker = 'import ragflow_otel_log_hook  # ragflow-otel-log-hook'
+
+sitecustomize = site_pkg / 'sitecustomize.py'
+content = sitecustomize.read_text(encoding="utf-8", errors="ignore") if sitecustomize.exists() else ''
+if marker not in content:
+    if content and not content.endswith('\n'):
+        content += '\n'
+    sitecustomize.write_text(content + marker + '\n', encoding="utf-8")
+    print(f'Chained OTel log hook in: {sitecustomize}')
+
+spec = importlib.util.find_spec('opentelemetry.instrumentation.auto_instrumentation.sitecustomize')
+if spec and spec.origin:
+    target = Path(spec.origin)
+    content = target.read_text(encoding="utf-8", errors="ignore")
+    if marker not in content:
+        if content and not content.endswith('\n'):
+            content += '\n'
+        target.write_text(content + marker + '\n', encoding="utf-8")
+        print(f'Chained OTel log hook in OTel sitecustomize: {target}')
+else:
+    print('OTel sitecustomize not found; skipping OTel log hook chaining')
 PY
 
 ## REDIS (VALKEY) OTEL DOES NOT WORK
