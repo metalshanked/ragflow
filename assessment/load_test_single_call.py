@@ -617,14 +617,22 @@ def print_aggregate_summary(results: list[RunMetrics], wall_seconds: float) -> N
     log("=" * 60)
 
     log("\n📊 1. OVERALL EXECUTION")
+    log("  (Helper: 'Average Throughput' shows how many assessments completed per second on average)")
     log(f"  • Total Assessments Run  : {len(results)}")
     log(f"  • Successfully Completed : {completed_count} ({(completed_count/len(results)*100 if results else 0):.1f}%)")
     log(f"  • Failed / Errors        : {failed_count}")
     log(f"  • Timed Out              : {timeout_count}")
     log(f"  • Total Load Test Time   : {wall_seconds:.1f} seconds")
-    log(f"  • Average Throughput     : {len(results) / wall_seconds:.2f} runs per second")
+    
+    throughput = len(results) / wall_seconds if wall_seconds > 0 else 0
+    if 0 < throughput < 0.01:
+        log(f"  • Average Throughput     : {throughput:.4f} runs per second (approx {(1/throughput):.1f} seconds per run)")
+    else:
+        log(f"  • Average Throughput     : {throughput:.2f} runs per second")
 
     log("\n⏱️ 2. TIME TAKEN (PER ASSESSMENT)")
+    log("  (Helper: Measures the start-to-finish time for an individual assessment run)")
+    log("  (Helper: '95% of runs...' means 95 out of 100 runs were faster than this time)")
     if end_to_end_latencies:
         import statistics
         mean_time = statistics.mean(end_to_end_latencies)
@@ -637,18 +645,28 @@ def print_aggregate_summary(results: list[RunMetrics], wall_seconds: float) -> N
         log("  • No assessments completed successfully to measure time.")
 
     log("\n📝 3. QUESTION PROCESSING")
+    log("  (Helper: Not processed questions usually mean the supporting documents failed to parse or timed out)")
     log(f"  • Total Questions Given  : {total_questions}")
     log(f"  • Questions Processed    : {processed_questions}")
     if total_questions > 0:
         log(f"  • Processing Success Rate: {(processed_questions / total_questions * 100.0):.1f}%")
 
+    log("\n📄 4. DOCUMENT PROCESSING STATUS")
+    log("  (Helper: Shows if documents were parsed successfully. 'timeout' = parsing took too long)")
+    if document_status_counts:
+        for status, count in document_status_counts.items():
+            log(f"  • {str(status).capitalize()}: {count}")
+    else:
+        log("  • No documents were processed.")
+
     if verdict_counts:
-        log("\n✅ 4. VERDICT BREAKDOWN")
+        log("\n✅ 5. VERDICT BREAKDOWN")
+        log("  (Helper: The final Yes/No/N/A answers produced by the AI across all processed questions)")
         for verdict, count in verdict_counts.items():
             log(f"  • {str(verdict).capitalize()}: {count}")
 
     if errors or cleanup_errors:
-        log("\n⚠️ 5. ERRORS & WARNINGS")
+        log("\n⚠️ 6. ERRORS & WARNINGS")
         for err, count in errors.items():
             log(f"  • Assessment Error ({count} times): {err}")
         for err, count in cleanup_errors.items():
