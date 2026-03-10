@@ -8,6 +8,48 @@ python performance/app.py
 
 Open `http://127.0.0.1:8787`.
 
+Docker:
+
+- build from the repo root:
+
+```bash
+docker build -f performance/Dockerfile performance -t ragflow-performance
+```
+
+- the Dockerfile is self-contained:
+  - it inlines the current app code
+  - it inlines the Python requirements
+  - it does not copy any local files during the image build
+
+- run on the default root path:
+
+```bash
+docker run --rm -p 8787:8787 ragflow-performance
+```
+
+- run on a custom subpath:
+
+```bash
+docker run --rm -p 8787:8787 \
+  -e PERFORMANCE_APP_BASE_PATH=/tools/performance \
+  ragflow-performance
+```
+
+- the Dockerfile installs Python packages from the internal company PyPI proxy by default:
+  - `https://artifactor.cera.com/api/pypi/pypi/simple`
+- override that at build time if needed:
+
+```bash
+docker build \
+  --build-arg PIP_INDEX_URL=https://artifactor.cera.com/api/pypi/pypi/simple \
+  --build-arg PIP_TRUSTED_HOST=artifactor.cera.com \
+  -f performance/Dockerfile performance -t ragflow-performance
+```
+
+- the container exposes:
+  - `PERFORMANCE_APP_PORT`
+  - `PERFORMANCE_APP_BASE_PATH`
+
 Browser persistence:
 
 - the form stores non-file fields in browser `localStorage`
@@ -17,19 +59,21 @@ TLS:
 
 - leave `Verify SSL certificates` enabled to use the HTTP library default trust store
 - disable it to turn certificate verification off for self-signed or otherwise untrusted endpoints
+- insecure SSL warnings are suppressed when verification is disabled
 
 What it does:
 
 - uploads your files to a new RAGFlow dataset
-- can queue multiple runs from one upload via `Run Count`
+- can start multiple parallel runs from one upload via `Parallel Runs`
 - lets you enable or disable parsing, retrieval, and chat as separate stages
 - starts parsing through the official dataset/document APIs when parsing is enabled
 - polls document status until parsing finishes
-- collects parsing telemetry from the same KB pipeline log endpoints the RAGFlow UI uses
 - auto-generates prompts from parsed chunk samples when retrieval or chat is enabled
 - benchmarks official retrieval calls when retrieval is enabled
 - benchmarks official OpenAI-compatible chat completions when chat is enabled
+- records app-controlled execution stage timings for provisioning, upload, parsing, prompt generation, retrieval, assistant setup, chat, summary, and cleanup
 - stores each run as JSON under `performance/data/runs/`
+- can export each run as a Word report with summaries, tables, and visualizations
 
 Config model:
 
@@ -49,7 +93,8 @@ Notes on stage behavior:
 
 - retrieval and chat currently require parsing to be enabled in this upload-based workflow because prompts are generated from parsed chunks
 - disabled stages are shown as skipped in the run view instead of reporting `0` metrics
-- when `Run Count` is greater than `1`, the app creates independent runs that reuse the same uploaded source files but provision separate remote datasets/chats for each run
+- when `Parallel Runs` is greater than `1`, the app creates independent runs that reuse the same uploaded source files but provision separate remote datasets/chats for each run
+- the results UI includes an execution-stage chart and timeline based on this app's own workflow rather than RagFlow pipeline canvases
 
 Auth:
 
