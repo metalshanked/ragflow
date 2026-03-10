@@ -1927,6 +1927,7 @@ INDEX_HTML = """<!doctype html>
   <meta charset=\"utf-8\" />
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
   <title>RAGFlow Performance Lab</title>
+  <link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%230f766e'/%3E%3Crect x='14' y='34' width='8' height='16' rx='2' fill='%23fffaf0'/%3E%3Crect x='28' y='24' width='8' height='26' rx='2' fill='%23fffaf0'/%3E%3Crect x='42' y='16' width='8' height='34' rx='2' fill='%23fffaf0'/%3E%3C/svg%3E\" />
   <style>
     :root { --bg:#f4efe6; --panel:#fffaf0; --ink:#1d232a; --muted:#6d726f; --line:#d9cfbe; --accent:#0f766e; --accent2:#c2410c; --good:#166534; --bad:#b91c1c; }
     * { box-sizing:border-box; }
@@ -2070,7 +2071,7 @@ INDEX_HTML = """<!doctype html>
           <button type=\"submit\">Start Benchmark</button>
         </form>
       </section>
-      <section class=\"panel\"><div style=\"display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;\"><h2 style=\"margin:0;\">Runs</h2><div style=\"display:flex;gap:8px;align-items:center;flex-wrap:nowrap;\"><div style=\"display:inline-flex;align-items:center;gap:8px;color:var(--muted);white-space:nowrap;\">Auto Refresh (sec)<input id=\"auto-refresh-sec\" type=\"number\" min=\"0\" max=\"3600\" value=\"0\" style=\"width:92px;\" /></div><button class=\"secondary\" id=\"refresh-runs\" type=\"button\">Refresh</button><button class=\"secondary\" id=\"reset-runs\" type=\"button\">Reset</button></div></div><div id=\"run-list\" class=\"run-list\"></div></section>
+      <section class=\"panel\"><div style=\"display:grid;gap:10px;\"><div style=\"display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;\"><h2 style=\"margin:0;\">Runs</h2><div style=\"display:inline-flex;align-items:center;gap:8px;color:var(--muted);white-space:nowrap;\">Auto Refresh (sec)<input id=\"auto-refresh-sec\" type=\"number\" min=\"0\" max=\"3600\" value=\"0\" style=\"width:92px;\" /></div></div><div style=\"display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;\"><button class=\"secondary\" id=\"refresh-runs\" type=\"button\">Refresh</button><button class=\"secondary\" id=\"reset-runs\" type=\"button\">Reset</button></div></div><div id=\"run-list\" class=\"run-list\"></div></section>
     </aside>
     <main class=\"content\"><div id=\"run-view\" class=\"empty\">Start a run or select a previous benchmark from the left.</div></main>
   </div>
@@ -2325,76 +2326,82 @@ async def start_run() -> Any:
     batch_root = UPLOADS_DIR / f"batch-{batch_id}"
     source_dir = batch_root / "source"
     source_dir.mkdir(parents=True, exist_ok=True)
-    source_paths = []
-    filenames = []
-    for file_storage in uploaded_files:
-        filename = sanitize_filename(file_storage.filename or f"upload-{uuid.uuid4().hex[:8]}")
-        target = source_dir / filename
-        await file_storage.save(target)
-        source_paths.append(target)
-        filenames.append(filename)
-    tls_config = {
-        "verify": verify_ssl,
-    }
-
-    common_config = {
-        "base_url": base_url,
-        "api_key": api_key,
-        "api_key_hint": f"...{api_key[-4:]}" if len(api_key) >= 4 else "***",
-        "dataset_options": dataset_options,
-        "prompts_per_document": max(1, safe_int(prompt_options.get("prompts_per_document"), 3)),
-        "shared_prompts": max(0, safe_int(prompt_options.get("shared_prompts"), 2)),
-        "http_timeout_sec": max(30, safe_int(form.get("http_timeout_sec"), 180)),
-        "dataset_prefix": form.get("dataset_prefix", "perf-dataset").strip() or "perf-dataset",
-        "chat_prefix": form.get("chat_prefix", "perf-chat").strip() or "perf-chat",
-        "cleanup_remote": form.get("cleanup_remote") == "on",
-        "tls": tls_config,
-        "batch_root": str(batch_root),
-        "analysis": {"enabled": enable_llm_summary},
-        "stages": {
-            "parsing": {
-                "enabled": enable_parsing,
-                "poll_interval_sec": parsing_poll_interval,
-                "chunk_sample_size": chunk_sample_size,
-                "collect_pipeline_logs": bool(collect_pipeline_logs),
-                "request_options": parsing_request_options,
-                "raw": parsing_options_raw,
-            },
-            "retrieval": {
-                "enabled": enable_retrieval,
-                "concurrency": retrieval_concurrency,
-                "request_options": retrieval_options,
-                "raw": retrieval_options_raw,
-            },
-            "chat": {
-                "enabled": enable_chat,
-                "concurrency": chat_concurrency,
-                "create_options": chat_create_options,
-                "completion_options": chat_completion_options,
-                "raw": chat_options_raw,
-            },
-        },
-    }
-
+    source_paths: list[Path] = []
+    filenames: list[str] = []
     run_ids: list[str] = []
-    for run_index in range(1, run_count + 1):
-        run_id = str(uuid.uuid4())
-        upload_dir = batch_root / run_id
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        local_paths = []
-        for source_path in source_paths:
-            target = upload_dir / source_path.name
-            shutil.copy2(source_path, target)
-            local_paths.append(str(target))
-        config = deepcopy(common_config)
-        config["local_files"] = local_paths
-        config["upload_dir"] = str(upload_dir)
-        config["batch"] = {"batch_id": batch_id, "run_index": run_index, "run_count": run_count, "parallel_count": parallel_runs}
-        queue_run(run_id, config, filenames)
-        run_ids.append(run_id)
 
-    shutil.rmtree(source_dir, ignore_errors=True)
-    return jsonify({"run_id": run_ids[0], "run_ids": run_ids})
+    try:
+        for file_storage in uploaded_files:
+            filename = sanitize_filename(file_storage.filename or f"upload-{uuid.uuid4().hex[:8]}")
+            target = source_dir / filename
+            await file_storage.save(target)
+            source_paths.append(target)
+            filenames.append(filename)
+
+        tls_config = {
+            "verify": verify_ssl,
+        }
+
+        common_config = {
+            "base_url": base_url,
+            "api_key": api_key,
+            "api_key_hint": f"...{api_key[-4:]}" if len(api_key) >= 4 else "***",
+            "dataset_options": dataset_options,
+            "prompts_per_document": max(1, safe_int(prompt_options.get("prompts_per_document"), 3)),
+            "shared_prompts": max(0, safe_int(prompt_options.get("shared_prompts"), 2)),
+            "http_timeout_sec": max(30, safe_int(form.get("http_timeout_sec"), 180)),
+            "dataset_prefix": form.get("dataset_prefix", "perf-dataset").strip() or "perf-dataset",
+            "chat_prefix": form.get("chat_prefix", "perf-chat").strip() or "perf-chat",
+            "cleanup_remote": form.get("cleanup_remote") == "on",
+            "tls": tls_config,
+            "batch_root": str(batch_root),
+            "analysis": {"enabled": enable_llm_summary},
+            "stages": {
+                "parsing": {
+                    "enabled": enable_parsing,
+                    "poll_interval_sec": parsing_poll_interval,
+                    "chunk_sample_size": chunk_sample_size,
+                    "collect_pipeline_logs": bool(collect_pipeline_logs),
+                    "request_options": parsing_request_options,
+                    "raw": parsing_options_raw,
+                },
+                "retrieval": {
+                    "enabled": enable_retrieval,
+                    "concurrency": retrieval_concurrency,
+                    "request_options": retrieval_options,
+                    "raw": retrieval_options_raw,
+                },
+                "chat": {
+                    "enabled": enable_chat,
+                    "concurrency": chat_concurrency,
+                    "create_options": chat_create_options,
+                    "completion_options": chat_completion_options,
+                    "raw": chat_options_raw,
+                },
+            },
+        }
+
+        for run_index in range(1, run_count + 1):
+            run_id = str(uuid.uuid4())
+            upload_dir = batch_root / run_id
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            local_paths = []
+            for source_path in source_paths:
+                target = upload_dir / source_path.name
+                shutil.copy2(source_path, target)
+                local_paths.append(str(target))
+            config = deepcopy(common_config)
+            config["local_files"] = local_paths
+            config["upload_dir"] = str(upload_dir)
+            config["batch"] = {"batch_id": batch_id, "run_index": run_index, "run_count": run_count, "parallel_count": parallel_runs}
+            queue_run(run_id, config, filenames)
+            run_ids.append(run_id)
+
+        return jsonify({"run_id": run_ids[0], "run_ids": run_ids})
+    finally:
+        shutil.rmtree(source_dir, ignore_errors=True)
+        if not run_ids:
+            shutil.rmtree(batch_root, ignore_errors=True)
 
 
 load_existing_runs()
