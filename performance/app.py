@@ -19,13 +19,17 @@ from typing import Any
 
 import matplotlib
 import requests
+import urllib3
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Inches, Pt
 from quart import Quart, Response, jsonify, request
+from urllib3.exceptions import InsecureRequestWarning
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+urllib3.disable_warnings(InsecureRequestWarning)
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -993,11 +997,10 @@ def build_horizontal_bar_chart(rows: list[dict[str, Any]], title: str, color: st
     items = [{"label": chart_label(item.get("label")), "value": safe_float(item.get("value"))} for item in rows if safe_float(item.get("value")) > 0]
     if not items:
         return None
-    top = items[:12]
-    fig_height = max(2.4, 0.45 * len(top) + 1.2)
+    fig_height = max(2.4, 0.45 * len(items) + 1.2)
     fig, ax = plt.subplots(figsize=(8.2, fig_height))
-    labels = [item["label"] for item in reversed(top)]
-    values = [item["value"] for item in reversed(top)]
+    labels = [item["label"] for item in reversed(items)]
+    values = [item["value"] for item in reversed(items)]
     ax.barh(range(len(values)), values, color=color)
     ax.set_yticks(range(len(labels)))
     ax.set_yticklabels(labels, fontsize=8)
@@ -1048,6 +1051,24 @@ def add_report_chart(document: Document, image_buffer: BytesIO | None) -> None:
         document.add_paragraph("No chart data available.")
         return
     document.add_picture(image_buffer, width=Inches(6.7))
+
+
+def add_paginated_bar_charts(
+    document: Document,
+    rows: list[dict[str, Any]],
+    title: str,
+    *,
+    color: str = "#0f766e",
+    page_size: int = 12,
+) -> None:
+    items = [item for item in rows if safe_float(item.get("value")) > 0]
+    if not items:
+        add_report_chart(document, None)
+        return
+    for index in range(0, len(items), page_size):
+        chunk = items[index : index + page_size]
+        chunk_title = title if len(items) <= page_size else f"{title} ({index // page_size + 1}/{math.ceil(len(items) / page_size)})"
+        add_report_chart(document, build_horizontal_bar_chart(chunk, chunk_title, color=color))
 
 
 def build_run_report(run: dict[str, Any]) -> bytes:
@@ -1105,9 +1126,9 @@ def build_run_report(run: dict[str, Any]) -> bytes:
     stage_rows = [{"label": stage.get("label") or stage.get("key"), "value": safe_float(stage.get("duration_sec"))} for stage in (run.get("timeline") or [])]
     document.add_heading("Visualizations", level=1)
     document.add_paragraph("Parse Duration by Document")
-    add_report_chart(document, build_horizontal_bar_chart(sorted(parse_rows, key=lambda item: item["value"], reverse=True), "Parse Duration by Document"))
+    add_paginated_bar_charts(document, sorted(parse_rows, key=lambda item: item["value"], reverse=True), "Parse Duration by Document")
     document.add_paragraph("Execution Stage Durations")
-    add_report_chart(document, build_horizontal_bar_chart(sorted(stage_rows, key=lambda item: item["value"], reverse=True), "Execution Stage Durations", color="#c2410c"))
+    add_paginated_bar_charts(document, sorted(stage_rows, key=lambda item: item["value"], reverse=True), "Execution Stage Durations", color="#c2410c")
     document.add_paragraph("Retrieval Latency Histogram")
     add_report_chart(document, build_histogram_chart((retrieval.get("summary") or {}).get("latency_histogram") or [], "Retrieval Latency Histogram"))
     document.add_paragraph("Chat Latency Histogram")
@@ -1149,10 +1170,10 @@ def build_run_report(run: dict[str, Any]) -> bytes:
     prompts = run.get("prompts") or []
     if prompts:
         document.add_heading("Generated Prompts", level=1)
-        for item in prompts[:50]:
+        for item in prompts:
             document.add_paragraph(f"[{item.get('kind')}] {item.get('prompt')}")
 
-    retrieval_results = (retrieval.get("results") or [])[:20]
+    retrieval_results = retrieval.get("results") or []
     if retrieval_results:
         document.add_heading("Retrieval Samples", level=1)
         add_table(
@@ -1170,7 +1191,7 @@ def build_run_report(run: dict[str, Any]) -> bytes:
             ],
         )
 
-    chat_results = (chat.get("results") or [])[:20]
+    chat_results = chat.get("results") or []
     if chat_results:
         document.add_heading("Chat Samples", level=1)
         add_table(
@@ -2049,7 +2070,7 @@ INDEX_HTML = """<!doctype html>
           <button type=\"submit\">Start Benchmark</button>
         </form>
       </section>
-      <section class=\"panel\"><div style=\"display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;\"><h2 style=\"margin:0;\">Runs</h2><div style=\"display:flex;gap:8px;align-items:center;flex-wrap:wrap;\"><label style=\"display:flex;align-items:center;gap:8px;color:var(--muted);\">Auto Refresh (sec)<input id=\"auto-refresh-sec\" type=\"number\" min=\"0\" max=\"3600\" value=\"0\" style=\"width:92px;\" /></label><button class=\"secondary\" id=\"refresh-runs\" type=\"button\">Refresh</button><button class=\"secondary\" id=\"reset-runs\" type=\"button\">Reset</button></div></div><div id=\"run-list\" class=\"run-list\"></div></section>
+      <section class=\"panel\"><div style=\"display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;\"><h2 style=\"margin:0;\">Runs</h2><div style=\"display:flex;gap:8px;align-items:center;flex-wrap:nowrap;\"><div style=\"display:inline-flex;align-items:center;gap:8px;color:var(--muted);white-space:nowrap;\">Auto Refresh (sec)<input id=\"auto-refresh-sec\" type=\"number\" min=\"0\" max=\"3600\" value=\"0\" style=\"width:92px;\" /></div><button class=\"secondary\" id=\"refresh-runs\" type=\"button\">Refresh</button><button class=\"secondary\" id=\"reset-runs\" type=\"button\">Reset</button></div></div><div id=\"run-list\" class=\"run-list\"></div></section>
     </aside>
     <main class=\"content\"><div id=\"run-view\" class=\"empty\">Start a run or select a previous benchmark from the left.</div></main>
   </div>
