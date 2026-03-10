@@ -417,6 +417,7 @@ class TestDatasetUiApis(unittest.TestCase):
 
     def test_create_dataset_uses_kb_create(self):
         client = self._make_client()
+        client.get_tenant_info = AsyncMock(return_value={"embd_id": "tenant-embd-123"})
         client._request = AsyncMock(return_value={"code": 0, "data": {"kb_id": "kb-123"}})
 
         result = _run(
@@ -435,6 +436,7 @@ class TestDatasetUiApis(unittest.TestCase):
                 "name": "my-ds",
                 "permission": "team",
                 "parser_config": {"enable_metadata": True},
+                "embd_id": "tenant-embd-123",
             },
         )
 

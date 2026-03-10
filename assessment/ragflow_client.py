@@ -172,6 +172,15 @@ class RagflowClient:
                 return body
 
     # ------------------------------------------------------------------
+    # Tenant
+    # ------------------------------------------------------------------
+
+    async def get_tenant_info(self) -> dict[str, Any]:
+        """Fetch tenant info."""
+        body = await self._request("GET", "/v1/user/tenant_info")
+        return body.get("data", {}) if isinstance(body, dict) else {}
+
+    # ------------------------------------------------------------------
     # Dataset
     # ------------------------------------------------------------------
 
@@ -221,6 +230,10 @@ class RagflowClient:
         """Create a dataset through UI KB API and return its ID."""
         payload = {"name": name}
         payload.update(kwargs)
+        if "embd_id" not in payload:
+            tenant_info = await self.get_tenant_info()
+            if tenant_info and "embd_id" in tenant_info:
+                payload["embd_id"] = tenant_info["embd_id"]
         body = await self._request("POST", "/v1/kb/create", json=payload)
         data = body.get("data", {}) if isinstance(body, dict) else {}
         dataset_id = (
