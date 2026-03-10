@@ -77,8 +77,6 @@
 #      env var for multi-worker mode.
 #   7. Merges ELASTIC_INDEX_SETTINGS env var into conf/mapping.json
 #      at container startup (deep-merge into "settings" section).
-#   8. Patches MinIO client to respect 'secure' config setting.
-#   9. Patches MinIO health check to use https when secure is on.
 #
 #   No wrapt, no .pth files.
 #
@@ -438,7 +436,7 @@
 #   INSTALL_DOCLING=0 -> no Docling stage pull
 #   INSTALL_DOCLING=1 -> integrate Docling from DOCLING_SERVE_IMAGE
 ARG INSTALL_DOCLING=0
-ARG RAGFLOW_BASE_IMAGE=infiniflow/ragflow:v0.24.0
+ARG RAGFLOW_BASE_IMAGE=infiniflow/ragflow:nightly
 # Proxy override example:
 #   --build-arg RAGFLOW_BASE_IMAGE=artifactory.cera.com/dockerproxy/infiniflow/ragflow:v0.24.0
 ARG DOCLING_SERVE_IMAGE=ghcr.io/docling-project/docling-serve-cpu:v1.12.0
@@ -457,7 +455,7 @@ ARG NODEJS_ORG_MIRROR=https://nodejs.org
 ARG NODE_VERSION=24.14.0
 ARG NODE_EXTRA_CA_CERT_PEM_B64=""
 ARG REMOVE_PYTHON_PACKAGES="crawl4ai"
-ARG SECURITY_PYTHON_SAFE_SPECS="setuptools==81.0.0 nltk==3.9.3 pdfminer.six==20251230 protobuf==5.29.6 google-cloud-aiplatform==1.133.0 mcp==1.23.0 pillow==12.1.1 python-multipart==0.0.22 pyasn1==0.6.2 azure-core==1.38.0"
+ARG SECURITY_PYTHON_SAFE_SPECS="setuptools==81.0.0 nltk==3.9.3 pdfminer.six==20251230 protobuf==5.29.6 mcp==1.23.0 pillow==12.1.1 python-multipart==0.0.22 pyasn1==0.6.2 azure-core==1.38.1"
 
 # Global uv package index for all installs in this Dockerfile.
 # Override at build time to use a custom mirror:
@@ -1562,19 +1560,7 @@ RUN mkdir -p /ragflow/scripts && \
 # This is immune to upstream renames/refactors of functions or comments.
 RUN sed -i '/^set -e$/a python3 /ragflow/scripts/merge_es_settings.py' /ragflow/entrypoint.sh
 
-# 8. Patch MinIO client to respect 'secure' configuration instead of hardcoding secure=False
-#    Also handles self-signed certificates via MINIO_CERT_CHECK env var (set to "false" to skip verification)
-RUN sed -i 's/secure=False/secure=str(settings.MINIO.get("secure", False)).lower() == "true"/' /ragflow/rag/utils/minio_conn.py
-
-# 9. Patch MinIO health check to use https when secure is enabled
-#    a) Replace hardcoded 'http://' with a dynamic scheme based on MINIO secure setting
-#    b) Add verify= parameter to handle self-signed certificates
-#    NOTE: The sed patterns include 'MINIO' context to avoid modifying other
-#    health check URLs in the same file (e.g. check_ragflow_server_alive).
-RUN sed -i "s|f'http://{settings\.MINIO|f'{\"https\" if str(settings.MINIO.get(\"secure\", False)).lower() == \"true\" else \"http\"}://{settings.MINIO|" /ragflow/api/utils/health_utils.py && \
-    sed -i "s|/minio/health/live')|/minio/health/live', verify=not (str(settings.MINIO.get(\"secure\", False)).lower() == \"true\"))|" /ragflow/api/utils/health_utils.py
-
-# 10. Patch db_models.py — suppress PostgreSQL "column already exists" migration errors
+# 8. Patch db_models.py — suppress PostgreSQL "column already exists" migration errors
 #    The alter_db_add_column function only handles MySQL duplicate column errors
 #    (error code 1060 / message 'Duplicate column name'). PostgreSQL raises a
 #    different exception type with "already exists" message, which falls through
@@ -1583,7 +1569,7 @@ RUN sed -i "s|f'http://{settings\.MINIO|f'{\"https\" if str(settings.MINIO.get(\
 #    harmless "column already exists" during migration.
 RUN sed -i '/except Exception as ex:/{n;/Failed to add/s/        logging.critical/        if "already exists" not in str(ex): logging.critical/}' /ragflow/api/db/db_models.py
 
-# 11. Make crawl4ai optional for agent startup by lazy-importing AsyncWebCrawler.
+# 9. Make crawl4ai optional for agent startup by lazy-importing AsyncWebCrawler.
 RUN python3 - <<'PY'
 from pathlib import Path
 
@@ -1613,7 +1599,7 @@ if needle in text:
 path.write_text(text)
 PY
 
-# 12. OpenTelemetry Log Forwarding — official SDK LoggingHandler
+# 10. OpenTelemetry Log Forwarding — official SDK LoggingHandler
 #     Uses the official opentelemetry-sdk LoggingHandler to capture Python
 #     log records at the source and export them as OTLP log entries.
 #     No file tailing, no sidecar, no external collector binary.
@@ -1780,20 +1766,20 @@ else:
 PY
 
 ## REDIS (VALKEY) OTEL DOES NOT WORK
-## 12. Patch redis_conn.py — instrument Valkey (Redis)
+## 11. Patch redis_conn.py — instrument Valkey (Redis)
 ##    RAGFlow uses 'valkey' as the Redis client, but imports it as 'redis'.
 ##    Standard OTel Redis instrumentation targets the 'redis' library.
 ##    We manually trigger the RedisInstrumentor on the 'valkey' module.
 #RUN sed -i '/import valkey as redis/a try:\n    import sys\n    sys.modules["redis"] = redis\n    from opentelemetry.instrumentation.redis import RedisInstrumentor\n    print("OTEL: Attempting to instrument Valkey (Redis)...")\n    RedisInstrumentor().instrument(redis_module=redis)\n    print("OTEL: Valkey instrumented successfully")\nexcept Exception as e:\n    print(f"OTEL: Valkey instrumentation failed: {e}")' /ragflow/rag/utils/redis_conn.py
 
-# 13. Security and compliance remediation bundle (single maintenance section):
+# 12. Security and compliance remediation bundle (single maintenance section):
 #    Keep this block updated as new Prisma findings arrive.
 #    - OS/OpenSSL refresh (including legacy libssl1.1 removal)
 #    - Node.js runtime refresh from NODEJS_ORG_MIRROR (fixes Node engine CVEs)
 #    - Keep bundled Apache Tika 3.2.3 + replace embedded jackson-core for GHSA fixes
 #    - Targeted Python package minimum versions for known CVEs
-# 13.1 OS/OpenSSL refresh (including legacy libssl1.1 removal)
-# 13.2 Node.js runtime refresh from NODEJS_ORG_MIRROR (implemented in the same RUN below)
+# 12.1 OS/OpenSSL refresh (including legacy libssl1.1 removal)
+# 12.2 Node.js runtime refresh from NODEJS_ORG_MIRROR (implemented in the same RUN below)
 RUN set -eux; \
     export DEBIAN_FRONTEND=noninteractive; \
     APT_MIRROR_HOST="$(echo "${APT_MIRROR_URL}" | sed -E 's#https?://([^/]+)/?.*#\1#')"; \
@@ -1875,7 +1861,7 @@ RUN set -eux; \
 	    apt-get autoremove -y; \
 	    rm -rf /var/lib/apt/lists/*
 
-# 13.3 Keep bundled Apache Tika 3.2.3 + replace embedded jackson-core for GHSA fixes
+# 12.3 Keep bundled Apache Tika 3.2.3 + replace embedded jackson-core for GHSA fixes
 RUN set -eux; \
 	    JACKSON_CORE_SAFE_VERSION="2.21.1"; \
 	    JACKSON_CORE_URL="${MAVEN_REPO_BASE_URL%/}/com/fasterxml/jackson/core/jackson-core/${JACKSON_CORE_SAFE_VERSION}/jackson-core-${JACKSON_CORE_SAFE_VERSION}.jar"; \
@@ -1962,7 +1948,7 @@ PY
 RUN rm -f /tmp/jackson-core.jar
 ENV TIKA_SERVER_JAR="file:///ragflow/tika-server-standard.jar"
 
-# 13.4 Targeted Python package minimum versions for known CVEs
+# 12.4 Targeted Python package minimum versions for known CVEs
 RUN /ragflow/.venv/bin/python3 - <<'PY'
 import importlib.metadata as md
 import os
@@ -2025,7 +2011,7 @@ if to_reinstall_specs:
     ])
 PY
 
-# 14. Compliance hardening:
+# 13. Compliance hardening:
 #    - remove bundled RAGFlow keypair from image (mount keys at runtime instead)
 #    - remove known non-runtime private keys shipped by third-party packages
 RUN set -eux; \
@@ -2036,14 +2022,14 @@ RUN set -eux; \
 
 
 
-# 15. Optional Docling integration
+# 14. Optional Docling integration
 #     INSTALL_DOCLING and DOCLING_SERVE_IMAGE are defined once at top.
 #     Keep all Docling-specific logic contained in this block.
 
-# 15.1 Variant without Docling
+# 14.1 Variant without Docling
 FROM runtime_base AS runtime_0
 
-# 15.2 Variant with Docling (only built when INSTALL_DOCLING=1 is selected below)
+# 14.2 Variant with Docling (only built when INSTALL_DOCLING=1 is selected below)
 FROM ${DOCLING_SERVE_IMAGE} AS docling_serve
 
 FROM runtime_base AS runtime_1
@@ -2232,7 +2218,7 @@ ENV DOCLING_CACHE_DIR=/ragflow/.cache/docling \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1
 
-# 15.3 Final selector:
+# 14.3 Final selector:
 #   INSTALL_DOCLING=0 -> runtime_0 (does not pull Docling stage)
 #   INSTALL_DOCLING=1 -> runtime_1 (pulls Docling stage and integrates package)
 FROM runtime_${INSTALL_DOCLING}
