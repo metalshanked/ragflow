@@ -1228,6 +1228,202 @@ def build_run_report(run: dict[str, Any]) -> bytes:
     return buffer.getvalue()
 
 
+def build_batch_report(batch_id: str, runs: list[dict[str, Any]]) -> bytes:
+    ordered_runs = sorted(runs, key=lambda run: safe_int(run.get("config", {}).get("batch", {}).get("run_index"), 0))
+    batch_summary = next((run.get("batch_summary") for run in ordered_runs if run.get("batch_summary")), {}) or {}
+    aggregate = batch_summary.get("aggregate") or summarize_batch_metrics(ordered_runs)
+    llm_summary = ((batch_summary.get("llm_assessment") or {}).get("content")) or ""
+    representative = ordered_runs[0] if ordered_runs else {}
+
+    document = Document()
+    document.core_properties.title = f"RAGFlow Batch Performance Report - {batch_id}"
+    document.core_properties.subject = "Batch performance benchmark results"
+
+    title = document.add_heading("RAGFlow Batch Performance Report", level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    subtitle = document.add_paragraph(f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    document.add_heading("Batch Overview", level=1)
+    add_table(
+        document,
+        ["Field", "Value"],
+        [
+            ["Batch ID", batch_id],
+            ["Dataset Prefix", representative.get("config", {}).get("dataset_prefix")],
+            ["Host", representative.get("config", {}).get("base_url")],
+            ["Requested Parallel Runs", representative.get("config", {}).get("batch", {}).get("parallel_count")],
+            ["Total Runs", aggregate.get("total_runs", len(ordered_runs))],
+            ["Completed Runs", aggregate.get("completed_runs", 0)],
+            ["Failed Runs", aggregate.get("failed_runs", 0)],
+            ["Average Parse Wall (s)", aggregate.get("avg_parse_wall_time_sec", 0)],
+            ["Average Retrieval P95 (ms)", aggregate.get("avg_retrieval_p95_ms", 0)],
+            ["Average Chat P95 (ms)", aggregate.get("avg_chat_p95_ms", 0)],
+            ["Average Chat Error Rate", f"{safe_float(aggregate.get('avg_chat_error_rate')) * 100:.2f}%"],
+            ["Average Chat Token Throughput (tok/s)", aggregate.get("avg_chat_tokens_per_sec", 0)],
+        ],
+    )
+
+    if llm_summary:
+        document.add_heading("Batch Executive Summary", level=1)
+        document.add_paragraph(llm_summary)
+
+    document.add_heading("Batch Run Table", level=1)
+    add_table(
+        document,
+        ["Run", "Status", "Dataset", "Parse Wall (s)", "Retrieval P95 (ms)", "Chat P95 (ms)", "Chat Error Rate"],
+        [
+            [
+                safe_int(run.get("config", {}).get("batch", {}).get("run_index"), 0),
+                run.get("status"),
+                run.get("dataset", {}).get("name"),
+                safe_float(run.get("summary", {}).get("parse_wall_time_sec")),
+                safe_float(run.get("summary", {}).get("retrieval_p95_ms")),
+                safe_float(run.get("summary", {}).get("chat_p95_ms")),
+                f"{safe_float(run.get('summary', {}).get('chat_error_rate')) * 100:.2f}%",
+            ]
+            for run in ordered_runs
+        ],
+    )
+
+    for index, run in enumerate(ordered_runs, start=1):
+        document.add_page_break()
+        run_title = f"Run {safe_int(run.get('config', {}).get('batch', {}).get('run_index'), index)}"
+        dataset_name = (run.get("dataset") or {}).get("name")
+        if dataset_name:
+            run_title = f"{run_title} - {dataset_name}"
+        document.add_heading(run_title, level=1)
+
+        add_table(
+            document,
+            ["Field", "Value"],
+            [
+                ["Run ID", run.get("id")],
+                ["Status", run.get("status")],
+                ["Phase", run.get("phase")],
+                ["Started", run.get("started_at")],
+                ["Completed", run.get("completed_at")],
+                ["Dataset", dataset_name],
+                ["Dataset ID", (run.get("dataset") or {}).get("id")],
+            ],
+        )
+
+        summary = run.get("summary") or {}
+        parse = run.get("parse") or {}
+        retrieval = run.get("retrieval") or {"summary": {}}
+        chat = run.get("chat_results") or {"summary": {}}
+        document.add_heading("Key Metrics", level=2)
+        add_table(
+            document,
+            ["Metric", "Value"],
+            [
+                ["Documents", summary.get("documents", 0)],
+                ["Prompts", summary.get("prompts", 0)],
+                ["Parse Wall Time (s)", summary.get("parse_wall_time_sec", 0)],
+                ["Parse P95 by Document (s)", parse.get("p95_parse_duration_sec", 0)],
+                ["Retrieval P95 (ms)", (retrieval.get("summary") or {}).get("p95_latency_ms", 0)],
+                ["Chat P95 (ms)", (chat.get("summary") or {}).get("p95_latency_ms", 0)],
+                ["Chat Error Rate", f"{safe_float(summary.get('chat_error_rate')) * 100:.2f}%"],
+                ["Chat Token Throughput (tok/s)", summary.get("chat_tokens_per_sec", 0)],
+            ],
+        )
+
+        run_assessment = ((run.get("analysis") or {}).get("llm_assessment") or {}).get("content")
+        if run_assessment:
+            document.add_heading("Run Executive Summary", level=2)
+            document.add_paragraph(run_assessment)
+
+        timeline = run.get("timeline") or []
+        if timeline:
+            document.add_heading("Execution Stage Timeline", level=2)
+            add_table(
+                document,
+                ["Stage", "Status", "Duration (s)", "Started", "Completed"],
+                [
+                    [
+                        stage.get("label") or stage.get("key"),
+                        stage.get("status"),
+                        safe_float(stage.get("duration_sec")),
+                        stage.get("started_at"),
+                        stage.get("completed_at"),
+                    ]
+                    for stage in timeline
+                ],
+            )
+
+        documents = parse.get("documents") or []
+        if documents:
+            document.add_heading("Parsed Documents", level=2)
+            add_table(
+                document,
+                ["Document", "Status", "Chunks", "Tokens", "Duration (s)"],
+                [
+                    [
+                        doc.get("name"),
+                        doc.get("run"),
+                        safe_int(doc.get("chunk_count")),
+                        safe_int(doc.get("token_count")),
+                        safe_float(doc.get("process_duration")),
+                    ]
+                    for doc in documents
+                ],
+            )
+
+        prompts = run.get("prompts") or []
+        if prompts:
+            document.add_heading("Generated Prompts", level=2)
+            for item in prompts:
+                document.add_paragraph(f"[{item.get('kind')}] {item.get('prompt')}")
+
+        retrieval_results = retrieval.get("results") or []
+        if retrieval_results:
+            document.add_heading("Retrieval Samples", level=2)
+            add_table(
+                document,
+                ["Prompt", "Latency (ms)", "Chunks", "Top Documents", "Status"],
+                [
+                    [
+                        item.get("prompt"),
+                        safe_float(item.get("latency_ms")),
+                        safe_int(item.get("chunk_count")),
+                        ", ".join(item.get("top_documents") or []),
+                        "ok" if item.get("ok") else f"error: {item.get('error')}",
+                    ]
+                    for item in retrieval_results
+                ],
+            )
+
+        chat_results = chat.get("results") or []
+        if chat_results:
+            document.add_heading("Chat Samples", level=2)
+            add_table(
+                document,
+                ["Prompt", "Latency (ms)", "Tokens", "Referenced Docs", "Status"],
+                [
+                    [
+                        item.get("prompt"),
+                        safe_float(item.get("latency_ms")),
+                        safe_int(item.get("total_tokens")),
+                        ", ".join(item.get("referenced_documents") or []),
+                        "ok" if item.get("ok") else f"error: {item.get('error')}",
+                    ]
+                    for item in chat_results
+                ],
+            )
+
+    for section in document.sections:
+        section.top_margin = Inches(0.6)
+        section.bottom_margin = Inches(0.6)
+        section.left_margin = Inches(0.7)
+        section.right_margin = Inches(0.7)
+    document.styles["Normal"].font.name = "Calibri"
+    document.styles["Normal"].font.size = Pt(10)
+
+    buffer = BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
 def summarize_batch_metrics(runs: list[dict[str, Any]]) -> dict[str, Any]:
     parse_times = [safe_float(run.get("summary", {}).get("parse_wall_time_sec")) for run in runs if safe_float(run.get("summary", {}).get("parse_wall_time_sec")) > 0]
     retrieval_p95 = [safe_float(run.get("summary", {}).get("retrieval_p95_ms")) for run in runs if safe_float(run.get("summary", {}).get("retrieval_p95_ms")) > 0]
@@ -2109,7 +2305,7 @@ function getRun(runId) { return state.runs.find((item) => item.id === runId) || 
 function getBatchRuns(batchId) { if (!batchId) return []; return state.runs.filter((item) => item.config?.batch?.batch_id === batchId).sort((a, b) => Number(a.config?.batch?.run_index || 0) - Number(b.config?.batch?.run_index || 0)); }
 function summarizeBatchRuns(batchRuns) { const average = (values) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0; const valuesFor = (field) => batchRuns.map((run) => Number(run.summary?.[field] || 0)).filter((value) => value > 0); return { total_runs: batchRuns.length, completed_runs: batchRuns.filter((run) => (run.status || '').toLowerCase() === 'completed').length, failed_runs: batchRuns.filter((run) => (run.status || '').toLowerCase() === 'failed').length, avg_parse_wall_time_sec: average(valuesFor('parse_wall_time_sec')), avg_retrieval_p95_ms: average(valuesFor('retrieval_p95_ms')), max_retrieval_p95_ms: valuesFor('retrieval_p95_ms').length ? Math.max(...valuesFor('retrieval_p95_ms')) : 0, avg_chat_p95_ms: average(valuesFor('chat_p95_ms')), max_chat_p95_ms: valuesFor('chat_p95_ms').length ? Math.max(...valuesFor('chat_p95_ms')) : 0, avg_chat_error_rate: average(batchRuns.map((run) => Number(run.summary?.chat_error_rate || 0))), avg_chat_tokens_per_sec: average(valuesFor('chat_tokens_per_sec')) }; }
 function renderBatchTabs(batchRuns, activeTab) { if (batchRuns.length <= 1) return ''; return `<div class=\"tabs\"><button class=\"tab ${activeTab === 'overview' ? 'active' : ''}\" data-batch-tab=\"overview\" type=\"button\">Batch Overview</button>${batchRuns.map((run) => `<button class=\"tab ${activeTab === run.id ? 'active' : ''}\" data-batch-tab=\"${run.id}\" type=\"button\">Run ${run.config?.batch?.run_index || '?'}</button>`).join('')}</div>`; }
-function renderBatchOverview(run, batchRuns) { const batch = run.config?.batch || {}; const batchSummary = batchRuns.find((item) => item.batch_summary?.aggregate || item.batch_summary?.llm_assessment)?.batch_summary || {}; const aggregate = batchSummary.aggregate || summarizeBatchRuns(batchRuns); const llm = batchSummary.llm_assessment?.content || ''; const rows = batchRuns.map((item) => [String(item.config?.batch?.run_index || '-'), statusBadge(item.status), escapeHtml(item.dataset?.name || item.config?.dataset_prefix || '-'), `${number(item.summary?.parse_wall_time_sec || 0)} s`, `${number(item.summary?.retrieval_p95_ms || 0)} ms`, `${number(item.summary?.chat_p95_ms || 0)} ms`, `${number((item.summary?.chat_error_rate || 0) * 100)}%`, item.error ? `<span style=\"color:var(--bad);\">${escapeHtml(item.error)}</span>` : '-']); return `<div style=\"display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:18px;\"><div><div style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap;\"><h2 style=\"margin:0;font-size:34px;letter-spacing:-.06em;\">${escapeHtml(run.config?.dataset_prefix || 'Batch')} batch</h2>${statusBadge(aggregate.failed_runs ? 'failed' : (aggregate.completed_runs === aggregate.total_runs ? 'completed' : 'running'))}</div><div class=\"subtle\" style=\"margin-top:6px;\">${escapeHtml(batch.batch_id || '-')} • ${batch.parallel_count || batch.run_count || batchRuns.length} runs • host ${escapeHtml(run.config?.base_url || '-')}</div></div><div class=\"subtle\" style=\"text-align:right;\"><div>First start: ${formatTs(batchRuns[0]?.started_at || batchRuns[0]?.created_at)}</div><div>Latest completion: ${formatTs(batchRuns[batchRuns.length - 1]?.completed_at)}</div></div></div><section class=\"grid\">${metricCard('Runs', aggregate.total_runs || batchRuns.length, `${aggregate.completed_runs || 0} completed • ${aggregate.failed_runs || 0} failed`)}${metricCard('Avg Parse Wall', `${number(aggregate.avg_parse_wall_time_sec || 0)} s`, 'wall time per run')}${metricCard('Avg Retrieval P95', `${number(aggregate.avg_retrieval_p95_ms || 0)} ms`, `max ${number(aggregate.max_retrieval_p95_ms || 0)} ms`)}${metricCard('Avg Chat P95', `${number(aggregate.avg_chat_p95_ms || 0)} ms`, `max ${number(aggregate.max_chat_p95_ms || 0)} ms`)}${metricCard('Avg Chat Error Rate', `${number((aggregate.avg_chat_error_rate || 0) * 100)}%`, `${number(aggregate.avg_chat_tokens_per_sec || 0)} tok/s`)}<div class=\"card span12\"><h3>Batch Executive Summary</h3><div class=\"subtle\">${llm ? 'Generated by the configured RAGFlow chat model after the batch finished.' : 'This appears after every run in the batch reaches a terminal state.'}</div>${llm ? `<div class=\"prose\">${escapeHtml(llm)}</div>` : ''}</div><div class=\"card span12\"><h3>Batch Run Table</h3>${renderPaginatedTable(`batch-${batch.batch_id || 'default'}-runs`, ['run','status','dataset','parse wall','retrieval p95','chat p95','chat errors','error'], rows, 10)}</div></section>`; }
+function renderBatchOverview(run, batchRuns) { const batch = run.config?.batch || {}; const batchSummary = batchRuns.find((item) => item.batch_summary?.aggregate || item.batch_summary?.llm_assessment)?.batch_summary || {}; const aggregate = batchSummary.aggregate || summarizeBatchRuns(batchRuns); const llm = batchSummary.llm_assessment?.content || ''; const rows = batchRuns.map((item) => [String(item.config?.batch?.run_index || '-'), statusBadge(item.status), escapeHtml(item.dataset?.name || item.config?.dataset_prefix || '-'), `${number(item.summary?.parse_wall_time_sec || 0)} s`, `${number(item.summary?.retrieval_p95_ms || 0)} ms`, `${number(item.summary?.chat_p95_ms || 0)} ms`, `${number((item.summary?.chat_error_rate || 0) * 100)}%`, item.error ? `<span style=\"color:var(--bad);\">${escapeHtml(item.error)}</span>` : '-']); return `<div style=\"display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:18px;\"><div><div style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap;\"><h2 style=\"margin:0;font-size:34px;letter-spacing:-.06em;\">${escapeHtml(run.config?.dataset_prefix || 'Batch')} batch</h2>${statusBadge(aggregate.failed_runs ? 'failed' : (aggregate.completed_runs === aggregate.total_runs ? 'completed' : 'running'))}</div><div class=\"subtle\" style=\"margin-top:6px;\">${escapeHtml(batch.batch_id || '-')} • ${batch.parallel_count || batch.run_count || batchRuns.length} runs • host ${escapeHtml(run.config?.base_url || '-')}</div></div><div style=\"display:grid;justify-items:end;gap:8px;\"><div class=\"subtle\" style=\"text-align:right;\"><div>First start: ${formatTs(batchRuns[0]?.started_at || batchRuns[0]?.created_at)}</div><div>Latest completion: ${formatTs(batchRuns[batchRuns.length - 1]?.completed_at)}</div></div><button class=\"secondary\" type=\"button\" data-download-batch=\"${escapeHtml(batch.batch_id || '')}\">Download Batch Word Report</button></div></div><section class=\"grid\">${metricCard('Runs', aggregate.total_runs || batchRuns.length, `${aggregate.completed_runs || 0} completed • ${aggregate.failed_runs || 0} failed`)}${metricCard('Avg Parse Wall', `${number(aggregate.avg_parse_wall_time_sec || 0)} s`, 'wall time per run')}${metricCard('Avg Retrieval P95', `${number(aggregate.avg_retrieval_p95_ms || 0)} ms`, `max ${number(aggregate.max_retrieval_p95_ms || 0)} ms`)}${metricCard('Avg Chat P95', `${number(aggregate.avg_chat_p95_ms || 0)} ms`, `max ${number(aggregate.max_chat_p95_ms || 0)} ms`)}${metricCard('Avg Chat Error Rate', `${number((aggregate.avg_chat_error_rate || 0) * 100)}%`, `${number(aggregate.avg_chat_tokens_per_sec || 0)} tok/s`)}<div class=\"card span12\"><h3>Batch Executive Summary</h3><div class=\"subtle\">${llm ? 'Generated by the configured RAGFlow chat model after the batch finished.' : 'This appears after every run in the batch reaches a terminal state.'}</div>${llm ? `<div class=\"prose\">${escapeHtml(llm)}</div>` : ''}</div><div class=\"card span12\"><h3>Batch Run Table</h3>${renderPaginatedTable(`batch-${batch.batch_id || 'default'}-runs`, ['run','status','dataset','parse wall','retrieval p95','chat p95','chat errors','error'], rows, 10)}</div></section>`; }
 function attachBatchTabHandlers(container, run, batchRuns) { const batch = run.config?.batch || {}; if ((batch.run_count || 1) <= 1 || !batch.batch_id) return; container.querySelectorAll('[data-batch-tab]').forEach((element) => element.addEventListener('click', async () => { const tab = element.getAttribute('data-batch-tab'); state.activeBatchTabs[batch.batch_id] = tab; if (tab && tab !== 'overview') { state.activeRunId = tab; persistActiveRun(); const selected = getRun(tab); renderRunView(selected || run); if (selected && ['queued', 'running'].includes((selected.status || '').toLowerCase())) startPolling(tab); else stopPolling(); } else { const liveRun = batchRuns.find((item) => ['queued', 'running'].includes((item.status || '').toLowerCase())); state.activeRunId = liveRun?.id || run.id; persistActiveRun(); renderRunView(run); if (liveRun) startPolling(liveRun.id); else stopPolling(); } renderRunList(); })); }
 function attachPaginationHandlers(container) { container.querySelectorAll('[data-table-id][data-table-page]').forEach((element) => element.addEventListener('click', () => { const tableId = element.getAttribute('data-table-id'); const page = Number(element.getAttribute('data-table-page') || 1); state.tablePages[tableId] = page; const active = getRun(state.activeRunId); if (active) renderRunView(active); })); }
 function attachChartPaginationHandlers(container) { container.querySelectorAll('[data-chart-id][data-chart-page]').forEach((element) => element.addEventListener('click', () => { const chartId = element.getAttribute('data-chart-id'); const page = Number(element.getAttribute('data-chart-page') || 1); state.chartPages[chartId] = page; const active = getRun(state.activeRunId); if (active) renderRunView(active); })); }
@@ -2154,7 +2350,7 @@ function renderRunView(run) {
   const summaryCard = run.analysis?.llm_assessment?.content ? `<div class=\"card span12\"><h3>Executive Summary</h3><div class=\"subtle\">Generated by the configured RAGFlow chat model.</div><div class=\"prose\">${escapeHtml(run.analysis.llm_assessment.content)}</div></div>` : '';
   container.innerHTML = `
     ${renderBatchTabs(batchRuns, activeBatchTab)}
-    <div style=\"display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:18px;\"><div><div style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap;\"><h2 style=\"margin:0;font-size:34px;letter-spacing:-.06em;\">${run.dataset?.name || 'Pending run'}</h2>${statusBadge(run.status)}</div><div class=\"subtle\" style=\"margin-top:6px;\">${run.dataset?.id || '-'} • ${run.phase || '-'}${batchLabel} • ${run.error ? `<span style=\"color:var(--bad);\">${run.error}</span>` : 'no fatal error'}</div></div><div style=\"display:grid;justify-items:end;gap:8px;\"><div class=\"subtle\" style=\"text-align:right;\"><div>Started: ${formatTs(run.started_at || run.created_at)}</div><div>Completed: ${formatTs(run.completed_at)}</div><div>Host: ${run.config?.base_url || '-'}</div></div><button class=\"secondary\" type=\"button\" data-download-run=\"${run.id}\">Download Word Report</button></div></div>
+    <div style=\"display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:18px;\"><div><div style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap;\"><h2 style=\"margin:0;font-size:34px;letter-spacing:-.06em;\">${run.dataset?.name || 'Pending run'}</h2>${statusBadge(run.status)}</div><div class=\"subtle\" style=\"margin-top:6px;\">${run.dataset?.id || '-'} • ${run.phase || '-'}${batchLabel} • ${run.error ? `<span style=\"color:var(--bad);\">${run.error}</span>` : 'no fatal error'}</div></div><div class=\"subtle\" style=\"text-align:right;\"><div>Started: ${formatTs(run.started_at || run.created_at)}</div><div>Completed: ${formatTs(run.completed_at)}</div><div>Host: ${run.config?.base_url || '-'}</div></div></div>
     <section class=\"card\" style=\"margin-bottom:16px;\"><div style=\"display:flex;justify-content:space-between;gap:10px;align-items:center;\"><div><h3 style=\"margin:0 0 6px;\">Live Progress</h3><div class=\"subtle\">${live.parse_completed || 0}/${live.parse_total || 0} parsed • ${live.retrieval_completed || 0}/${live.retrieval_total || 0} retrievals • ${live.chat_completed || 0}/${live.chat_total || 0} chats</div></div><div style=\"font-size:30px;font-weight:800;letter-spacing:-.05em;\">${Number(run.progress || 0)}%</div></div><div class=\"progress\"><div style=\"width:${Math.max(2, Number(run.progress || 0))}%\"></div></div><div class=\"subtle\">${events.length ? events[events.length - 1].message : 'Waiting for updates.'}</div></section>
     <section class=\"grid\">
       ${metricCard('Documents', run.summary?.documents || parse.total_documents || 0, parsingEnabled ? `${parse.total_chunks || 0} chunks • ${parse.total_tokens || 0} tokens indexed` : 'uploaded files only')}
@@ -2179,7 +2375,7 @@ function renderRunView(run) {
   attachBatchTabHandlers(container, run, batchRuns);
   attachPaginationHandlers(container);
   attachChartPaginationHandlers(container);
-  container.querySelectorAll('[data-download-run]').forEach((element) => element.addEventListener('click', () => { window.location.href = `${BASE_PATH}/api/runs/${element.getAttribute('data-download-run')}/report.docx`; }));
+  container.querySelectorAll('[data-download-batch]').forEach((element) => element.addEventListener('click', () => { window.location.href = `${BASE_PATH}/api/batches/${element.getAttribute('data-download-batch')}/report.docx`; }));
 }
 document.getElementById('refresh-runs').addEventListener('click', fetchRuns);
 document.getElementById('reset-runs').addEventListener('click', async () => { if (!window.confirm('Clear all stored run results from this app? Active configs in local storage will be kept.')) return; const response = await fetch(`${BASE_PATH}/api/runs/reset`, { method: 'POST' }); const payload = await response.json(); if (!response.ok || payload.error) { alert(payload.error || 'Unable to reset runs.'); return; } state.activeRunId = null; state.activeBatchTabs = {}; persistActiveRun(); stopPolling(); document.getElementById('run-view').innerHTML = `<div class=\"empty\">Start a run or select a previous benchmark from the left.</div>`; await fetchRuns(); });
@@ -2233,6 +2429,25 @@ async def download_run_report(run_id: str) -> Any:
 
     report_bytes = build_run_report(run)
     filename = f"ragflow-performance-{run_id}.docx"
+    return Response(
+        report_bytes,
+        headers={
+            "Content-Type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(report_bytes)),
+        },
+    )
+
+
+@app.get(route_path("/api/batches/<batch_id>/report.docx"))
+async def download_batch_report(batch_id: str) -> Any:
+    with RUNS_LOCK:
+        batch_runs = [json_clone(run) for run in RUNS.values() if run.get("config", {}).get("batch", {}).get("batch_id") == batch_id]
+    if not batch_runs:
+        return jsonify({"error": "Batch not found"}), 404
+
+    report_bytes = build_batch_report(batch_id, batch_runs)
+    filename = f"ragflow-performance-batch-{batch_id}.docx"
     return Response(
         report_bytes,
         headers={
