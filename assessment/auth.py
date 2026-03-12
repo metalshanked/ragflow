@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import json
+import logging
 import re
 import ssl
 from datetime import datetime, timedelta, timezone
@@ -40,6 +41,7 @@ ROLE_VIEWER = "viewer"
 ROLE_OPERATOR = "operator"
 ROLE_ADMIN = "admin"
 KNOWN_ROLES = (ROLE_VIEWER, ROLE_OPERATOR, ROLE_ADMIN)
+logger = logging.getLogger(__name__)
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -243,6 +245,14 @@ def _ldap_server() -> Server:
             validate=ssl.CERT_REQUIRED if settings.ldap_verify_ssl else ssl.CERT_NONE,
             ca_certs_file=settings.ldap_ca_cert or None,
         )
+    logger.debug(
+        "Initializing LDAP server connection uri=%s use_ssl=%s start_tls=%s verify_ssl=%s timeout=%s",
+        settings.ldap_server_uri,
+        settings.ldap_use_ssl,
+        settings.ldap_start_tls,
+        settings.ldap_verify_ssl,
+        settings.ldap_connect_timeout_seconds,
+    )
     return Server(
         settings.ldap_server_uri,
         use_ssl=settings.ldap_use_ssl,
@@ -291,6 +301,12 @@ def _search_user(conn: Connection, username: str) -> tuple[str, list[str]]:
 
     safe_username = escape_filter_chars(username)
     filter_expr = settings.ldap_user_filter.format(username=safe_username)
+    logger.debug(
+        "LDAP user search base_dn=%s filter=%s username=%s",
+        settings.ldap_user_base_dn,
+        filter_expr,
+        username,
+    )
     attributes = [settings.ldap_group_member_attribute, "cn"]
     ok = conn.search(
         search_base=settings.ldap_user_base_dn,
@@ -319,6 +335,13 @@ def _search_groups(conn: Connection, username: str, user_dn: str) -> list[str]:
     filter_expr = settings.ldap_group_search_filter.format(
         username=safe_username,
         user_dn=safe_user_dn,
+    )
+    logger.debug(
+        "LDAP group search base_dn=%s filter=%s username=%s user_dn=%s",
+        settings.ldap_group_search_base_dn,
+        filter_expr,
+        username,
+        user_dn,
     )
     attrs = [settings.ldap_group_name_attribute]
     ok = conn.search(
@@ -373,6 +396,7 @@ def _ldap_authenticate_sync(username: str, password: str) -> tuple[list[str], li
 
     try:
         if settings.ldap_user_dn_template.strip():
+            logger.debug("LDAP auth using direct bind template for user=%s", username)
             user_dn = settings.ldap_user_dn_template.format(username=username)
             user_conn = Connection(
                 server,
@@ -402,6 +426,11 @@ def _ldap_authenticate_sync(username: str, password: str) -> tuple[list[str], li
                 _, groups = _search_user(search_conn, username)
                 groups.extend(_search_groups(search_conn, username, user_dn))
         else:
+            logger.debug(
+                "LDAP auth using search bind mode for user=%s bind_dn_configured=%s",
+                username,
+                bool(settings.ldap_bind_dn.strip()),
+            )
             if settings.ldap_bind_dn.strip():
                 search_conn = Connection(
                     server,
@@ -432,6 +461,13 @@ def _ldap_authenticate_sync(username: str, password: str) -> tuple[list[str], li
         # Deduplicate while preserving order.
         dedup_groups = list(dict.fromkeys(g for g in groups if g and str(g).strip()))
         roles = _resolve_roles(dedup_groups)
+        logger.debug(
+            "LDAP auth resolved user=%s user_dn=%s groups=%s roles=%s",
+            username,
+            user_dn,
+            dedup_groups,
+            roles,
+        )
 
         if settings.ldap_require_mapped_roles and not roles:
             raise HTTPException(
@@ -439,9 +475,28 @@ def _ldap_authenticate_sync(username: str, password: str) -> tuple[list[str], li
                 detail="User is authenticated but has no mapped roles.",
             )
         return dedup_groups, roles
-    except HTTPException:
+    except HTTPException as exc:
+        if 400 <= exc.status_code < 500:
+            logger.warning(
+                "LDAP authentication rejected user=%s status=%s detail=%s",
+                username,
+                exc.status_code,
+                exc.detail,
+            )
+        else:
+            logger.exception(
+                "LDAP authentication failed for user=%s with HTTP error status=%s",
+                username,
+                exc.status_code,
+            )
         raise
-    except LDAPException:
+    except LDAPException as exc:
+        logger.warning(
+            "LDAP bind/search failed for user=%s: %s",
+            username,
+            exc,
+            exc_info=logger.isEnabledFor(logging.DEBUG),
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid username or password",
@@ -513,7 +568,25 @@ async def get_token(req: LoginRequest):
             detail="LDAP auth is not configured (missing ASSESSMENT_LDAP_SERVER_URI).",
         )
 
-    groups, roles = await _ldap_authenticate(req.username.strip(), req.password)
+    username = req.username.strip()
+    logger.debug("LDAP login requested for user=%s", username)
+    try:
+        groups, roles = await _ldap_authenticate(username, req.password)
+    except HTTPException as exc:
+        if 400 <= exc.status_code < 500:
+            logger.warning(
+                "LDAP login request denied for user=%s status=%s detail=%s",
+                username,
+                exc.status_code,
+                exc.detail,
+            )
+        else:
+            logger.exception(
+                "LDAP login request failed for user=%s with HTTP status=%s",
+                username,
+                exc.status_code,
+            )
+        raise
     access_ttl = max(1, settings.jwt_access_token_ttl_minutes)
     refresh_ttl = max(1, settings.jwt_refresh_token_ttl_minutes)
 
@@ -531,13 +604,14 @@ async def get_token(req: LoginRequest):
         token_type="refresh",
         ttl_minutes=refresh_ttl,
     )
+    logger.debug("LDAP login succeeded for user=%s roles=%s", username, roles)
 
     return TokenResponse(
         access_token=access_token,
         refresh_token=refresh_token,
         expires_in=access_ttl * 60,
         refresh_expires_in=refresh_ttl * 60,
-        username=req.username.strip(),
+        username=username,
         roles=roles,
         groups=groups,
     )

@@ -33,6 +33,9 @@ APP_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" 
 APP_FAVICON_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAACBElEQVR42sWWa0tUURSG9y+a+/0+0y8xEiOSQhRFFEMSRZQikiKURJQiFEW832acNLOLpd2vVpqjWf6Ft3Xmg1DOWnNm3HBeWJ+fZ5+z91pLnak4QursH6TO/Uay8hDJql9Inj9A4sI+EhdzSFTvIX7pJ+KXdxGv2UWsdgexuh+I1X9HtOEboo3biDZ9RaT5CyItnxG58gnhVqqrHxFu+4BQ+3uEOt4h1PkWwa43CHa/RvDaKwSubyFwYwvKSnjg5iYJWAj397yEshLuv/WCBCyE+29vkIAA15HtHFi4785zKOnkOuB5AQbu631GAsJn1wHPCzBwX99TEhD+uQ64URzce/cJlHThdMDzAgzc279OAsJt/z+2lanjKkmAgXsHHpOA8NQ4gVLDwT2DJCC980IC5YSDe4bWSEBoMlKMIWaUKQEG7rn3iASEDmdGwIwEB3ffX4WS2muxmJXg4O4HKyQg9HYzMSPBwd3DD0lAGCxmU0yCg7tGslDSVCslkgQHd40uk4AwUksNJ8HBneNpKGmZKDcnBBi4c8IQEDaZ0+QfAQbunFwiAWGN0hUO7phehJJ2OG0CDNwxs0ACwgKpTYCBO+bmSUDYXnWFg9sX5qDMrM7SPJeajHRyA25fnCUBC+H29AwJWAi3ZaahrITbslMkYCHcWPH+AiMzXFUS3KaoAAAAAElFTkSuQmCC"
 )
+APP_FAVICON_ICO = base64.b64decode(
+    "AAABAAEAICAAAAEAIAAxAgAAFgAAAIlQTkcNChoKAAAADUlIRFIAAAAgAAAAIAgGAAAAc3p69AAAAgRJREFUeNrFlmtLVFEUhvcvmvv9PtMvMRIjkkIURRRDEkWUIpIilESUIhRFvN9mnDSzi6Xdr1aao1n+hbd15oNQzlpzZtxwXlifn2efs/daS52pOELq7B+kzv1GsvIQyapfSJ4/QOLCPhIXc0hU7yF+6Sfil3cRr9lFrHYHsbofiNV/R7ThG6KN24g2fUWk+QsiLZ8RufIJ4Vaqqx8RbvuAUPt7hDreIdT5FsGuNwh2v0bw2isErm8hcGMLykp44OYmCVgI9/e8hLIS7r/1ggQshPtvb5CAANeR7RxYuO/Ocyjp5DrgeQEG7ut9RgLCZ9cBzwswcF/fUxIQ/rkOuFEc3Hv3CZR04XTA8wIM3Nu/TgLCbf8/tpWp4ypJgIF7Bx6TgPDUOIFSw8E9gyQgvfNCAuWEg3uG1khAaDJSjCFmlCkBBu6594gEhA5nRsCMBAd331+FktprsZiV4ODuByskIPR2MzEjwcHdww9JQBgsZlNMgoO7RrJQ0lQrJZIEB3eNLpOAMFJLDSfBwZ3jaShpmSg3JwQYuHPCEBA2mdPkHwEG7pxcIgFhjdIVDu6YXoSSdjhtAgzcMbNAAsICqU2AgTvm5klA2F51hYPbF+agzKzO0jyXmox0cgNuX5wlAQvh9vQMCVgIt2WmoayE27JTJGAh3Fjx/gIjM1xVEtymqAAAAABJRU5ErkJggg=="
+)
 
 
 def _base_path(request: Request) -> str:
@@ -47,8 +50,8 @@ def _icon_href(base_path: str) -> str:
 
 
 def _favicon_href(base_path: str) -> str:
-    prefix = f"{base_path}/favicon.png" if base_path else "/favicon.png"
-    return f"{prefix}?v=1"
+    prefix = f"{base_path}/favicon.ico" if base_path else "/favicon.ico"
+    return f"{prefix}?v=2"
 
 
 @router.get("/ui", response_class=HTMLResponse, include_in_schema=False)
@@ -88,8 +91,8 @@ async def favicon_png() -> Response:
 async def favicon() -> Response:
     """Serve a browser-friendly favicon."""
     return Response(
-        content=APP_FAVICON_PNG,
-        media_type="image/png",
+        content=APP_FAVICON_ICO,
+        media_type="image/x-icon",
         headers={"Cache-Control": "public, max-age=86400"},
     )
 
@@ -100,8 +103,8 @@ def _build_html(*, icon_href: str, favicon_href: str) -> str:
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<link rel="icon" href="__FAVICON_HREF__" sizes="32x32" type="image/png"/>
-<link rel="shortcut icon" href="__FAVICON_HREF__" type="image/png"/>
+<link rel="icon" href="__FAVICON_HREF__" sizes="any" type="image/x-icon"/>
+<link rel="shortcut icon" href="__FAVICON_HREF__" type="image/x-icon"/>
 <title>Assessment API – Dashboard</title>
 <style>
 :root{--bg:#f5f7fa;--card:#fff;--primary:#4361ee;--primary-hover:#3a56d4;--danger:#ef476f;--success:#06d6a0;--warn:#ffd166;--text:#212529;--muted:#6c757d;--border:#dee2e6;--radius:8px;--disabled:#a0aec0}

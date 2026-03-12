@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 import time
 from contextlib import contextmanager
+from fastapi import HTTPException
 from unittest.mock import AsyncMock, patch
 
 import jwt
@@ -213,6 +215,28 @@ def test_auth_token_endpoint_requires_ldap_configuration():
             )
             assert resp.status_code == 503
             assert "LDAP auth is not configured" in resp.json()["detail"]
+
+
+def test_auth_token_endpoint_logs_failed_ldap_login(caplog):
+    app = make_app()
+    with TestClient(app) as client:
+        with override_settings(
+            jwt_secret_key=TEST_JWT_SECRET,
+            jwt_algorithm="HS256",
+            ldap_server_uri="ldap://dc1.example.local:389",
+        ):
+            with caplog.at_level(logging.WARNING):
+                with patch(
+                    "assessment.auth._ldap_authenticate",
+                    AsyncMock(side_effect=HTTPException(status_code=401, detail="Invalid username or password")),
+                ):
+                    resp = client.post(
+                        "/api/v1/auth/token",
+                        json={"username": "alice", "password": "wrong-password"},
+                    )
+
+            assert resp.status_code == 401
+            assert "LDAP login request denied for user=alice status=401 detail=Invalid username or password" in caplog.text
 
 
 def test_refresh_rejects_access_token_type():
