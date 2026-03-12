@@ -155,7 +155,7 @@ def test_rbac_for_viewer_operator_admin_and_native_passthrough():
             assert client.get("/api/v1/native/test-endpoint", headers=admin_h).status_code == 200
 
 
-def test_legacy_token_without_roles_allowed_when_ldap_disabled():
+def test_roleless_token_rejected_when_ldap_disabled():
     app = make_app()
     with TestClient(app) as client:
         with override_settings(
@@ -173,7 +173,8 @@ def test_legacy_token_without_roles_allowed_when_ldap_disabled():
                 "/api/v1/protected-delete",
                 headers={"Authorization": f"Bearer {token}"},
             )
-            assert resp.status_code == 200
+            assert resp.status_code == 403
+            assert "missing required role claims" in resp.json()["detail"].lower()
 
 
 def test_roleless_token_rejected_when_ldap_enabled():
@@ -195,6 +196,7 @@ def test_roleless_token_rejected_when_ldap_enabled():
                 headers={"Authorization": f"Bearer {token}"},
             )
             assert resp.status_code == 403
+            assert "missing required role claims" in resp.json()["detail"].lower()
 
 
 def test_auth_token_endpoint_requires_ldap_configuration():

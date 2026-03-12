@@ -7,6 +7,8 @@ is configured) that provides a browser-based interface to all API features.
 
 from __future__ import annotations
 
+import base64
+
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, Response
 
@@ -28,6 +30,10 @@ APP_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" 
   <circle cx="84" cy="54" r="4.5" fill="#2ec4b6"/>
 </svg>"""
 
+APP_FAVICON_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAACBElEQVR42sWWa0tUURSG9y+a+/0+0y8xEiOSQhRFFEMSRZQikiKURJQiFEW832acNLOLpd2vVpqjWf6Ft3Xmg1DOWnNm3HBeWJ+fZ5+z91pLnak4QursH6TO/Uay8hDJql9Inj9A4sI+EhdzSFTvIX7pJ+KXdxGv2UWsdgexuh+I1X9HtOEboo3biDZ9RaT5CyItnxG58gnhVqqrHxFu+4BQ+3uEOt4h1PkWwa43CHa/RvDaKwSubyFwYwvKSnjg5iYJWAj397yEshLuv/WCBCyE+29vkIAA15HtHFi4785zKOnkOuB5AQbu631GAsJn1wHPCzBwX99TEhD+uQ64URzce/cJlHThdMDzAgzc279OAsJt/z+2lanjKkmAgXsHHpOA8NQ4gVLDwT2DJCC980IC5YSDe4bWSEBoMlKMIWaUKQEG7rn3iASEDmdGwIwEB3ffX4WS2muxmJXg4O4HKyQg9HYzMSPBwd3DD0lAGCxmU0yCg7tGslDSVCslkgQHd40uk4AwUksNJ8HBneNpKGmZKDcnBBi4c8IQEDaZ0+QfAQbunFwiAWGN0hUO7phehJJ2OG0CDNwxs0ACwgKpTYCBO+bmSUDYXnWFg9sX5qDMrM7SPJeajHRyA25fnCUBC+H29AwJWAi3ZaahrITbslMkYCHcWPH+AiMzXFUS3KaoAAAAAElFTkSuQmCC"
+)
+
 
 def _base_path(request: Request) -> str:
     root_path = request.scope.get("root_path", "") or ""
@@ -40,10 +46,22 @@ def _icon_href(base_path: str) -> str:
     return f"{base_path}/icon.svg" if base_path else "/icon.svg"
 
 
+def _favicon_href(base_path: str) -> str:
+    prefix = f"{base_path}/favicon.png" if base_path else "/favicon.png"
+    return f"{prefix}?v=1"
+
+
 @router.get("/ui", response_class=HTMLResponse, include_in_schema=False)
 async def ui_page(request: Request):
     """Serve the single-page assessment UI."""
-    return HTMLResponse(content=_build_html(_icon_href(_base_path(request))), status_code=200)
+    base_path = _base_path(request)
+    return HTMLResponse(
+        content=_build_html(
+            icon_href=_icon_href(base_path),
+            favicon_href=_favicon_href(base_path),
+        ),
+        status_code=200,
+    )
 
 
 @router.get("/icon.svg", include_in_schema=False)
@@ -56,24 +74,34 @@ async def app_icon() -> Response:
     )
 
 
-@router.get("/favicon.ico", include_in_schema=False)
-async def favicon() -> Response:
-    """Serve the favicon using the same SVG asset as the app icon."""
+@router.get("/favicon.png", include_in_schema=False)
+async def favicon_png() -> Response:
+    """Serve a PNG favicon for browsers that ignore SVG favicons."""
     return Response(
-        content=APP_ICON_SVG,
-        media_type="image/svg+xml",
+        content=APP_FAVICON_PNG,
+        media_type="image/png",
         headers={"Cache-Control": "public, max-age=86400"},
     )
 
 
-def _build_html(icon_href: str) -> str:
+@router.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> Response:
+    """Serve a browser-friendly favicon."""
+    return Response(
+        content=APP_FAVICON_PNG,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+def _build_html(*, icon_href: str, favicon_href: str) -> str:
     return r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<link rel="icon" href="__ICON_HREF__" type="image/svg+xml"/>
-<link rel="shortcut icon" href="__ICON_HREF__" type="image/svg+xml"/>
+<link rel="icon" href="__FAVICON_HREF__" sizes="32x32" type="image/png"/>
+<link rel="shortcut icon" href="__FAVICON_HREF__" type="image/png"/>
 <title>Assessment API – Dashboard</title>
 <style>
 :root{--bg:#f5f7fa;--card:#fff;--primary:#4361ee;--primary-hover:#3a56d4;--danger:#ef476f;--success:#06d6a0;--warn:#ffd166;--text:#212529;--muted:#6c757d;--border:#dee2e6;--radius:8px;--disabled:#a0aec0}
@@ -1015,9 +1043,11 @@ async function checkHealth(){
     document.getElementById('hdr-info').textContent='RAGFlow: '+d.ragflow_url+' | Auth: '+authType;
     const authBar=document.getElementById('auth-bar');
     if(authBar){
-      authBar.style.display = d.auth_enabled ? 'flex' : 'none';
-      if(!d.auth_enabled){
+      authBar.style.display = authType === 'ldap' ? 'flex' : 'none';
+      if(authType === 'disabled'){
         document.getElementById('auth-status').textContent='Authentication disabled';
+      }else if(authType === 'jwt'){
+        document.getElementById('auth-status').textContent='JWT auth is enabled; LDAP login is unavailable in this mode.';
       }
     }
   }catch(e){el.textContent='Error: '+e.message;}
@@ -1251,4 +1281,4 @@ function toggleAll(source, className) {
 
 </script>
 </body>
-</html>""".replace("__ICON_HREF__", icon_href)
+</html>""".replace("__ICON_HREF__", icon_href).replace("__FAVICON_HREF__", favicon_href)

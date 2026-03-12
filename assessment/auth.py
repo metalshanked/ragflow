@@ -480,11 +480,11 @@ async def verify_jwt(
     payload = _decode_token(credentials.credentials, expected_type="access")
     roles = [str(r).strip().lower() for r in payload.get("roles", []) if str(r).strip()]
 
-    # Legacy/manual tokens without role claims: keep compatibility only when
-    # LDAP login mode is not enabled.
-    if not roles and not _ldap_login_enabled():
-        roles = [ROLE_ADMIN]
-        payload["roles"] = roles
+    if not roles:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Token is missing required role claims.",
+        )
 
     required = _required_roles_for_request(request.method, request.url.path)
     if required and not (set(roles) & required):

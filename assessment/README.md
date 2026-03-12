@@ -136,78 +136,81 @@ export ASSESSMENT_VERIFY_SSL=false                   # disable SSL verification 
 export ASSESSMENT_SSL_CA_CERT=/path/to/ca-bundle.pem  # or point to a custom CA / self-signed cert
 ```
 
-All settings (see `config.py`):
+All settings (see `config.py`). Examples below use shell-style `export`, but the same values work in `.env` files without the `export` prefix:
 
-| Variable | Default | Description |
-|---|---|---|
-| `ASSESSMENT_RAGFLOW_BASE_URL` | `http://localhost:9380` | RAGFlow server URL |
-| `ASSESSMENT_RAGFLOW_API_KEY` | (empty) | RAGFlow API key |
-| `ASSESSMENT_MAX_CONCURRENT_QUESTIONS` | `5` | Parallel question processing limit |
-| `ASSESSMENT_POLLING_INTERVAL_SECONDS` | `3.0` | Seconds between parsing status polls |
-| `ASSESSMENT_DOCUMENT_PARSE_TIMEOUT_SECONDS` | `600.0` | Max wait for document parsing |
-| `ASSESSMENT_DEFAULT_SIMILARITY_THRESHOLD` | `0.1` | RAG similarity threshold |
-| `ASSESSMENT_DEFAULT_TOP_N` | `8` | Number of chunks to retrieve |
-| `ASSESSMENT_DEFAULT_DATASET_OPTIONS` | `{}` | JSON object of default dataset options merged into dataset create/update operations (runtime `dataset_options` overrides defaults) |
-| `ASSESSMENT_QUESTION_ID_COLUMN` | `A` | Default Excel column for Question Serial No (letter like `A` or 1-based number like `1`) |
-| `ASSESSMENT_QUESTION_COLUMN` | `B` | Default Excel column for Question text (letter like `B` or 1-based number like `2`) |
-| `ASSESSMENT_VENDOR_RESPONSE_COLUMN` | `C` | Default Excel column for Vendor response (letter like `C` or 1-based number like `3`) |
-| `ASSESSMENT_VENDOR_COMMENT_COLUMN` | `D` | Default Excel column for Vendor comments (letter like `D` or 1-based number like `4`) |
-| `ASSESSMENT_PROCESS_VENDOR_RESPONSE` | `false` | If `true`, verify vendor response and comments in determining results. |
-| `ASSESSMENT_ONLY_CITED_REFERENCES` | `true` | If `true` (default), only references actually cited as `[ID:N]` in the LLM answer are included in results. Set to `false` to return all retrieved chunks. |
-| `ASSESSMENT_HOST` | `0.0.0.0` | Server bind host |
-| `ASSESSMENT_PORT` | `8000` | Server bind port |
-| `ASSESSMENT_API_BASE_PATH` | (empty) | Subpath prefix, e.g. `/assessment` |
-| `ASSESSMENT_JWT_SECRET_KEY` | (empty) | JWT signing key; empty = auth disabled |
-| `ASSESSMENT_JWT_ALGORITHM` | `HS256` | JWT algorithm for access/refresh tokens |
-| `ASSESSMENT_JWT_ACCESS_TOKEN_TTL_MINUTES` | `30` | Access token TTL in minutes |
-| `ASSESSMENT_JWT_REFRESH_TOKEN_TTL_MINUTES` | `10080` | Refresh token TTL in minutes |
-| `ASSESSMENT_LDAP_SERVER_URI` | (empty) | LDAP/AD server URI (set to enable LDAP login endpoints) |
-| `ASSESSMENT_LDAP_USE_SSL` | `false` | Use LDAPS (`ldaps://`) |
-| `ASSESSMENT_LDAP_START_TLS` | `false` | Upgrade LDAP connection with StartTLS |
-| `ASSESSMENT_LDAP_VERIFY_SSL` | `true` | Verify LDAP TLS certificates |
-| `ASSESSMENT_LDAP_CA_CERT` | (empty) | Custom CA cert path for LDAP TLS |
-| `ASSESSMENT_LDAP_USER_DN_TEMPLATE` | (empty) | Direct-bind template, e.g. `user@domain.local` |
-| `ASSESSMENT_LDAP_BIND_DN` | (empty) | Service-account bind DN for LDAP search mode |
-| `ASSESSMENT_LDAP_BIND_PASSWORD` | (empty) | Service-account bind password |
-| `ASSESSMENT_LDAP_USER_BASE_DN` | (empty) | User search base DN |
-| `ASSESSMENT_LDAP_USER_FILTER` | `(|(sAMAccountName={username})(uid={username})(cn={username}))` | User search LDAP filter |
-| `ASSESSMENT_LDAP_GROUP_MEMBER_ATTRIBUTE` | `memberOf` | Group membership attribute on user object |
-| `ASSESSMENT_LDAP_GROUP_SEARCH_BASE_DN` | (empty) | Optional group search base DN |
-| `ASSESSMENT_LDAP_GROUP_SEARCH_FILTER` | `(|(member={user_dn})(memberUid={username}))` | Optional group search filter |
-| `ASSESSMENT_LDAP_GROUP_NAME_ATTRIBUTE` | `cn` | Group name attribute used for mapping |
-| `ASSESSMENT_LDAP_GROUP_ROLE_MAPPING_JSON` | `{"viewer":[],"operator":[],"admin":[]}` | LDAP group-to-role mapping JSON |
-| `ASSESSMENT_LDAP_REQUIRE_MAPPED_ROLES` | `true` | Require at least one mapped role after LDAP auth |
-| `ASSESSMENT_DATABASE_URL` | `sqlite+aiosqlite:///./assessment.db` | Database URL (SQLite default; see [Database Persistence](#database-persistence) for PostgreSQL) |
-| `ASSESSMENT_DATABASE_BOOTSTRAP_MODE` | `create` | `create` = create missing tables only; `recreate` = drop and recreate all assessment tables at startup |
-| `ASSESSMENT_DATABASE_ALLOW_DESTRUCTIVE_RECREATE` | `false` | Required to allow destructive `recreate` bootstrap on PostgreSQL |
-| `ASSESSMENT_VERIFY_SSL` | `true` | Set `false` to skip SSL certificate verification |
-| `ASSESSMENT_SSL_CA_CERT` | (empty) | Path to a custom CA bundle or self-signed certificate (PEM) |
-| `ASSESSMENT_TASK_RETENTION_DAYS` | `0` | Auto-delete task rows older than this many days; `0` = disabled (kept forever) |
-| `ASSESSMENT_TASK_CLEANUP_INTERVAL_HOURS` | `24.0` | How often the cleanup job runs (in hours) |
-| `ASSESSMENT_LOG_LEVEL` | `INFO` | Log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
-| `ASSESSMENT_LOG_JSON` | `true` | Emit JSON-formatted logs |
-| `ASSESSMENT_LOG_TO_CONSOLE` | `true` | Write logs to stdout/stderr |
-| `ASSESSMENT_LOG_FILE_ENABLED` | `true` | Enable local file logging |
-| `ASSESSMENT_LOG_DIR` | `./logs` | Directory for local log files |
-| `ASSESSMENT_LOG_FILE_NAME` | `assessment.log` | Active log file name |
-| `ASSESSMENT_LOG_MAX_BYTES` | `20971520` | Rotate log file after this size in bytes |
-| `ASSESSMENT_LOG_BACKUP_COUNT` | `30` | Number of rotated files to retain |
-| `ASSESSMENT_OTEL_ENABLED` | `false` | Enable OpenTelemetry initialization/instrumentation |
-| `ASSESSMENT_OTEL_EXPORTER_OTLP_ENDPOINT` | (empty) | Base OTLP HTTP endpoint, e.g. `http://otel-collector:4318` |
-| `ASSESSMENT_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | (empty) | Optional full traces endpoint override |
-| `ASSESSMENT_OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | (empty) | Optional full logs endpoint override |
-| `ASSESSMENT_OTEL_EXPORTER_OTLP_HEADERS` | (empty) | OTLP headers (JSON object or comma `k=v` list) |
-| `ASSESSMENT_OTEL_SERVICE_NAME` | `assessment-api` | OTel service name |
-| `ASSESSMENT_OTEL_SERVICE_VERSION` | `1.0.0` | OTel service version |
-| `ASSESSMENT_OTEL_RESOURCE_ATTRIBUTES_JSON` | `{}` | Extra resource attributes JSON |
-| `ASSESSMENT_OTEL_SAMPLE_RATIO` | `1.0` | Trace sampling ratio (0.0-1.0) |
-| `ASSESSMENT_OTEL_EXPORT_TRACES` | `true` | Export traces to OTLP |
-| `ASSESSMENT_OTEL_EXPORT_LOGS` | `true` | Export logs to OTLP |
-| `ASSESSMENT_OTEL_ENABLE_CONSOLE_EXPORTER` | `false` | Also export traces/logs to console exporter |
-| `ASSESSMENT_OTEL_INSTRUMENT_FASTAPI` | `true` | Enable FastAPI auto instrumentation |
-| `ASSESSMENT_OTEL_INSTRUMENT_HTTPX` | `true` | Enable HTTPX auto instrumentation |
-| `ASSESSMENT_OTEL_INSTRUMENT_SQLALCHEMY` | `true` | Enable SQLAlchemy auto instrumentation |
-| `ASSESSMENT_OPENINFERENCE_ENABLED` | `true` | Add OpenInference semantic attributes/context |
+| Variable | Default | Example | Description |
+|---|---|---|---|
+| `ASSESSMENT_RAGFLOW_BASE_URL` | `http://localhost:9380` | `http://ragflow.internal:9380` | RAGFlow server URL |
+| `ASSESSMENT_RAGFLOW_API_KEY` | (empty) | `ragflow-sk-example123` | RAGFlow API key |
+| `ASSESSMENT_MAX_CONCURRENT_QUESTIONS` | `5` | `10` | Parallel question processing limit |
+| `ASSESSMENT_POLLING_INTERVAL_SECONDS` | `3.0` | `2.5` | Seconds between parsing status polls |
+| `ASSESSMENT_DOCUMENT_PARSE_TIMEOUT_SECONDS` | `600.0` | `1800` | Max wait for document parsing |
+| `ASSESSMENT_DEFAULT_CHAT_NAME_PREFIX` | `assessment` | `vendor-assessment` | Prefix used when the app auto-generates chat names |
+| `ASSESSMENT_DEFAULT_SIMILARITY_THRESHOLD` | `0.1` | `0.2` | RAG similarity threshold |
+| `ASSESSMENT_DEFAULT_TOP_N` | `8` | `12` | Number of chunks to retrieve |
+| `ASSESSMENT_DEFAULT_DATASET_OPTIONS` | `{}` | `{"permission":"team","parser_config":{"enable_metadata":true}}` | JSON object of default dataset options merged into dataset create/update operations |
+| `ASSESSMENT_QUESTION_ID_COLUMN` | `A` | `A` | Default Excel column for Question Serial No |
+| `ASSESSMENT_QUESTION_COLUMN` | `B` | `B` | Default Excel column for Question text |
+| `ASSESSMENT_VENDOR_RESPONSE_COLUMN` | `C` | `C` | Default Excel column for vendor response |
+| `ASSESSMENT_VENDOR_COMMENT_COLUMN` | `D` | `D` | Default Excel column for vendor comments |
+| `ASSESSMENT_PROCESS_VENDOR_RESPONSE` | `false` | `true` | If `true`, verify vendor response and comments during assessment |
+| `ASSESSMENT_ONLY_CITED_REFERENCES` | `true` | `false` | If `true`, include only chunks cited as `[ID:N]`; if `false`, include all retrieved chunks |
+| `ASSESSMENT_VERIFY_SSL` | `true` | `false` | If `false`, skip SSL certificate verification when calling RAGFlow |
+| `ASSESSMENT_SSL_CA_CERT` | (empty) | `/certs/ragflow-ca.pem` | Path to a custom CA bundle or self-signed certificate for RAGFlow |
+| `ASSESSMENT_DATABASE_URL` | `sqlite+aiosqlite:///./assessment.db` | `postgresql+asyncpg://assessment:secret@postgres:5432/assessment` | Database URL |
+| `ASSESSMENT_DATABASE_BOOTSTRAP_MODE` | `create` | `recreate` | `create` creates missing tables; `recreate` drops and recreates assessment tables |
+| `ASSESSMENT_DATABASE_ALLOW_DESTRUCTIVE_RECREATE` | `false` | `true` | Must be `true` to allow destructive `recreate` bootstrap on PostgreSQL |
+| `ASSESSMENT_TASK_RETENTION_DAYS` | `0` | `30` | Auto-delete task rows older than this many days; `0` disables cleanup |
+| `ASSESSMENT_TASK_CLEANUP_INTERVAL_HOURS` | `24.0` | `12` | How often the cleanup job runs |
+| `ASSESSMENT_HOST` | `0.0.0.0` | `0.0.0.0` | Server bind host |
+| `ASSESSMENT_PORT` | `8000` | `8010` | Server bind port |
+| `ASSESSMENT_API_BASE_PATH` | (empty) | `/assessment` | Subpath prefix when serving behind a reverse proxy |
+| `ASSESSMENT_JWT_SECRET_KEY` | (empty) | `replace-with-a-long-random-secret` | JWT signing key; empty disables auth |
+| `ASSESSMENT_JWT_ALGORITHM` | `HS256` | `HS256` | JWT algorithm for access/refresh tokens |
+| `ASSESSMENT_JWT_ACCESS_TOKEN_TTL_MINUTES` | `30` | `60` | Access token TTL in minutes |
+| `ASSESSMENT_JWT_REFRESH_TOKEN_TTL_MINUTES` | `10080` | `4320` | Refresh token TTL in minutes |
+| `ASSESSMENT_LOG_LEVEL` | `INFO` | `DEBUG` | Log level |
+| `ASSESSMENT_LOG_JSON` | `true` | `false` | Emit JSON-formatted logs |
+| `ASSESSMENT_LOG_TO_CONSOLE` | `true` | `true` | Write logs to stdout/stderr |
+| `ASSESSMENT_LOG_FILE_ENABLED` | `true` | `false` | Enable local file logging |
+| `ASSESSMENT_LOG_DIR` | `./logs` | `/var/log/assessment` | Directory for local log files |
+| `ASSESSMENT_LOG_FILE_NAME` | `assessment.log` | `assessment-prod.log` | Active log file name |
+| `ASSESSMENT_LOG_MAX_BYTES` | `20971520` | `52428800` | Rotate log file after this size in bytes |
+| `ASSESSMENT_LOG_BACKUP_COUNT` | `30` | `14` | Number of rotated files to retain |
+| `ASSESSMENT_OTEL_ENABLED` | `false` | `true` | Enable OpenTelemetry initialization/instrumentation |
+| `ASSESSMENT_OTEL_SERVICE_NAME` | `assessment-api` | `assessment-api-prod` | OTel service name |
+| `ASSESSMENT_OTEL_SERVICE_VERSION` | `1.0.0` | `1.2.3` | OTel service version |
+| `ASSESSMENT_OTEL_RESOURCE_ATTRIBUTES_JSON` | `{}` | `{"deployment.environment":"prod","team":"security"}` | Extra OTel resource attributes as JSON |
+| `ASSESSMENT_OTEL_SAMPLE_RATIO` | `1.0` | `0.25` | Trace sampling ratio from `0.0` to `1.0` |
+| `ASSESSMENT_OTEL_EXPORT_TRACES` | `true` | `true` | Export traces to OTLP |
+| `ASSESSMENT_OTEL_EXPORT_LOGS` | `true` | `false` | Export logs to OTLP |
+| `ASSESSMENT_OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` | `grpc` | OTLP export protocol |
+| `ASSESSMENT_OTEL_EXPORTER_OTLP_ENDPOINT` | (empty) | `http://otel-collector:4318` | Base OTLP endpoint |
+| `ASSESSMENT_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | (empty) | `http://otel-collector:4318/v1/traces` | Optional full traces endpoint override |
+| `ASSESSMENT_OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | (empty) | `http://otel-collector:4318/v1/logs` | Optional full logs endpoint override |
+| `ASSESSMENT_OTEL_EXPORTER_OTLP_HEADERS` | (empty) | `{"Authorization":"Bearer token123"}` | OTLP headers as JSON or comma-separated `k=v` pairs |
+| `ASSESSMENT_OTEL_ENABLE_CONSOLE_EXPORTER` | `false` | `true` | Also export traces/logs to the console exporter |
+| `ASSESSMENT_OTEL_INSTRUMENT_FASTAPI` | `true` | `true` | Enable FastAPI auto-instrumentation |
+| `ASSESSMENT_OTEL_INSTRUMENT_HTTPX` | `true` | `false` | Enable HTTPX auto-instrumentation |
+| `ASSESSMENT_OTEL_INSTRUMENT_SQLALCHEMY` | `true` | `true` | Enable SQLAlchemy auto-instrumentation |
+| `ASSESSMENT_OPENINFERENCE_ENABLED` | `true` | `true` | Add OpenInference semantic attributes/context |
+| `ASSESSMENT_LDAP_SERVER_URI` | (empty) | `ldap://dc1.example.local:389` | LDAP/AD server URI |
+| `ASSESSMENT_LDAP_USE_SSL` | `false` | `true` | Use LDAPS (`ldaps://`) |
+| `ASSESSMENT_LDAP_START_TLS` | `false` | `true` | Upgrade LDAP connection with StartTLS |
+| `ASSESSMENT_LDAP_VERIFY_SSL` | `true` | `false` | Verify LDAP TLS certificates |
+| `ASSESSMENT_LDAP_CA_CERT` | (empty) | `/certs/ldap-ca.pem` | Custom CA cert path for LDAP TLS |
+| `ASSESSMENT_LDAP_CONNECT_TIMEOUT_SECONDS` | `10` | `15` | LDAP connection timeout in seconds |
+| `ASSESSMENT_LDAP_USER_DN_TEMPLATE` | (empty) | `{username}@example.local` | Direct-bind template for user login |
+| `ASSESSMENT_LDAP_BIND_DN` | (empty) | `CN=svc-ragflow,OU=Service Accounts,DC=example,DC=local` | Service-account bind DN for LDAP search mode |
+| `ASSESSMENT_LDAP_BIND_PASSWORD` | (empty) | `replace-with-service-account-password` | Service-account bind password |
+| `ASSESSMENT_LDAP_USER_BASE_DN` | (empty) | `OU=Users,DC=example,DC=local` | User search base DN |
+| `ASSESSMENT_LDAP_USER_FILTER` | `(|(sAMAccountName={username})(uid={username})(cn={username}))` | `(&(objectClass=user)(sAMAccountName={username}))` | User search LDAP filter |
+| `ASSESSMENT_LDAP_GROUP_MEMBER_ATTRIBUTE` | `memberOf` | `memberOf` | Group membership attribute on the user object |
+| `ASSESSMENT_LDAP_GROUP_SEARCH_BASE_DN` | (empty) | `OU=Groups,DC=example,DC=local` | Optional group search base DN |
+| `ASSESSMENT_LDAP_GROUP_SEARCH_FILTER` | `(|(member={user_dn})(memberUid={username}))` | `(&(objectClass=group)(member={user_dn}))` | Optional group search filter |
+| `ASSESSMENT_LDAP_GROUP_NAME_ATTRIBUTE` | `cn` | `cn` | Group name attribute used during mapping |
+| `ASSESSMENT_LDAP_GROUP_ROLE_MAPPING_JSON` | `{"viewer":[],"operator":[],"admin":[]}` | `{"viewer":["RGF-Readers"],"operator":["RGF-Operators"],"admin":["RGF-Admins"]}` | LDAP group-to-role mapping JSON |
+| `ASSESSMENT_LDAP_REQUIRE_MAPPED_ROLES` | `true` | `false` | Require at least one mapped role after LDAP auth |
 
 Default dataset options example:
 
@@ -406,15 +409,32 @@ Role permissions:
 - `operator`: everything in `viewer` plus write/execute flows (`POST`/`PUT`/`PATCH`) for assessment operations
 - `admin`: full access, including destructive endpoints (`DELETE`) and direct native passthrough (`/api/v1/native/*`)
 
-### Legacy Manual JWT
+### Manual JWT Helper
 
-If LDAP mode is not enabled, you can still generate JWTs manually:
+If LDAP mode is not enabled, the app does not provide a login/token issuer. Mint a JWT locally with the helper:
 
-```python
-import jwt
-token = jwt.encode({"sub": "assessment-client"}, "my-super-secret-key", algorithm="HS256")
-print(token)
+```bash
+python -m assessment.mint_jwt --subject assessment-admin --role admin
 ```
+
+You can also specify multiple roles or groups:
+
+```bash
+python -m assessment.mint_jwt \
+  --subject assessment-operator \
+  --role viewer \
+  --role operator \
+  --group RGF-Operators \
+  --ttl-minutes 480
+```
+
+The helper defaults to:
+
+- `ASSESSMENT_JWT_SECRET_KEY` for signing
+- `ASSESSMENT_JWT_ALGORITHM` for the algorithm
+- `access` for the token type
+
+Tokens without role claims are rejected in all modes.
 
 When the secret is **empty** (default), authentication is disabled and all requests are allowed.
 
