@@ -8,30 +8,80 @@ is configured) that provides a browser-based interface to all API features.
 from __future__ import annotations
 
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
 router = APIRouter(tags=["ui"])
+
+APP_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Assessment">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4361ee"/>
+      <stop offset="100%" stop-color="#2ec4b6"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="url(#bg)"/>
+  <path d="M30 94V34h52l16 16v44H30z" fill="#fff" opacity=".98"/>
+  <path d="M82 34v18h16" fill="#dfe7ff"/>
+  <path d="M46 82l10-12 10 8 18-24" fill="none" stroke="#4361ee" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="46" cy="82" r="4.5" fill="#2ec4b6"/>
+  <circle cx="66" cy="78" r="4.5" fill="#2ec4b6"/>
+  <circle cx="84" cy="54" r="4.5" fill="#2ec4b6"/>
+</svg>"""
+
+
+def _base_path(request: Request) -> str:
+    root_path = request.scope.get("root_path", "") or ""
+    if root_path == "/":
+        return ""
+    return root_path.rstrip("/")
+
+
+def _icon_href(base_path: str) -> str:
+    return f"{base_path}/icon.svg" if base_path else "/icon.svg"
 
 
 @router.get("/ui", response_class=HTMLResponse, include_in_schema=False)
 async def ui_page(request: Request):
     """Serve the single-page assessment UI."""
-    return HTMLResponse(content=_build_html(), status_code=200)
+    return HTMLResponse(content=_build_html(_icon_href(_base_path(request))), status_code=200)
 
 
-def _build_html() -> str:
+@router.get("/icon.svg", include_in_schema=False)
+async def app_icon() -> Response:
+    """Serve the dashboard app icon."""
+    return Response(
+        content=APP_ICON_SVG,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@router.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> Response:
+    """Serve the favicon using the same SVG asset as the app icon."""
+    return Response(
+        content=APP_ICON_SVG,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+def _build_html(icon_href: str) -> str:
     return r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
+<link rel="icon" href="__ICON_HREF__" type="image/svg+xml"/>
+<link rel="shortcut icon" href="__ICON_HREF__" type="image/svg+xml"/>
 <title>Assessment API – Dashboard</title>
 <style>
 :root{--bg:#f5f7fa;--card:#fff;--primary:#4361ee;--primary-hover:#3a56d4;--danger:#ef476f;--success:#06d6a0;--warn:#ffd166;--text:#212529;--muted:#6c757d;--border:#dee2e6;--radius:8px;--disabled:#a0aec0}
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);line-height:1.6;padding:0}
 header{background:var(--primary);color:#fff;padding:1rem 2rem;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem}
-header h1{font-size:1.3rem;font-weight:600}
+header h1{font-size:1.3rem;font-weight:600;display:flex;align-items:center;gap:.65rem}
+header h1 img{width:28px;height:28px;display:block;flex:0 0 auto}
 header .info{font-size:.85rem;opacity:.85}
 .container{max-width:1200px;margin:1.5rem auto;padding:0 1rem}
 .tabs{display:flex;gap:4px;margin-bottom:1rem;flex-wrap:wrap}
@@ -105,7 +155,7 @@ th{background:var(--bg);font-weight:600;position:sticky;top:0}
 </head>
 <body>
 <header>
-  <h1>&#128202; Assessment API Dashboard</h1>
+  <h1><img src="__ICON_HREF__" alt=""/>Assessment API Dashboard</h1>
   <span class="info" id="hdr-info"></span>
 </header>
 
@@ -1201,4 +1251,4 @@ function toggleAll(source, className) {
 
 </script>
 </body>
-</html>"""
+</html>""".replace("__ICON_HREF__", icon_href)
