@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime
+import io
 from unittest.mock import AsyncMock, MagicMock, patch
+import zipfile
 
 import httpx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import openpyxl
 
 from assessment import routers
 from assessment.models import SessionCreateResponse, TaskState, TaskStatus
@@ -38,6 +41,58 @@ def make_app() -> FastAPI:
     app = FastAPI()
     app.include_router(routers.router)
     return app
+
+
+def _make_minimal_docx_bytes() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "word/document.xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+            <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+              <w:body>
+                <w:p><w:r><w:t>Hello DOCX</w:t></w:r></w:p>
+                <w:tbl>
+                  <w:tr><w:tc><w:p><w:r><w:t>Cell A</w:t></w:r></w:p></w:tc></w:tr>
+                </w:tbl>
+              </w:body>
+            </w:document>""",
+        )
+    return buffer.getvalue()
+
+
+def _make_minimal_xlsx_bytes() -> bytes:
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "SheetA"
+    sheet.append(["Name", "Value"])
+    sheet.append(["alpha", 1])
+    sheet.append(["beta", 2])
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def _make_minimal_pptx_bytes() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(
+            "ppt/slides/slide1.xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+            <p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+                   xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+              <p:cSld>
+                <p:spTree>
+                  <p:sp>
+                    <p:txBody>
+                      <a:p><a:r><a:t>Slide text</a:t></a:r></a:p>
+                    </p:txBody>
+                  </p:sp>
+                </p:spTree>
+              </p:cSld>
+            </p:sld>""",
+        )
+    return buffer.getvalue()
 
 
 def test_ragflow_passthrough_forwards_request_and_response():
@@ -183,6 +238,67 @@ def test_delete_dataset_and_documents_use_passthrough_helper():
             assert doc_resp.status_code == 200
             assert doc_resp.json() == {"message": "Documents deleted"}
             assert mocked.await_count == 2
+
+
+def test_render_document_renders_docx_to_html():
+    app = make_app()
+    with TestClient(app) as client:
+        with override_settings(jwt_secret_key=""):
+            mocked = AsyncMock(
+                return_value=httpx.Response(
+                    status_code=200,
+                    content=_make_minimal_docx_bytes(),
+                    headers={"content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+                    request=httpx.Request("GET", "http://testserver/mock"),
+                )
+            )
+            with patch("assessment.routers._fetch_ragflow_resource", mocked):
+                resp = client.get("/api/v1/proxy/document/doc-1/render?filename=test.docx")
+
+            assert resp.status_code == 200
+            assert resp.headers["content-type"].startswith("text/html")
+            assert "Hello DOCX" in resp.text
+            assert "<table>" in resp.text
+
+
+def test_render_document_renders_xlsx_to_html():
+    app = make_app()
+    with TestClient(app) as client:
+        with override_settings(jwt_secret_key=""):
+            mocked = AsyncMock(
+                return_value=httpx.Response(
+                    status_code=200,
+                    content=_make_minimal_xlsx_bytes(),
+                    headers={"content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+                    request=httpx.Request("GET", "http://testserver/mock"),
+                )
+            )
+            with patch("assessment.routers._fetch_ragflow_resource", mocked):
+                resp = client.get("/api/v1/proxy/document/doc-2/render?filename=test.xlsx")
+
+            assert resp.status_code == 200
+            assert resp.headers["content-type"].startswith("text/html")
+            assert "SheetA" in resp.text
+            assert "alpha" in resp.text
+
+
+def test_render_document_rejects_unsupported_extension():
+    app = make_app()
+    with TestClient(app) as client:
+        with override_settings(jwt_secret_key=""):
+            mocked = AsyncMock(
+                return_value=httpx.Response(
+                    status_code=200,
+                    content=b"binary",
+                    headers={"content-type": "application/octet-stream"},
+                    request=httpx.Request("GET", "http://testserver/mock"),
+                )
+            )
+            with patch("assessment.routers._fetch_ragflow_resource", mocked):
+                resp = client.get("/api/v1/proxy/document/doc-3/render?filename=test.pdf")
+
+            assert resp.status_code == 415
+            assert resp.json()["detail"] == "Document type is not renderable in the built-in UI"
 
 
 def test_task_events_endpoint_returns_paginated_history():

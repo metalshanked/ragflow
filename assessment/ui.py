@@ -922,6 +922,7 @@ function _normalizeReference(raw){
     contentFormat: String(preview.content_format||'none').trim(),
     hasInlinePreview: !!preview.has_inline_preview,
     documentUrl: links.document_url || null,
+    renderedDocumentUrl: links.rendered_document_url || null,
     imageUrl: links.image_url || null,
     sourceUrl: links.source_url || null,
     score: typeof retrieval.score === 'number' ? retrieval.score : null,
@@ -1004,12 +1005,41 @@ function _renderCsvTable(text){
   html+='</table></div>';
   return html;
 }
+function _isTextLikeContentType(contentType){
+  return contentType.indexOf('text/')===0 ||
+    contentType.indexOf('json')>=0 ||
+    contentType.indexOf('xml')>=0 ||
+    contentType.indexOf('csv')>=0 ||
+    contentType.indexOf('html')>=0;
+}
+function _canInlineDocument(contentType, ref){
+  if(contentType.indexOf('pdf')>=0 || contentType.indexOf('image/')===0){
+    return true;
+  }
+  if(_isTextLikeContentType(contentType)){
+    return true;
+  }
+  return ['txt','md','markdown','html','htm','json','xml','yaml','yml','csv'].indexOf(ref.documentType)>=0;
+}
+function _supportsServerRenderedDocument(ref){
+  return ['docx','excel','ppt'].indexOf(ref.documentType)>=0;
+}
 async function openReferenceDocument(rawRef){
   const parsed=_parseRefPayload(rawRef);
   const ref=_normalizeReference(parsed);
   if(!parsed || !ref.documentUrl){toast('Reference document is unavailable','err');return;}
   _openModal(ref.documentName || 'Reference document', '<p class="reference-empty">Loading document…</p>', 'modal-document');
   try{
+    const renderUrl = (_supportsServerRenderedDocument(ref) && ref.renderedDocumentUrl) ? ref.renderedDocumentUrl : null;
+    if(renderUrl){
+      const renderResponse = await _fetchProtectedResource(renderUrl);
+      if(renderResponse.ok && (renderResponse.headers.get('content-type')||'').toLowerCase().indexOf('text/html') >= 0){
+        const renderedHtml = await renderResponse.text();
+        const body='<div class="reference-html">'+renderedHtml+'</div>';
+        _openModal(ref.documentName || 'Reference document', body, 'modal-document');
+        return;
+      }
+    }
     const response=await _fetchProtectedResource(ref.documentUrl);
     if(!response.ok){
       const text=await response.text().catch(function(){return '';});
@@ -1019,32 +1049,23 @@ async function openReferenceDocument(rawRef){
     const objectUrl=_trackModalObjectUrl(URL.createObjectURL(blob));
     const contentType=(response.headers.get('content-type')||'').toLowerCase();
     const downloadName=ref.documentName || 'reference';
-    let body='<div class="modal-toolbar"><a href="'+escAttr(objectUrl)+'" download="'+escAttr(downloadName)+'">Download</a></div>';
+    let body='<div class="modal-toolbar"><a href="'+escAttr(objectUrl)+'" download="'+escAttr(downloadName)+'">Download</a><a href="'+escAttr(objectUrl)+'" target="_blank" rel="noopener">Open Raw File</a></div>';
     if(contentType.indexOf('pdf')>=0){
       const pdfUrl=objectUrl + (ref.pageNumber!=null ? '#page='+encodeURIComponent(String(ref.pageNumber)) : '');
       body+='<iframe src="'+escAttr(pdfUrl)+'" title="'+escAttr(downloadName)+'"></iframe>';
     }else if(contentType.indexOf('image/')===0){
       body+='<img src="'+escAttr(objectUrl)+'" alt="'+escAttr(downloadName)+'"/>';
     }else{
-      const isTextLike=
-        contentType.indexOf('text/')===0 ||
-        contentType.indexOf('json')>=0 ||
-        contentType.indexOf('xml')>=0 ||
-        contentType.indexOf('csv')>=0 ||
-        contentType.indexOf('html')>=0;
+      const isTextLike=_isTextLikeContentType(contentType);
       const text=isTextLike ? await blob.text().catch(function(){return '';}) : '';
-      if(contentType.indexOf('text/csv')>=0 || (ref.documentType==='excel' && !ref.fullContent && text)){
+      if(!_canInlineDocument(contentType, ref)){
+        body+='<p class="reference-empty">This file type is available through the packaged proxy link, but browsers do not render it inline reliably. Use Download or Open Raw File to view the original document.</p>';
+      }else if(contentType.indexOf('text/csv')>=0 || (ref.documentType==='excel' && text)){
         body+=_renderCsvTable(text);
-      }else if(ref.tableHtml){
-        body+='<div class="reference-html">'+_sanitizeHtml(ref.tableHtml)+'</div>';
-      }else if(ref.htmlContent){
-        body+='<div class="reference-html">'+_sanitizeHtml(ref.htmlContent)+'</div>';
-      }else if(_looksLikeHtmlContent(ref.fullContent||text) || ref.referenceType==='table'){
-        body+='<div class="reference-html">'+_sanitizeHtml(ref.fullContent||text)+'</div>';
+      }else if(_looksLikeHtmlContent(text)){
+        body+='<div class="reference-html">'+_sanitizeHtml(text)+'</div>';
       }else if(text){
         body+='<pre>'+escHtml(text)+'</pre>';
-      }else if(ref.fullContent){
-        body+='<div class="reference-html">'+_sanitizeHtml(ref.fullContent)+'</div>';
       }else{
         body+='<p class="reference-empty">No inline preview is available for this file type. Use Download to open the original document.</p>';
       }

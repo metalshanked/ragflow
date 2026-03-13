@@ -39,6 +39,8 @@ def test_ui_page_includes_icon_links_and_header_logo():
     assert "openReferenceImage(this.dataset.ref)" in response.text
     assert "openReferenceContent(this.dataset.ref)" in response.text
     assert "async function _fetchProtectedResource" in response.text
+    assert "function _supportsServerRenderedDocument" in response.text
+    assert "renderedDocumentUrl: links.rendered_document_url || null" in response.text
     assert 'class="reference-html"' in response.text
     assert "AUTH_MODE = authType;" in response.text
     assert "initApiLinks();" in response.text

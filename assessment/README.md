@@ -711,6 +711,7 @@ GET /api/v1/assessments/{task_id}/results?page=1&page_size=50
           },
           "links": {
             "document_url": "/api/v1/proxy/document/doc123",
+            "rendered_document_url": "/api/v1/proxy/document/doc123/render?filename=privacy_policy.pdf",
             "image_url": "/api/v1/proxy/image/img456",
             "source_url": null
           },
@@ -736,9 +737,9 @@ GET /api/v1/assessments/{task_id}/results?page=1&page_size=50
             "media_family": "spreadsheet"
           },
           "location": {
-            "kind": "row",
+            "kind": "chunk",
             "value": 36,
-            "label": "Row 36",
+            "label": "Chunk 36",
             "page_number": null,
             "highlight_box": null
           },
@@ -752,6 +753,7 @@ GET /api/v1/assessments/{task_id}/results?page=1&page_size=50
           },
           "links": {
             "document_url": "/api/v1/proxy/document/doc789",
+            "rendered_document_url": "/api/v1/proxy/document/doc789/render?filename=Evidence_List.xlsx",
             "image_url": null,
             "source_url": null
           },
@@ -799,6 +801,12 @@ GET /api/v1/proxy/document/{document_id}
 ```
 
 Proxies document downloads from RAGFlow. Reference `document_url` fields point here.
+
+```
+GET /api/v1/proxy/document/{document_id}/render?filename=example.docx
+```
+
+Renders supported document types (`docx`, `xlsx` / `xlsm`, `pptx`) into HTML for in-app viewing. Reference `rendered_document_url` fields point here.
 
 #### Upload Documents (Standalone)
 
@@ -906,11 +914,59 @@ The reference model is a packaged wrapper over RAGFlow references. Each referenc
 Key packaging rules:
 
 - `reference_type` is normalized from upstream `doc_type`; empty upstream values become `text`
-- `location.label` exposes user-facing positions such as `Page 3`, `Slide 4`, `Row 36`, or `Chunk 10`
+- `reference_type` describes the cited chunk kind, not the source file type; a PDF can legitimately produce `text`, `table`, or `image` references
+- `location.label` exposes user-facing positions such as `Page 3`, `Slide 4`, or `Chunk 10`
 - `preview` carries text, HTML, or table content in a typed way
-- `links` uses assessment proxy URLs instead of exposing raw RAGFlow URLs
+- `preview.has_inline_preview` is `true` when the packaged reference includes inline text/HTML/table content or an image link that the UI can show in its preview modal
+- `links` uses assessment proxy URLs instead of exposing raw RAGFlow URLs, including `rendered_document_url` for supported full-document HTML rendering
 - upstream ID aliases like `doc_id` / `kb_id` / `img_id` are normalized into `document.document_id`, `document.dataset_id`, and `document.image_id`
 - `source_metadata.extra_fields` preserves unknown upstream fields for forward compatibility
+
+### How `reference_type` is derived
+
+The wrapper uses upstream RAGFlow chunk metadata first:
+
+1. If upstream `doc_type` or `doc_type_kwd` is present, that value is preserved as the public `reference_type`.
+2. If upstream leaves it empty, the wrapper normalizes it to `text`.
+
+That means:
+
+- `reference_type="table"` means the cited chunk is a table-like chunk from RAGFlow.
+- `reference_type="image"` means the cited chunk is an image-like chunk from RAGFlow.
+- `reference_type="text"` means either upstream explicitly said `text` or upstream left the type blank and the wrapper normalized it.
+
+This is intentionally separate from `document.document_type`. For example, a single PDF document can yield:
+
+- `document.document_type="pdf"` with `reference_type="text"` for ordinary extracted text
+- `document.document_type="pdf"` with `reference_type="table"` for a detected table chunk
+- `document.document_type="pdf"` with `reference_type="image"` for an image-based chunk
+
+If a PDF reference shows `reference_type="table"` and also has an image link, that is valid. It means the source file is a PDF, while the cited chunk itself is a table and RAGFlow also exposed an associated image/snapshot for it.
+
+### How `location` is derived
+
+The wrapper only exposes location semantics that are supported by upstream RAGFlow metadata:
+
+- PDFs: `positions[0][0]` is treated as a real page number, and `positions[0][1:5]` are exposed as `highlight_box`.
+- PPT/PPTX: `positions[0][0]` is treated as a real slide number.
+- Excel, DOCX, text, HTML, and other non-paged formats: the wrapper treats `positions[0][0]` as a generic chunk index.
+
+This is deliberate. In upstream RAGFlow, many non-PDF/non-PPT chunks are created through generic tokenization that stores positions as `[[index, index, index, index, index]]`. That value is not reliable enough to claim `row`, `sheet`, or page semantics, especially for multi-sheet spreadsheets, so the wrapper uses `Chunk N` instead.
+
+### How `has_inline_preview` is derived
+
+`preview.has_inline_preview` is a UI-oriented boolean derived by the wrapper. It is `true` when either of these is available:
+
+- packaged inline content in `preview.full_content`
+- a packaged reference image in `links.image_url`
+
+In code terms, it is currently calculated as:
+
+```text
+bool(full_content or image_url)
+```
+
+This flag is about the reference preview modal, not the original file download. A DOCX/XLSX/PPTX reference can therefore have `has_inline_preview=true` because the cited chunk itself has table/text content, even though the full source document is still a binary Office file.
 
 Current response shape:
 
@@ -942,6 +998,7 @@ Current response shape:
   },
   "links": {
     "document_url": "/api/v1/proxy/document/doc123",
+    "rendered_document_url": "/api/v1/proxy/document/doc123/render?filename=control-matrix.docx",
     "image_url": null,
     "source_url": null
   },
@@ -961,7 +1018,7 @@ Current response shape:
 | Document type | `document.media_family` | Location example | Preview behavior |
 |---|---|---|---|
 | **PDF** | `pdf` | `Page 3` plus optional `highlight_box` | text, html, or table HTML |
-| **Excel / CSV** | `spreadsheet` | `Row 36` | text or table HTML |
+| **Excel / CSV** | `spreadsheet` | `Chunk 36` | text or table HTML |
 | **DOCX** | `document` | `Chunk 10` | text or table HTML |
 | **PPT / PPTX** | `presentation` | `Slide 4` | text |
 | **Image files** | `image` | none | image link |
@@ -969,11 +1026,40 @@ Current response shape:
 | **Other / future file types** | `other` or inferred family | generic location when available | text, html, table HTML, or image link depending on upstream data |
 
 `document.document_id`, `document.dataset_id`, and `document.image_id` are preserved from upstream because they can be useful for correlation, debugging, and proxy operations. The wrapper also accepts upstream aliases such as `doc_id`, `kb_id`, and `img_id`. Unknown future upstream fields are preserved in `source_metadata.extra_fields`.
+
+### Common Value Matrix
+
+| Source file example | `document.document_type` | `document.media_family` | Common `reference_type` values |
+|---|---|---|---|
+| `policy.pdf` | `pdf` | `pdf` | `text`, `table`, `image` |
+| `controls.docx` | `docx` | `document` | `text`, `table`, `image` |
+| `evidence.xlsx` / `evidence.csv` | `excel` | `spreadsheet` | `text`, `table` |
+| `slides.pptx` / `slides.ppt` | `ppt` | `presentation` | `text`, `image` |
+| `diagram.png` / `photo.jpg` | `png`, `jpg`, `jpeg`, etc. | `image` | `image`, sometimes `text` |
+| `notes.txt` / `README.md` / `page.html` | `txt`, `md`, `html`, etc. | `text` | `text`, sometimes `html` |
+| Unknown / newer extension | raw extension or `unknown` | `other` | upstream value if present, otherwise `text` |
+
+Use the fields this way:
+
+- `document.document_type`: what kind of source file the chunk came from
+- `document.media_family`: broad family for display logic
+- `reference_type`: what kind of cited chunk/result was retrieved from that file
 ### Reference Response Example
 
 The nested example above is the current contract.
 
 > **Note on the UI:** The RAGFlow built-in web UI (`web/src/components/`) has its own reference rendering logic that is separate from this Assessment API. The Assessment API’s citation filtering (`only_cited_references`) applies only to the Assessment API endpoints and its built-in dashboard at `/ui`. The main RAGFlow chat UI renders references using its own component (`reference-document-list.tsx`) and is not affected by these assessment settings.
+
+### Built-In Document Rendering
+
+When a user clicks `Open Document` in the built-in assessment UI:
+
+- PDF documents render inline in the browser modal.
+- Images render inline in the browser modal.
+- `docx`, `xlsx` / `xlsm`, and `pptx` documents are converted server-side into HTML for in-app viewing.
+- Legacy binary Office formats such as `doc`, `xls`, and `ppt` are not converted by the built-in renderer and fall back to raw download/open behavior.
+
+This keeps the UI usable for the most common modern Office formats without claiming richer location semantics than upstream RAGFlow actually provides.
 
 ### Python Example
 
@@ -1328,45 +1414,45 @@ The main Python files are layered deliberately. At a high level:
 
 ```mermaid
 flowchart TD
-    A[config.py<br/>Settings()] --> B[main.py]
-    B --> C[configure_logging()<br/>observability.py]
-    B --> D[FastAPI app creation]
-    D --> E[include_router(router)<br/>routers.py]
-    D --> F[include_router(auth_router)<br/>auth.py]
-    D --> G[include_router(ui_router)<br/>ui.py]
-    B --> H[startup event]
-    H --> I[init_db()<br/>db.py]
-    H --> J[init_telemetry(app)<br/>observability.py]
-    H --> K[cleanup loop for old tasks<br/>main.py + db.py]
+    A["config.py\nSettings()"] --> B["main.py"]
+    B --> C["configure_logging()\nobservability.py"]
+    B --> D["FastAPI app creation"]
+    D --> E["include_router(router)\nrouters.py"]
+    D --> F["include_router(auth_router)\nauth.py"]
+    D --> G["include_router(ui_router)\nui.py"]
+    B --> H["startup event"]
+    H --> I["init_db()\ndb.py"]
+    H --> J["init_telemetry(app)\nobservability.py"]
+    H --> K["cleanup loop for old tasks\nmain.py + db.py"]
 ```
 
 ### API Request Flow
 
 ```mermaid
 flowchart LR
-    A[Client / UI / API caller] --> B[main.py FastAPI app]
-    B --> C[routers.py endpoint]
-    C --> D{verify_jwt in auth.py}
-    D -->|JWT or LDAP-backed JWT valid| E[request.state auth context]
-    E --> F[services.py business logic]
-    F --> G[db.py persistence]
-    F --> H[ragflow_client.py outbound RAGFlow calls]
-    F --> I[observability.py spans/log enrichment]
-    G --> J[(SQLite / PostgreSQL)]
-    H --> K[RAGFlow API]
+    A["Client / UI / API caller"] --> B["main.py FastAPI app"]
+    B --> C["routers.py endpoint"]
+    C --> D{"verify_jwt in auth.py"}
+    D -->|JWT or LDAP-backed JWT valid| E["request.state auth context"]
+    E --> F["services.py business logic"]
+    F --> G["db.py persistence"]
+    F --> H["ragflow_client.py outbound RAGFlow calls"]
+    F --> I["observability.py spans/log enrichment"]
+    G --> J[("SQLite / PostgreSQL")]
+    H --> K["RAGFlow API"]
 ```
 
 ### UI Request Flow
 
 ```mermaid
 flowchart LR
-    A[Browser] --> B[ui.py]
-    B --> C[Single-page HTML / JS]
-    C --> D[/api/v1/auth/*]
-    C --> E[/api/v1/*]
-    D --> F[auth.py]
-    E --> G[routers.py]
-    F --> H[JWT stored in browser]
+    A["Browser"] --> B["ui.py"]
+    B --> C["Single-page HTML / JS"]
+    C --> D["/api/v1/auth/*"]
+    C --> E["/api/v1/*"]
+    D --> F["auth.py"]
+    E --> G["routers.py"]
+    F --> H["JWT stored in browser"]
     H --> E
 ```
 

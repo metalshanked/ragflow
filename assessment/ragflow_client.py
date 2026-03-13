@@ -12,6 +12,7 @@ from copy import deepcopy
 import logging
 import re
 from typing import Any, Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -733,13 +734,9 @@ class RagflowClient:
                 location["label"] = f"Slide {first_value}"
             return location
 
+        location["kind"] = "chunk"
         location["value"] = first_value
-        if doc_type in RagflowClient._SPREADSHEET_TYPES:
-            location["kind"] = "row"
-            location["label"] = f"Row {first_value}"
-        else:
-            location["kind"] = "chunk"
-            location["label"] = f"Chunk {first_value}"
+        location["label"] = f"Chunk {first_value}"
         return location
 
     @staticmethod
@@ -798,15 +795,13 @@ class RagflowClient:
 
         Position interpretation varies by document type:
         - **PDF**: ``positions`` encodes ``[page, x1, x2, y1, y2]`` with real
-          page numbers and bounding-box coordinates → ``page_number`` and
-          ``coordinates`` are populated.
+          page numbers and bounding-box coordinates.
         - **PPT/PPTX**: ``positions`` encodes ``[slide, 0, 0, 0, 0]`` with
-          real slide numbers but zero coordinates → ``page_number`` is
-          populated, ``coordinates`` is ``None``.
-        - **Excel / DOCX / other**: RAGFlow stores
-          ``[[index, index, index, index, index]]`` where *index* is a
-          chunk or row counter.  There is no meaningful page number, so
-          ``page_number`` is ``None`` and ``chunk_index`` is set instead.
+          real slide numbers but zero coordinates.
+        - **Excel / DOCX / other**: RAGFlow commonly stores
+          ``[[index, index, index, index, index]]`` via generic chunk
+          tokenization. The wrapper therefore treats the value as a generic
+          chunk index instead of inventing a row number or sheet location.
         """
         ref_block = response_data.get("reference", {})
         if not ref_block:
@@ -841,6 +836,11 @@ class RagflowClient:
             image_url = f"/api/v1/proxy/image/{image_id}" if image_id else None
             doc_id = RagflowClient._first_present(chunk, "document_id", "doc_id")
             doc_url = f"/api/v1/proxy/document/{doc_id}" if doc_id else None
+            rendered_doc_url = (
+                f"/api/v1/proxy/document/{doc_id}/render?filename={quote(doc_name or ('document.' + (doc_type or 'bin')))}"
+                if doc_id
+                else None
+            )
             dataset_id = RagflowClient._first_present(chunk, "dataset_id", "kb_id")
             preview = RagflowClient._build_preview(reference_type, chunk.get("content", ""), image_url)
             extra_fields = {k: v for k, v in chunk.items() if k not in known_keys}
@@ -860,6 +860,7 @@ class RagflowClient:
                     "preview": preview,
                     "links": {
                         "document_url": doc_url,
+                        "rendered_document_url": rendered_doc_url,
                         "image_url": image_url,
                         "source_url": chunk.get("url"),
                     },

@@ -598,6 +598,10 @@ class TestExtractReferences(unittest.TestCase):
         self.assertEqual(refs[0]["document"]["image_id"], "img-1")
         self.assertEqual(refs[0]["links"]["image_url"], "/api/v1/proxy/image/img-1")
         self.assertEqual(refs[0]["links"]["document_url"], "/api/v1/proxy/document/doc-1")
+        self.assertEqual(
+            refs[0]["links"]["rendered_document_url"],
+            "/api/v1/proxy/document/doc-1/render?filename=test.pdf",
+        )
         self.assertEqual(refs[0]["preview"]["full_content"], "some content")
         self.assertEqual(refs[0]["preview"]["text_excerpt"], "some content")
         self.assertEqual(refs[0]["preview"]["content_format"], "table_html")
@@ -626,11 +630,15 @@ class TestExtractReferences(unittest.TestCase):
         self.assertEqual(refs[0]["document"]["dataset_id"], "kb-alias-1")
         self.assertEqual(refs[0]["document"]["image_id"], "img-alias-1")
         self.assertEqual(refs[0]["links"]["document_url"], "/api/v1/proxy/document/doc-alias-1")
+        self.assertEqual(
+            refs[0]["links"]["rendered_document_url"],
+            "/api/v1/proxy/document/doc-alias-1/render?filename=diagram.png",
+        )
         self.assertEqual(refs[0]["links"]["image_url"], "/api/v1/proxy/image/img-alias-1")
         self.assertEqual(refs[0]["reference_type"], "image")
 
     def test_excel_does_not_expose_internal_positions(self):
-        """Excel positions are internal and must not leak into the wrapper response."""
+        """Excel positions are generic chunk indices and must not be mislabeled as rows."""
         response = {
             "reference": {
                 "chunks": [
@@ -647,8 +655,9 @@ class TestExtractReferences(unittest.TestCase):
         self.assertEqual(refs[0]["document"]["document_type"], "excel")
         self.assertEqual(refs[0]["document"]["media_family"], "spreadsheet")
         self.assertIsNone(refs[0]["location"]["page_number"])
-        self.assertEqual(refs[0]["location"]["kind"], "row")
+        self.assertEqual(refs[0]["location"]["kind"], "chunk")
         self.assertEqual(refs[0]["location"]["value"], 26)
+        self.assertEqual(refs[0]["location"]["label"], "Chunk 26")
         self.assertEqual(refs[0]["reference_type"], "text")
         self.assertEqual(refs[0]["preview"]["full_content"], "excel content")
 

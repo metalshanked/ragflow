@@ -33,12 +33,20 @@ Common:
 
 from __future__ import annotations
 
+import io
 import logging
+import os
+import re
+from html import escape
 from typing import Any, Optional
+from urllib.parse import unquote
+import zipfile
+from xml.etree import ElementTree as ET
 
 import httpx
+import openpyxl
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
 from .auth import actor_from_request, verify_jwt
@@ -105,6 +113,128 @@ _HOP_BY_HOP_HEADERS = {
     "host",
     "content-length",
 }
+_DOCX_NS = {
+    "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+}
+_PPTX_NS = {
+    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
+}
+_HTML_RENDERABLE_EXTENSIONS = {"docx", "xlsx", "xlsm", "pptx"}
+
+
+def _extract_filename_from_headers(headers: httpx.Headers) -> str | None:
+    content_disposition = headers.get("content-disposition", "")
+    if not content_disposition:
+        return None
+    star_match = re.search(r"filename\*=UTF-8''([^;]+)", content_disposition, re.IGNORECASE)
+    if star_match:
+        return unquote(star_match.group(1))
+    match = re.search(r'filename="([^"]+)"', content_disposition, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    match = re.search(r"filename=([^;]+)", content_disposition, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+async def _fetch_ragflow_resource(path: str, *, timeout: float) -> httpx.Response:
+    headers = {"Authorization": f"Bearer {settings.ragflow_api_key}"}
+    url = f"{settings.ragflow_base_url}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=timeout, verify=RagflowClient._ssl_verify()) as client:
+            resp = await client.get(url, headers=headers)
+    except httpx.ConnectError:
+        raise HTTPException(status_code=502, detail="Cannot connect to RAGFlow server")
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="RAGFlow server timed out")
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Error communicating with RAGFlow: {exc}")
+    return resp
+
+
+def _render_docx_html(content: bytes) -> str:
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        xml_data = archive.read("word/document.xml")
+    root = ET.fromstring(xml_data)
+    body = root.find("w:body", _DOCX_NS)
+    if body is None:
+        return '<p class="reference-empty">The document body is empty.</p>'
+
+    parts: list[str] = []
+    for child in list(body):
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "p":
+            texts = [node.text or "" for node in child.findall(".//w:t", _DOCX_NS)]
+            paragraph = "".join(texts).strip()
+            if paragraph:
+                parts.append(f"<p>{escape(paragraph)}</p>")
+        elif tag == "tbl":
+            rows_html: list[str] = []
+            for row in child.findall(".//w:tr", _DOCX_NS):
+                cells_html: list[str] = []
+                for cell in row.findall("./w:tc", _DOCX_NS):
+                    cell_text = "".join((node.text or "") for node in cell.findall(".//w:t", _DOCX_NS)).strip()
+                    cells_html.append(f"<td>{escape(cell_text)}</td>")
+                rows_html.append("<tr>" + "".join(cells_html) + "</tr>")
+            if rows_html:
+                parts.append("<table>" + "".join(rows_html) + "</table>")
+    if not parts:
+        return '<p class="reference-empty">No readable DOCX content was found.</p>'
+    return '<div class="rendered-document rendered-docx">' + "".join(parts) + "</div>"
+
+
+def _render_xlsx_html(content: bytes) -> str:
+    workbook = openpyxl.load_workbook(io.BytesIO(content), data_only=True, read_only=True)
+    sheets_html: list[str] = []
+    for sheet in workbook.worksheets:
+        rows = list(sheet.iter_rows(values_only=True))
+        if not rows:
+            continue
+        table_rows: list[str] = []
+        for row_idx, row in enumerate(rows):
+            if not any(cell not in (None, "") for cell in row):
+                continue
+            cells: list[str] = []
+            cell_tag = "th" if row_idx == 0 else "td"
+            for cell in row:
+                value = "" if cell is None else str(cell)
+                cells.append(f"<{cell_tag}>{escape(value)}</{cell_tag}>")
+            table_rows.append("<tr>" + "".join(cells) + "</tr>")
+        if table_rows:
+            sheets_html.append(f"<section><h3>{escape(sheet.title)}</h3><table>{''.join(table_rows)}</table></section>")
+    if not sheets_html:
+        return '<p class="reference-empty">No readable spreadsheet content was found.</p>'
+    return '<div class="rendered-document rendered-xlsx">' + "".join(sheets_html) + "</div>"
+
+
+def _render_pptx_html(content: bytes) -> str:
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        slide_names = sorted(
+            name for name in archive.namelist()
+            if name.startswith("ppt/slides/slide") and name.endswith(".xml")
+        )
+        slides_html: list[str] = []
+        for idx, slide_name in enumerate(slide_names, start=1):
+            root = ET.fromstring(archive.read(slide_name))
+            texts = [text.strip() for text in root.findall(".//a:t", _PPTX_NS) if (text.text or "").strip()]
+            body = "".join(f"<p>{escape(text)}</p>" for text in texts) if texts else '<p class="reference-empty">No text content detected on this slide.</p>'
+            slides_html.append(f"<section><h3>Slide {idx}</h3>{body}</section>")
+    if not slides_html:
+        return '<p class="reference-empty">No readable PowerPoint content was found.</p>'
+    return '<div class="rendered-document rendered-pptx">' + "".join(slides_html) + "</div>"
+
+
+def _render_document_bytes(content: bytes, filename: str) -> str:
+    ext = os.path.splitext(filename or "")[1].lower().lstrip(".")
+    if ext == "docx":
+        return _render_docx_html(content)
+    if ext in {"xlsx", "xlsm"}:
+        return _render_xlsx_html(content)
+    if ext == "pptx":
+        return _render_pptx_html(content)
+    raise HTTPException(status_code=415, detail="Document type is not renderable in the built-in UI")
 
 
 async def _audit(
@@ -867,19 +997,7 @@ async def proxy_image(image_id: str):
 
     Streams the response directly from the RAGFlow server.
     """
-    from .ragflow_client import RagflowClient
-
-    ragflow_url = f"{settings.ragflow_base_url}/v1/document/image/{image_id}"
-    headers = {"Authorization": f"Bearer {settings.ragflow_api_key}"}
-    try:
-        async with httpx.AsyncClient(timeout=30, verify=RagflowClient._ssl_verify()) as client:
-            resp = await client.get(ragflow_url, headers=headers)
-    except httpx.ConnectError:
-        raise HTTPException(status_code=502, detail="Cannot connect to RAGFlow server")
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="RAGFlow server timed out")
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Error communicating with RAGFlow: {exc}")
+    resp = await _fetch_ragflow_resource(f"/v1/document/image/{image_id}", timeout=30)
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail="Failed to fetch image from RAGFlow")
     return Response(
@@ -897,19 +1015,7 @@ async def proxy_document(document_id: str):
 
     Streams the response directly from the RAGFlow server.
     """
-    from .ragflow_client import RagflowClient
-
-    ragflow_url = f"{settings.ragflow_base_url}/v1/document/get/{document_id}"
-    headers = {"Authorization": f"Bearer {settings.ragflow_api_key}"}
-    try:
-        async with httpx.AsyncClient(timeout=60, verify=RagflowClient._ssl_verify()) as client:
-            resp = await client.get(ragflow_url, headers=headers)
-    except httpx.ConnectError:
-        raise HTTPException(status_code=502, detail="Cannot connect to RAGFlow server")
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="RAGFlow server timed out")
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Error communicating with RAGFlow: {exc}")
+    resp = await _fetch_ragflow_resource(f"/v1/document/get/{document_id}", timeout=60)
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail="Failed to fetch document from RAGFlow")
     # Forward content-type and content-disposition if present
@@ -921,6 +1027,35 @@ async def proxy_document(document_id: str):
         media_type=resp.headers.get("content-type", "application/octet-stream"),
         headers=response_headers,
     )
+
+
+@router.get("/proxy/document/{document_id}/render")
+async def render_document(document_id: str, filename: str | None = Query(default=None)):
+    """
+    Render supported document types to HTML for the built-in UI.
+
+    This is intended for browser display of common non-PDF formats such as
+    DOCX, XLSX, and PPTX.
+    """
+    resp = await _fetch_ragflow_resource(f"/v1/document/get/{document_id}", timeout=60)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail="Failed to fetch document from RAGFlow")
+    resolved_filename = filename or _extract_filename_from_headers(resp.headers) or document_id
+    ext = os.path.splitext(resolved_filename)[1].lower().lstrip(".")
+    if ext not in _HTML_RENDERABLE_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="Document type is not renderable in the built-in UI")
+    try:
+        rendered_html = _render_document_bytes(resp.content, resolved_filename)
+    except HTTPException:
+        raise
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=415, detail="Document content is not a supported OOXML file")
+    except ET.ParseError:
+        raise HTTPException(status_code=422, detail="Failed to parse document structure")
+    except Exception as exc:
+        logger.exception("Failed to render document %s", document_id)
+        raise HTTPException(status_code=422, detail=f"Failed to render document: {exc}")
+    return HTMLResponse(rendered_html)
 
 
 # ---------------------------------------------------------------------------

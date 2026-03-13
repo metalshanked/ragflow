@@ -66,7 +66,7 @@ class ReferenceHighlightBox(BaseModel):
 
 
 class ReferenceLocation(BaseModel):
-    kind: str = ""  # page | slide | row | chunk
+    kind: str = ""  # page | slide | chunk
     value: Optional[int] = None
     label: str = ""
     page_number: Optional[int] = None
@@ -84,6 +84,7 @@ class ReferencePreview(BaseModel):
 
 class ReferenceLinks(BaseModel):
     document_url: Optional[str] = None
+    rendered_document_url: Optional[str] = None
     image_url: Optional[str] = None
     source_url: Optional[str] = None
 
