@@ -91,6 +91,20 @@ def _effective_dataset_options(
     return _deep_merge_dicts(defaults, runtime)
 
 
+def _effective_chat_options(
+    chat_opts: dict | None,
+    *,
+    include_defaults: bool = True,
+) -> dict[str, Any]:
+    """Return runtime chat options merged on top of configured defaults."""
+    runtime = chat_opts if isinstance(chat_opts, dict) else {}
+    if not include_defaults:
+        return deepcopy(runtime)
+
+    defaults = settings.default_chat_options if isinstance(settings.default_chat_options, dict) else {}
+    return _deep_merge_dicts(defaults, runtime)
+
+
 def _ordered_unique(values: list[str]) -> list[str]:
     """Return non-empty values preserving first-seen order."""
     seen: set[str] = set()
@@ -536,7 +550,7 @@ async def run_assessment(
                 client = RagflowClient()
 
                 dataset_opts = _effective_dataset_options(dataset_opts, include_defaults=True)
-                chat_opts = chat_opts or {}
+                chat_opts = _effective_chat_options(chat_opts, include_defaults=True)
                 reuse_mode = bool(dataset_name and reuse_exisiting_dataset)
 
                 try:
@@ -1156,7 +1170,7 @@ async def run_assessment_for_session(
                         message="Creating chat assistant...",
                     )
                     c_name = chat_name or f"{settings.default_chat_name_prefix}_chat_{task_id[:8]}"
-                    chat_opts = chat_opts or {}
+                    chat_opts = _effective_chat_options(chat_opts, include_defaults=True)
                     chat_id = await client.ensure_chat(
                         c_name,
                         [dataset_id],
@@ -1258,7 +1272,7 @@ async def run_assessment_from_dataset(
                         message="Creating chat assistant...",
                     )
                     c_name = chat_name or f"{settings.default_chat_name_prefix}_chat_{task_id[:8]}"
-                    chat_opts = chat_opts or {}
+                    chat_opts = _effective_chat_options(chat_opts, include_defaults=True)
                     chat_id = await client.ensure_chat(
                         c_name,
                         dataset_ids,

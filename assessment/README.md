@@ -156,6 +156,7 @@ All settings (see `config.py`). Examples below use shell-style `export`, but the
 | `ASSESSMENT_DEFAULT_SIMILARITY_THRESHOLD` | `0.1` | `0.2` | RAG similarity threshold |
 | `ASSESSMENT_DEFAULT_TOP_N` | `8` | `12` | Number of chunks to retrieve |
 | `ASSESSMENT_DEFAULT_DATASET_OPTIONS` | `{}` | `{"permission":"team","parser_config":{"enable_metadata":true}}` | JSON object of default dataset options merged into dataset create/update operations |
+| `ASSESSMENT_DEFAULT_CHAT_OPTIONS` | `{}` | `{"llm":{"temperature":0.2},"prompt":{"top_n":12}}` | JSON object of default chat options merged into chat creation operations |
 | `ASSESSMENT_QUESTION_ID_COLUMN` | `A` | `A` | Default Excel column for Question Serial No |
 | `ASSESSMENT_QUESTION_COLUMN` | `B` | `B` | Default Excel column for Question text |
 | `ASSESSMENT_VENDOR_RESPONSE_COLUMN` | `C` | `C` | Default Excel column for vendor response |
@@ -240,10 +241,27 @@ Example with forward REST dataset fields:
 export ASSESSMENT_DEFAULT_DATASET_OPTIONS='{"permission":"team","chunk_method":"naive","parser_config":{"enable_metadata":true,"auto_keywords":3,"auto_questions":2}}'
 ```
 
+Default chat options example:
+
+```bash
+export ASSESSMENT_DEFAULT_CHAT_OPTIONS='{"llm":{"temperature":0.2},"prompt":{"top_n":12}}'
+```
+
+Forward chat contract:
+
+- `chat_options` and `ASSESSMENT_DEFAULT_CHAT_OPTIONS` are merged and sent to RAGFlow's public chat creation API.
+- Use forward chat fields such as `llm`, `prompt`, and other public chat-create options supported by upstream RAGFlow.
+- Request `chat_options` override the configured defaults, including nested fields.
+
 Merge precedence:
 
 1. `ASSESSMENT_DEFAULT_DATASET_OPTIONS`
 2. Request `dataset_options` (overrides defaults, including nested fields)
+
+Chat merge precedence:
+
+1. `ASSESSMENT_DEFAULT_CHAT_OPTIONS`
+2. Request `chat_options` (overrides defaults, including nested fields)
 
 ### Observability (OpenTelemetry + OpenInference)
 

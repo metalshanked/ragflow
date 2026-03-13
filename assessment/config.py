@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     # Example env value:
     # ASSESSMENT_DEFAULT_DATASET_OPTIONS='{"permission":"team","parser_config":{"enable_metadata":true}}'
     default_dataset_options: dict[str, Any] = Field(default_factory=dict)
+    # Default chat options merged into all chat create operations initiated
+    # by this app. Runtime `chat_options` payloads override these.
+    # Example env value:
+    # ASSESSMENT_DEFAULT_CHAT_OPTIONS='{"llm":{"temperature":0.2},"prompt":{"top_n":12}}'
+    default_chat_options: dict[str, Any] = Field(default_factory=dict)
 
     # Questions Excel column names (1-based column numbers or header names)
     # Accessible via env: ASSESSMENT_QUESTION_ID_COLUMN, ASSESSMENT_QUESTION_COLUMN, etc.
@@ -159,6 +164,29 @@ class Settings(BaseSettings):
             return parsed
         raise ValueError(
             "ASSESSMENT_DEFAULT_DATASET_OPTIONS must be a JSON object"
+        )
+
+    @field_validator("default_chat_options", mode="before")
+    @classmethod
+    def _parse_default_chat_options(cls, value: Any) -> dict[str, Any]:
+        if value in (None, ""):
+            return {}
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "ASSESSMENT_DEFAULT_CHAT_OPTIONS must be valid JSON"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise ValueError(
+                    "ASSESSMENT_DEFAULT_CHAT_OPTIONS must be a JSON object"
+                )
+            return parsed
+        raise ValueError(
+            "ASSESSMENT_DEFAULT_CHAT_OPTIONS must be a JSON object"
         )
 
     model_config = {"env_prefix": "ASSESSMENT_", "env_file": ".env"}

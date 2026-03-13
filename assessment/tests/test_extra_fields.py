@@ -193,6 +193,68 @@ def test_run_assessment_merges_default_and_runtime_dataset_options(
     assert dataset_kwargs["parser_config"]["raptor"]["max_token"] == 512
 
 
+@patch("assessment.services._process_questions", new_callable=AsyncMock)
+@patch("assessment.services._update_status", new_callable=AsyncMock)
+@patch("assessment.services.get_task", new_callable=AsyncMock)
+@patch("assessment.services.RagflowClient")
+def test_run_assessment_merges_default_and_runtime_chat_options(
+    MockClient,
+    mock_get_task,
+    mock_update_status,
+    mock_process_questions,
+):
+    del mock_update_status
+    mock_process_questions.return_value = 0
+
+    record = _make_record("task-extra-003b")
+    mock_get_task.return_value = record
+
+    mock_client = AsyncMock()
+    mock_client.ensure_dataset = AsyncMock(return_value="ds-1")
+    mock_client.upload_document = AsyncMock(return_value="doc-1")
+    mock_client.start_parsing = AsyncMock()
+    mock_client.wait_for_parsing = AsyncMock(return_value=[
+        {
+            "document_id": "doc-1",
+            "document_name": "evidence.pdf",
+            "status": "success",
+            "progress": 1.0,
+            "message": "ok",
+        }
+    ])
+    mock_client.ensure_chat = AsyncMock(return_value="chat-1")
+    mock_client.create_session = AsyncMock(return_value="sess-1")
+    mock_client.close = AsyncMock()
+    MockClient.return_value = mock_client
+
+    default_opts = {
+        "llm": {"temperature": 0.1, "max_tokens": 512},
+        "prompt": {"top_n": 8, "quote": True},
+    }
+    runtime_opts = {
+        "llm": {"temperature": 0.2},
+        "prompt": {"top_n": 12},
+        "custom_chat_flag": "yes",
+    }
+
+    with patch.object(services.settings, "default_chat_options", default_opts):
+        _run(
+            run_assessment(
+                task_id="task-extra-003b",
+                questions=record.questions,
+                evidence_files=[("evidence.pdf", b"file-bytes")],
+                chat_opts=runtime_opts,
+            )
+        )
+
+    _, chat_kwargs = mock_client.ensure_chat.await_args
+    assert chat_kwargs["llm"]["temperature"] == 0.2
+    assert chat_kwargs["llm"]["max_tokens"] == 512
+    assert chat_kwargs["prompt"]["top_n"] == 12
+    assert chat_kwargs["prompt"]["quote"] is True
+    assert chat_kwargs["custom_chat_flag"] == "yes"
+
+
 @patch("assessment.services.db_find_document_by_hash", new_callable=AsyncMock)
 @patch("assessment.services._process_questions", new_callable=AsyncMock)
 @patch("assessment.services._update_status", new_callable=AsyncMock)
