@@ -20,9 +20,9 @@ def test_ui_page_includes_icon_links_and_header_logo():
 
     assert response.status_code == 200
     assert 'rel="icon" href="favicon.ico"' in response.text
-    assert 'rel="shortcut icon" href="favicon.ico"' in response.text
-    assert 'rel="apple-touch-icon" href="favicon.ico"' in response.text
-    assert '<img src="favicon.ico" alt=""/>' in response.text
+    assert 'rel="shortcut icon"' not in response.text
+    assert 'rel="apple-touch-icon"' not in response.text
+    assert '<img src="data:image/svg+xml;base64,' in response.text
     assert "<title>AI Assessments</title>" in response.text
     assert ">AI Assessments</h2>" in response.text
     assert ">AI Assessments</h1>" in response.text
@@ -33,14 +33,16 @@ def test_ui_page_includes_icon_links_and_header_logo():
     assert 'id="link-docs"' in response.text
     assert 'id="api-link-result"' in response.text
     assert 'id="btn-delete-all-tasks"' in response.text
-    assert 'id="detail-auto-refresh-interval"' in response.text
+    assert 'id="confirm-modal"' in response.text
     assert 'id="btn-delete-detail-task"' in response.text
+    assert "detail-auto-refresh" not in response.text
     assert "assessment_access_token_expires_at" in response.text
     assert "ensureActiveSession(false);" in response.text
     assert "runApiLink('link-assessments')" in response.text
     assert "openReferenceDocument(this.dataset.ref)" in response.text
     assert "openReferenceImage(this.dataset.ref)" in response.text
     assert "openReferenceContent(this.dataset.ref)" in response.text
+    assert "function openDeleteAllModal()" in response.text
     assert "async function deleteAllTasks" in response.text
     assert "async function deleteTask(taskId)" in response.text
     assert "async function _fetchProtectedResource" in response.text
@@ -62,8 +64,8 @@ def test_ui_page_uses_relative_favicon_links():
 
     assert response.status_code == 200
     assert 'rel="icon" href="favicon.ico"' in response.text
-    assert 'rel="shortcut icon" href="favicon.ico"' in response.text
-    assert '<img src="favicon.ico" alt=""/>' in response.text
+    assert 'rel="shortcut icon"' not in response.text
+    assert '<img src="data:image/svg+xml;base64,' in response.text
 
 
 def test_icon_routes_serve_svg_and_png_assets():

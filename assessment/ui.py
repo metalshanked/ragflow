@@ -29,6 +29,9 @@ APP_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" 
   <circle cx="66" cy="78" r="4.5" fill="#2ec4b6"/>
   <circle cx="84" cy="54" r="4.5" fill="#2ec4b6"/>
 </svg>"""
+APP_ICON_DATA_URI = "data:image/svg+xml;base64," + base64.b64encode(
+    APP_ICON_SVG.encode("utf-8")
+).decode("ascii")
 
 APP_FAVICON_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAACBElEQVR42sWWa0tUURSG9y+a+/0+0y8xEiOSQhRFFEMSRZQikiKURJQiFEW832acNLOLpd2vVpqjWf6Ft3Xmg1DOWnNm3HBeWJ+fZ5+z91pLnak4QursH6TO/Uay8hDJql9Inj9A4sI+EhdzSFTvIX7pJ+KXdxGv2UWsdgexuh+I1X9HtOEboo3biDZ9RaT5CyItnxG58gnhVqqrHxFu+4BQ+3uEOt4h1PkWwa43CHa/RvDaKwSubyFwYwvKSnjg5iYJWAj397yEshLuv/WCBCyE+29vkIAA15HtHFi4785zKOnkOuB5AQbu631GAsJn1wHPCzBwX99TEhD+uQ64URzce/cJlHThdMDzAgzc279OAsJt/z+2lanjKkmAgXsHHpOA8NQ4gVLDwT2DJCC980IC5YSDe4bWSEBoMlKMIWaUKQEG7rn3iASEDmdGwIwEB3ffX4WS2muxmJXg4O4HKyQg9HYzMSPBwd3DD0lAGCxmU0yCg7tGslDSVCslkgQHd40uk4AwUksNJ8HBneNpKGmZKDcnBBi4c8IQEDaZ0+QfAQbunFwiAWGN0hUO7phehJJ2OG0CDNwxs0ACwgKpTYCBO+bmSUDYXnWFg9sX5qDMrM7SPJeajHRyA25fnCUBC+H29AwJWAi3ZaahrITbslMkYCHcWPH+AiMzXFUS3KaoAAAAAElFTkSuQmCC"
@@ -48,6 +51,7 @@ async def ui_page(request: Request):
     return HTMLResponse(
         content=_build_html(
             favicon_href=_ui_asset_href(request, "favicon.ico"),
+            app_icon_href=APP_ICON_DATA_URI,
         ),
         status_code=200,
     )
@@ -83,15 +87,13 @@ async def favicon() -> Response:
     )
 
 
-def _build_html(*, favicon_href: str) -> str:
+def _build_html(*, favicon_href: str, app_icon_href: str) -> str:
     return r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <link rel="icon" href="__FAVICON_HREF__" sizes="any" type="image/x-icon"/>
-<link rel="shortcut icon" href="__FAVICON_HREF__" type="image/x-icon"/>
-<link rel="apple-touch-icon" href="__FAVICON_HREF__"/>
 <title>AI Assessments</title>
 <style>
 :root{--bg:#f5f7fa;--card:#fff;--primary:#4361ee;--primary-hover:#3a56d4;--danger:#ef476f;--success:#06d6a0;--warn:#ffd166;--text:#212529;--muted:#6c757d;--border:#dee2e6;--radius:8px;--disabled:#a0aec0}
@@ -191,6 +193,9 @@ button.link-card{width:100%;text-align:left;font:inherit}
 .reference-html img{max-width:100%;height:auto}
 .reference-score{font-size:.78rem;color:var(--muted)}
 .reference-empty{font-size:.84rem;color:var(--muted)}
+.confirm-card{width:min(480px,92vw);padding:1.25rem 1.25rem 1rem}
+.confirm-card p{margin:.75rem 0 1rem;color:var(--muted)}
+.confirm-actions{display:flex;justify-content:flex-end;gap:.6rem;flex-wrap:wrap}
 /* Auto-refresh toggle */
 .auto-refresh{display:flex;align-items:center;gap:.5rem;font-size:.85rem}
 .auto-refresh label{margin:0;font-weight:normal}
@@ -202,7 +207,7 @@ button.link-card{width:100%;text-align:left;font:inherit}
 <div class="login-screen hidden" id="login-screen">
   <div class="login-card">
     <div class="login-mark">
-      <img src="__FAVICON_HREF__" alt=""/>
+      <img src="__APP_ICON_HREF__" alt=""/>
       <div>
         <h2>AI Assessments</h2>
         <p>Sign in with your LDAP account to access the app.</p>
@@ -221,7 +226,7 @@ button.link-card{width:100%;text-align:left;font:inherit}
   </div>
 </div>
 <header>
-  <h1><img src="__FAVICON_HREF__" alt=""/>AI Assessments</h1>
+  <h1><img src="__APP_ICON_HREF__" alt=""/>AI Assessments</h1>
   <div class="header-actions">
     <span class="info" id="hdr-info"></span>
     <span class="session-pill hidden" id="session-summary"></span>
@@ -257,7 +262,7 @@ button.link-card{width:100%;text-align:left;font:inherit}
           </select>
         </div>
         <button class="btn btn-primary btn-sm" id="btn-refresh-tasks" onclick="loadTasks()">&#128260; Refresh</button>
-        <button class="btn btn-danger btn-sm" id="btn-delete-all-tasks" onclick="deleteAllTasks()">Delete All Tasks</button>
+        <button class="btn btn-danger btn-sm" id="btn-delete-all-tasks" onclick="openDeleteAllModal()">Delete All</button>
       </div>
     </div>
     <div id="tasks-body"><p class="empty">Click Refresh to load tasks</p></div>
@@ -466,15 +471,6 @@ button.link-card{width:100%;text-align:left;font:inherit}
     <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem;margin-bottom:.5rem">
       <h3 id="detail-title">Task Details</h3>
       <div style="display:flex;align-items:center;gap:.6rem;flex-wrap:wrap">
-        <div class="auto-refresh">
-          <label><input type="checkbox" id="detail-auto-refresh-cb" onchange="toggleDetailAutoRefresh()"/> Auto-refresh</label>
-          <select id="detail-auto-refresh-interval" onchange="toggleDetailAutoRefresh()" style="width:auto;padding:2px 4px;font-size:.82rem">
-            <option value="5">5s</option>
-            <option value="10" selected>10s</option>
-            <option value="30">30s</option>
-            <option value="60">60s</option>
-          </select>
-        </div>
         <button class="btn btn-outline btn-sm" onclick="closeDetail()">&#10005; Close</button>
         <button class="btn btn-primary btn-sm" onclick="refreshDetail()">&#128260; Refresh</button>
         <button class="btn btn-danger btn-sm" id="btn-delete-detail-task" onclick="deleteCurrentTask()">Delete Task</button>
@@ -491,6 +487,7 @@ button.link-card{width:100%;text-align:left;font:inherit}
 <div class="toast" id="toast"></div>
 <!-- Image modal container -->
 <div id="img-modal" class="hidden"></div>
+<div id="confirm-modal" class="hidden"></div>
 
 <script>
 function validateJsonInput(el) {
@@ -877,26 +874,27 @@ function onRetryFieldChange(){ btnReset('btn-retry-start'); }
 /* Auto-refresh                                                        */
 /* ------------------------------------------------------------------ */
 let _autoRefreshTimer = null;
+let _autoRefreshInFlight = false;
+async function refreshActiveViews(){
+  if(_autoRefreshInFlight)return;
+  _autoRefreshInFlight=true;
+  try{
+    await loadTasks();
+    const detail=document.getElementById('task-detail');
+    if(_detailTaskId && detail && !detail.classList.contains('hidden')){
+      await refreshDetail();
+    }
+  }finally{
+    _autoRefreshInFlight=false;
+  }
+}
 function toggleAutoRefresh(){
   if(_autoRefreshTimer){clearInterval(_autoRefreshTimer);_autoRefreshTimer=null;}
   const cb=document.getElementById('auto-refresh-cb');
   if(cb.checked){
     const secs=parseInt(document.getElementById('auto-refresh-interval').value)||10;
-    loadTasks();
-    _autoRefreshTimer=setInterval(loadTasks, secs*1000);
-  }
-}
-let _detailAutoRefreshTimer = null;
-function toggleDetailAutoRefresh(){
-  if(_detailAutoRefreshTimer){clearInterval(_detailAutoRefreshTimer);_detailAutoRefreshTimer=null;}
-  const cb=document.getElementById('detail-auto-refresh-cb');
-  const detail=document.getElementById('task-detail');
-  if(cb && cb.checked && _detailTaskId && detail && !detail.classList.contains('hidden')){
-    const secs=parseInt(document.getElementById('detail-auto-refresh-interval').value)||10;
-    refreshDetail();
-    _detailAutoRefreshTimer=setInterval(function(){
-      if(_detailTaskId && !detail.classList.contains('hidden'))refreshDetail();
-    }, secs*1000);
+    void refreshActiveViews();
+    _autoRefreshTimer=setInterval(function(){ void refreshActiveViews(); }, secs*1000);
   }
 }
 
@@ -992,6 +990,21 @@ function closeImageModal(){
   _clearModalObjectUrls();
   m.className='hidden';
   m.innerHTML='';
+}
+function openDeleteAllModal(){
+  const modal=document.getElementById('confirm-modal');
+  modal.className='modal-overlay';
+  modal.innerHTML="<div class=\"modal-content confirm-card\"><button class=\"modal-close\" onclick=\"closeConfirmModal()\">&times;</button><div class=\"modal-title\">Delete all tasks?</div><p>This will call the delete-task API for every task currently returned by the assessment API and will also remove each task's results, datasets, and chat resources.</p><div class=\"confirm-actions\"><button class=\"btn btn-outline btn-sm\" type=\"button\" onclick=\"closeConfirmModal()\">Cancel</button><button class=\"btn btn-danger btn-sm\" type=\"button\" onclick=\"confirmDeleteAllTasks()\">Delete All</button></div></div>";
+  modal.onclick=function(e){if(e.target===modal)closeConfirmModal();};
+}
+function closeConfirmModal(){
+  const modal=document.getElementById('confirm-modal');
+  modal.className='hidden';
+  modal.innerHTML='';
+}
+async function confirmDeleteAllTasks(){
+  closeConfirmModal();
+  await deleteAllTasks();
 }
 async function showImageModal(url, title){
   _openModal(title||'Reference image', '<p class="reference-empty">Loading image…</p>', 'modal-document');
@@ -1159,7 +1172,6 @@ async function deleteCurrentTask(){
 }
 
 async function deleteAllTasks(){
-  if(!confirm('Delete all tasks shown by the assessment API and remove each task\\'s datasets, chat, and results?'))return;
   const button=document.getElementById('btn-delete-all-tasks');
   const original=button.innerHTML;
   button.disabled=true;
@@ -1284,12 +1296,8 @@ async function viewTask(tid){
   document.getElementById('task-detail').classList.remove('hidden');
   document.getElementById('detail-title').textContent='Task '+tid.substring(0,12)+'\u2026';
   await refreshDetail();
-  if(document.getElementById('detail-auto-refresh-cb').checked)toggleDetailAutoRefresh();
 }
 function closeDetail(){
-  if(_detailAutoRefreshTimer){clearInterval(_detailAutoRefreshTimer);_detailAutoRefreshTimer=null;}
-  const cb=document.getElementById('detail-auto-refresh-cb');
-  if(cb)cb.checked=false;
   document.getElementById('task-detail').classList.add('hidden');
 }
 
@@ -1885,4 +1893,4 @@ function toggleAll(source, className) {
 
 </script>
 </body>
-</html>""".replace("__FAVICON_HREF__", favicon_href)
+</html>""".replace("__FAVICON_HREF__", favicon_href).replace("__APP_ICON_HREF__", app_icon_href)
