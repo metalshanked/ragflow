@@ -173,6 +173,11 @@ th{background:var(--bg);font-weight:600;position:sticky;top:0}
 .ref-links{margin-top:.3rem;display:flex;gap:.6rem;flex-wrap:wrap;font-size:.8rem}
 .ref-links a{color:var(--primary);text-decoration:none;cursor:pointer}
 .ref-links a:hover{text-decoration:underline}
+.link-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:.85rem;margin-top:1rem}
+.link-card{display:block;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:.9rem 1rem;color:var(--text);text-decoration:none}
+.link-card:hover{border-color:var(--primary);box-shadow:0 4px 16px rgba(67,97,238,.08)}
+.link-card strong{display:block;margin-bottom:.25rem}
+.link-card code{display:block;font-size:.8rem;color:var(--muted);word-break:break-all}
 /* Image modal */
 .modal-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6);z-index:1000;display:flex;align-items:center;justify-content:center}
 .modal-content{background:#fff;border-radius:var(--radius);padding:1rem;max-width:90vw;max-height:90vh;overflow:auto;position:relative}
@@ -226,6 +231,7 @@ th{background:var(--bg);font-weight:600;position:sticky;top:0}
     <button class="tab" data-tab="upload" onclick="switchTab(this)">&#128228; Upload Docs</button>
     <button class="tab" data-tab="manage" onclick="switchTab(this)">&#128193; Manage Data</button>
     <button class="tab" data-tab="health" onclick="switchTab(this)">&#128154; Health</button>
+    <button class="tab" data-tab="api" onclick="switchTab(this)">&#128279; API Docs</button>
   </div>
 
   <!-- TASKS PANEL -->
@@ -412,6 +418,38 @@ th{background:var(--bg);font-weight:600;position:sticky;top:0}
     <pre id="health-result" style="margin-top:1rem;background:var(--bg);padding:1rem;border-radius:var(--radius);font-size:.88rem"></pre>
   </div>
 
+  <!-- API DOCS PANEL -->
+  <div class="panel" id="panel-api">
+    <h3>API Docs & Links</h3>
+    <p style="color:var(--muted);font-size:.88rem;margin:.4rem 0">Quick links to the generated API documentation and commonly used endpoints.</p>
+    <div class="link-grid">
+      <a class="link-card" id="link-docs" target="_blank" rel="noreferrer">
+        <strong>Swagger UI</strong>
+        <code></code>
+      </a>
+      <a class="link-card" id="link-redoc" target="_blank" rel="noreferrer">
+        <strong>ReDoc</strong>
+        <code></code>
+      </a>
+      <a class="link-card" id="link-openapi" target="_blank" rel="noreferrer">
+        <strong>OpenAPI JSON</strong>
+        <code></code>
+      </a>
+      <a class="link-card" id="link-health" target="_blank" rel="noreferrer">
+        <strong>Health</strong>
+        <code></code>
+      </a>
+      <a class="link-card" id="link-assessments" target="_blank" rel="noreferrer">
+        <strong>Assessments List</strong>
+        <code></code>
+      </a>
+      <a class="link-card" id="link-datasets" target="_blank" rel="noreferrer">
+        <strong>Native Datasets</strong>
+        <code></code>
+      </a>
+    </div>
+  </div>
+
   <!-- TASK DETAIL MODAL -->
   <div id="task-detail" class="hidden" style="margin-top:1rem">
     <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem;margin-bottom:.5rem">
@@ -462,6 +500,24 @@ const HEALTH_URL = (function(){
   const uiIdx = path.lastIndexOf('/ui');
   return uiIdx > 0 ? path.substring(0, uiIdx) + '/health' : '/health';
 })();
+
+function initApiLinks(){
+  const links = {
+    'link-docs': BASE_PATH + '/docs',
+    'link-redoc': BASE_PATH + '/redoc',
+    'link-openapi': BASE_PATH + '/openapi.json',
+    'link-health': HEALTH_URL,
+    'link-assessments': API + '/assessments',
+    'link-datasets': API + '/native/datasets',
+  };
+  Object.keys(links).forEach(function(id){
+    const el = document.getElementById(id);
+    if(!el)return;
+    el.href = links[id];
+    const codeEl = el.querySelector('code');
+    if(codeEl)codeEl.textContent = links[id];
+  });
+}
 
 let ACCESS_TOKEN = localStorage.getItem('assessment_access_token') || '';
 let REFRESH_TOKEN = localStorage.getItem('assessment_refresh_token') || '';
@@ -1149,6 +1205,7 @@ function escHtml(s){const d=document.createElement('div');d.textContent=s||'';re
 function escAttr(s){return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 
 // Auto-check health on load
+initApiLinks();
 checkHealth();
 /* ------------------------------------------------------------------ */
 /* Manage Data                                                         */

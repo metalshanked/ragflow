@@ -25,7 +25,11 @@ def test_ui_page_includes_icon_links_and_header_logo():
     assert '<img src="/favicon.ico" alt=""/>' in response.text
     assert 'id="login-screen"' in response.text
     assert 'id="btn-logout"' in response.text
+    assert 'data-tab="api"' in response.text
+    assert 'id="panel-api"' in response.text
+    assert 'id="link-docs"' in response.text
     assert "AUTH_MODE = authType;" in response.text
+    assert "initApiLinks();" in response.text
     assert "Refresh Token" not in response.text
     assert ">Verify<" not in response.text
 

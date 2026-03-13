@@ -72,11 +72,11 @@ def mint_token(
     payload = {
         "sub": subject.strip(),
         "roles": normalized_roles,
-        "groups": normalized_groups,
         "type": token_type,
-        "iat": int(now.timestamp()),
         "exp": int(exp.timestamp()),
     }
+    if normalized_groups:
+        payload["groups"] = normalized_groups
     return jwt.encode(payload, secret, algorithm=algorithm)
 
 

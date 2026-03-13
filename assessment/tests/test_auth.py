@@ -61,6 +61,23 @@ def create_access_token(username: str, roles: list[str]) -> str:
     )
 
 
+class _FakeEntry:
+    def __init__(self, dn: str, attrs: dict[str, object]):
+        self.entry_dn = dn
+        self.entry_attributes_as_dict = attrs
+
+
+class _FakeConnection:
+    def __init__(self, entry: _FakeEntry):
+        self.entry = entry
+        self.entries = [entry]
+        self.last_search: dict[str, object] | None = None
+
+    def search(self, **kwargs):
+        self.last_search = kwargs
+        return True
+
+
 def test_resolve_roles_handles_multiple_groups_and_formats():
     mapping = (
         '{"viewer":["rgf-readers"],'
@@ -77,6 +94,68 @@ def test_resolve_roles_handles_multiple_groups_and_formats():
         roles = auth._resolve_roles(groups)
 
     assert roles == [auth.ROLE_VIEWER, auth.ROLE_OPERATOR, auth.ROLE_ADMIN]
+
+
+def test_resolve_roles_and_groups_keeps_only_mapped_group_names():
+    mapping = (
+        '{"viewer":["CN=RGF-Readers,OU=Groups,DC=example,DC=local"],'
+        '"operator":["RGF-Operators"],'
+        '"admin":[]}'
+    )
+    groups = [
+        "CN=RGF-Readers,OU=Groups,DC=example,DC=local",
+        "EXAMPLE\\RGF-Operators",
+        "CN=Very-Large-Unrelated-Group,OU=Groups,DC=example,DC=local",
+    ]
+
+    with override_settings(ldap_group_role_mapping_json=mapping):
+        roles, matched_groups = auth._resolve_roles_and_groups(groups)
+
+    assert roles == [auth.ROLE_VIEWER, auth.ROLE_OPERATOR]
+    assert matched_groups == ["RGF-Readers", "RGF-Operators"]
+
+
+def test_create_token_omits_empty_groups_and_iat():
+    with override_settings(
+        jwt_secret_key=TEST_JWT_SECRET,
+        jwt_algorithm="HS256",
+    ):
+        token = auth._create_token(
+            username="alice",
+            roles=["admin"],
+            groups=[],
+            token_type="access",
+            ttl_minutes=30,
+        )
+
+    payload = jwt.decode(token, TEST_JWT_SECRET, algorithms=["HS256"])
+    assert payload["sub"] == "alice"
+    assert payload["roles"] == ["admin"]
+    assert payload["type"] == "access"
+    assert "groups" not in payload
+    assert "iat" not in payload
+
+
+def test_search_user_avoids_memberof_when_targeted_group_lookup_enabled():
+    entry = _FakeEntry(
+        "CN=Alice,OU=Users,DC=example,DC=local",
+        {"memberOf": ["CN=Huge-Group,OU=Groups,DC=example,DC=local"], "cn": ["Alice"]},
+    )
+    conn = _FakeConnection(entry)
+    mapping = '{"viewer":["RGF-Readers"],"operator":[],"admin":[]}'
+
+    with override_settings(
+        ldap_user_base_dn="OU=Users,DC=example,DC=local",
+        ldap_group_search_base_dn="OU=Groups,DC=example,DC=local",
+        ldap_group_name_attribute="cn",
+        ldap_group_role_mapping_json=mapping,
+    ):
+        user_dn, groups = auth._search_user(conn, "alice")
+
+    assert user_dn == "CN=Alice,OU=Users,DC=example,DC=local"
+    assert groups == []
+    assert conn.last_search is not None
+    assert conn.last_search["attributes"] == ["cn"]
 
 
 def test_auth_token_verify_refresh_happy_path():

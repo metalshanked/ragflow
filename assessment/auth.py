@@ -134,27 +134,82 @@ def _group_candidate_values(groups: list[str]) -> set[str]:
     return candidates
 
 
-def _resolve_roles(groups: list[str]) -> list[str]:
-    """Resolve roles from LDAP groups using env-configured mapping JSON."""
+def _mapping_patterns() -> list[str]:
+    patterns: list[str] = []
+    for values in _load_role_mapping().values():
+        for value in values:
+            raw = value.strip()
+            if raw:
+                patterns.append(raw)
+    return patterns
+
+
+def _mapping_group_name(pattern: str) -> str:
+    raw = pattern.strip()
+    if not raw:
+        return ""
+    if "\\" in raw:
+        raw = raw.split("\\", 1)[1].strip()
+    if "," in raw and "=" in raw:
+        first_rdn = raw.split(",", 1)[0]
+        if "=" in first_rdn:
+            raw = first_rdn.split("=", 1)[1].strip()
+    elif "=" in raw and "," not in raw:
+        parts = raw.split("=", 1)
+        if len(parts) == 2:
+            raw = parts[1].strip()
+    raw = raw.strip().strip("*")
+    return raw
+
+
+def _mapped_group_names() -> list[str]:
+    names: list[str] = []
+    for pattern in _mapping_patterns():
+        name = _mapping_group_name(pattern)
+        if name and name.lower() not in {n.lower() for n in names}:
+            names.append(name)
+    return names
+
+
+def _use_targeted_group_lookup() -> bool:
+    return bool(settings.ldap_group_search_base_dn.strip() and _mapped_group_names())
+
+
+def _resolve_roles_and_groups(groups: list[str]) -> tuple[list[str], list[str]]:
+    """Resolve roles and keep only matched mapping-group names."""
     mapping = _load_role_mapping()
     candidates = _group_candidate_values(groups)
     roles: set[str] = set()
+    matched_groups: list[str] = []
+    matched_seen: set[str] = set()
 
     for role, patterns in mapping.items():
         for pattern in patterns:
-            p = pattern.strip().lower()
-            if not p:
+            p = pattern.strip()
+            low = p.lower()
+            if not low:
                 continue
-            matched = False
-            if any(ch in p for ch in "*?[]"):
-                matched = any(fnmatch.fnmatch(c, p) for c in candidates)
+            if any(ch in low for ch in "*?[]"):
+                matched = any(fnmatch.fnmatch(candidate, low) for candidate in candidates)
             else:
-                matched = p in candidates
-            if matched:
-                roles.add(role)
-                break
+                matched = low in candidates
+            if not matched:
+                continue
 
-    return [r for r in KNOWN_ROLES if r in roles]
+            roles.add(role)
+            group_name = _mapping_group_name(p)
+            if group_name and group_name.lower() not in matched_seen:
+                matched_seen.add(group_name.lower())
+                matched_groups.append(group_name)
+
+    ordered_roles = [role for role in KNOWN_ROLES if role in roles]
+    return ordered_roles, matched_groups
+
+
+def _resolve_roles(groups: list[str]) -> list[str]:
+    """Resolve roles from LDAP groups using env-configured mapping JSON."""
+    roles, _ = _resolve_roles_and_groups(groups)
+    return roles
 
 
 def _required_roles_for_request(method: str, path: str) -> set[str]:
@@ -194,11 +249,11 @@ def _create_token(
     payload = {
         "sub": username,
         "roles": roles,
-        "groups": groups,
         "type": token_type,
-        "iat": int(now.timestamp()),
         "exp": int(exp.timestamp()),
     }
+    if groups:
+        payload["groups"] = groups
     return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
 
 
@@ -307,7 +362,14 @@ def _search_user(conn: Connection, username: str) -> tuple[str, list[str]]:
         filter_expr,
         username,
     )
-    attributes = [settings.ldap_group_member_attribute, "cn"]
+    attributes = ["cn"]
+    if not _use_targeted_group_lookup():
+        attributes.insert(0, settings.ldap_group_member_attribute)
+    logger.debug(
+        "LDAP user search attributes=%s targeted_group_lookup=%s",
+        attributes,
+        _use_targeted_group_lookup(),
+    )
     ok = conn.search(
         search_base=settings.ldap_user_base_dn,
         search_filter=filter_expr,
@@ -322,7 +384,7 @@ def _search_user(conn: Connection, username: str) -> tuple[str, list[str]]:
 
     entry = conn.entries[0]
     user_dn = str(entry.entry_dn)
-    groups = _extract_groups_from_entry(entry)
+    groups = [] if _use_targeted_group_lookup() else _extract_groups_from_entry(entry)
     return user_dn, groups
 
 
@@ -330,12 +392,22 @@ def _search_groups(conn: Connection, username: str, user_dn: str) -> list[str]:
     if not settings.ldap_group_search_base_dn:
         return []
 
+    mapped_names = _mapped_group_names()
+    if not mapped_names:
+        logger.debug("LDAP group search skipped because no mapped group names were configured")
+        return []
+
     safe_username = escape_filter_chars(username)
     safe_user_dn = escape_filter_chars(user_dn)
-    filter_expr = settings.ldap_group_search_filter.format(
+    base_filter = settings.ldap_group_search_filter.format(
         username=safe_username,
         user_dn=safe_user_dn,
     )
+    group_attr = settings.ldap_group_name_attribute
+    cn_filter = "(|" + "".join(
+        f"({group_attr}={escape_filter_chars(name)})" for name in mapped_names
+    ) + ")"
+    filter_expr = f"(&{base_filter}{cn_filter})"
     logger.debug(
         "LDAP group search base_dn=%s filter=%s username=%s user_dn=%s",
         settings.ldap_group_search_base_dn,
@@ -358,7 +430,6 @@ def _search_groups(conn: Connection, username: str, user_dn: str) -> list[str]:
         if dn:
             found.append(dn)
 
-        group_attr = settings.ldap_group_name_attribute
         values = entry.entry_attributes_as_dict.get(group_attr, [])
         if isinstance(values, str):
             found.append(values)
@@ -461,13 +532,14 @@ def _ldap_authenticate_sync(username: str, password: str) -> tuple[list[str], li
 
         # Deduplicate while preserving order.
         dedup_groups = list(dict.fromkeys(g for g in groups if g and str(g).strip()))
-        roles = _resolve_roles(dedup_groups)
+        roles, matched_groups = _resolve_roles_and_groups(dedup_groups)
         logger.debug(
-            "LDAP auth resolved user=%s user_dn=%s groups=%s roles=%s",
+            "LDAP auth resolved user=%s user_dn=%s matched_groups=%s roles=%s raw_group_count=%s",
             username,
             user_dn,
-            dedup_groups,
+            matched_groups,
             roles,
+            len(dedup_groups),
         )
 
         if settings.ldap_require_mapped_roles and not roles:
@@ -475,7 +547,7 @@ def _ldap_authenticate_sync(username: str, password: str) -> tuple[list[str], li
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="User is authenticated but has no mapped roles.",
             )
-        return dedup_groups, roles
+        return matched_groups, roles
     except HTTPException as exc:
         if 400 <= exc.status_code < 500:
             logger.warning(
