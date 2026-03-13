@@ -15,7 +15,7 @@ from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, ContextManager, Iterator
 
 from .config import settings
 
@@ -64,6 +64,9 @@ try:
 except Exception:  # pragma: no cover - optional runtime dependency
     _OPENINFERENCE_AVAILABLE = False
     _oi_using_attributes = None
+
+_OpenInferenceAttributesFactory = Callable[..., ContextManager[Any]]
+_oi_using_attributes_factory: _OpenInferenceAttributesFactory | None = _oi_using_attributes
 
 
 logger = logging.getLogger(__name__)
@@ -444,13 +447,17 @@ def start_span(
 @contextmanager
 def openinference_attributes(**attrs: Any) -> Iterator[None]:
     """Optional OpenInference context propagation helper."""
-    if not settings.openinference_enabled or not _OPENINFERENCE_AVAILABLE:
+    if (
+        not settings.openinference_enabled
+        or not _OPENINFERENCE_AVAILABLE
+        or _oi_using_attributes_factory is None
+    ):
         yield
         return
     # Some OpenInference versions can reject unknown keys at context creation
     # time. Fall back to a no-op context instead of failing app logic.
     try:
-        context = _oi_using_attributes(**attrs)  # type: ignore[misc]
+        context = _oi_using_attributes_factory(**attrs)
     except Exception:
         context = nullcontext()
     with context:

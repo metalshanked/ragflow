@@ -37,14 +37,6 @@ APP_FAVICON_ICO = base64.b64decode(
     "AAABAAEAICAAAAEAIAAxAgAAFgAAAIlQTkcNChoKAAAADUlIRFIAAAAgAAAAIAgGAAAAc3p69AAAAgRJREFUeNrFlmtLVFEUhvcvmvv9PtMvMRIjkkIURRRDEkWUIpIilESUIhRFvN9mnDSzi6Xdr1aao1n+hbd15oNQzlpzZtxwXlifn2efs/daS52pOELq7B+kzv1GsvIQyapfSJ4/QOLCPhIXc0hU7yF+6Sfil3cRr9lFrHYHsbofiNV/R7ThG6KN24g2fUWk+QsiLZ8RufIJ4Vaqqx8RbvuAUPt7hDreIdT5FsGuNwh2v0bw2isErm8hcGMLykp44OYmCVgI9/e8hLIS7r/1ggQshPtvb5CAANeR7RxYuO/Ocyjp5DrgeQEG7ut9RgLCZ9cBzwswcF/fUxIQ/rkOuFEc3Hv3CZR04XTA8wIM3Nu/TgLCbf8/tpWp4ypJgIF7Bx6TgPDUOIFSw8E9gyQgvfNCAuWEg3uG1khAaDJSjCFmlCkBBu6594gEhA5nRsCMBAd331+FktprsZiV4ODuByskIPR2MzEjwcHdww9JQBgsZlNMgoO7RrJQ0lQrJZIEB3eNLpOAMFJLDSfBwZ3jaShpmSg3JwQYuHPCEBA2mdPkHwEG7pxcIgFhjdIVDu6YXoSSdjhtAgzcMbNAAsICqU2AgTvm5klA2F51hYPbF+agzKzO0jyXmox0cgNuX5wlAQvh9vQMCVgIt2WmoayE27JTJGAh3Fjx/gIjM1xVEtymqAAAAABJRU5ErkJggg=="
 )
 
-
-def _base_path(request: Request) -> str:
-    root_path = request.scope.get("root_path", "") or ""
-    if root_path == "/":
-        return ""
-    return root_path.rstrip("/")
-
-
 def _ui_asset_href(request: Request, asset_name: str) -> str:
     _ = request
     return asset_name
