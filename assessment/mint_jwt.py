@@ -53,6 +53,7 @@ def mint_token(
     secret: str,
     algorithm: str,
     token_type: str = "access",
+    auth_type: str = "jwt",
 ) -> str:
     if not subject.strip():
         raise ValueError("--subject is required.")
@@ -72,6 +73,7 @@ def mint_token(
     payload = {
         "sub": subject.strip(),
         "roles": normalized_roles,
+        "auth_type": auth_type.strip() or "jwt",
         "type": token_type,
         "exp": int(exp.timestamp()),
     }
@@ -114,6 +116,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Token type claim. Default: access.",
     )
     parser.add_argument(
+        "--auth-type",
+        default="jwt",
+        help="Authentication source claim. Default: jwt.",
+    )
+    parser.add_argument(
         "--secret",
         default=settings.jwt_secret_key,
         help="Signing secret. Defaults to ASSESSMENT_JWT_SECRET_KEY.",
@@ -138,6 +145,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             secret=args.secret,
             algorithm=args.algorithm,
             token_type=args.token_type,
+            auth_type=args.auth_type,
         )
     except ValueError as exc:
         parser.exit(status=2, message=f"error: {exc}\n")

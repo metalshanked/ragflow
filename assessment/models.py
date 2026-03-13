@@ -71,6 +71,12 @@ class QuestionResult(BaseModel):
 # Task models
 # ---------------------------------------------------------------------------
 
+class ActorInfo(BaseModel):
+    username: str = ""
+    roles: list[str] = Field(default_factory=list)
+    auth_type: str = ""
+
+
 class TaskStatus(BaseModel):
     task_id: str
     state: TaskState = TaskState.PENDING
@@ -81,6 +87,7 @@ class TaskStatus(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     error: Optional[str] = None
+    created_by: Optional[ActorInfo] = None
 
     # RAGFlow resource IDs (populated as the pipeline progresses)
     dataset_id: Optional[str] = None
@@ -126,6 +133,7 @@ class TaskEvent(BaseModel):
     id: int
     task_id: str
     event_type: str
+    actor: Optional[ActorInfo] = None
     state: Optional[TaskState] = None
     pipeline_stage: Optional[PipelineStage] = None
     message: str = ""
@@ -141,6 +149,20 @@ class TaskEventListResponse(BaseModel):
     page: int
     page_size: int
     total_pages: int
+
+
+class AuditEvent(BaseModel):
+    id: int
+    action: str
+    actor: Optional[ActorInfo] = None
+    task_id: Optional[str] = None
+    dataset_id: Optional[str] = None
+    document_ids: list[str] = Field(default_factory=list)
+    request_method: str = ""
+    request_path: str = ""
+    status_code: Optional[int] = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 # ---------------------------------------------------------------------------

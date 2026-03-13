@@ -7,7 +7,7 @@ from fastapi import HTTPException
 from unittest.mock import AsyncMock, patch
 
 import jwt
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.testclient import TestClient
 
 from assessment import auth
@@ -48,6 +48,15 @@ def make_app() -> FastAPI:
     async def protected_native(_: dict | None = Depends(auth.verify_jwt)):
         return {"ok": True}
 
+    @app.get("/api/v1/whoami")
+    async def whoami(request: Request, _: dict | None = Depends(auth.verify_jwt)):
+        actor = getattr(request.state, "auth_actor", None)
+        return {
+            "username": getattr(actor, "username", ""),
+            "roles": getattr(actor, "roles", []),
+            "auth_type": getattr(actor, "auth_type", ""),
+        }
+
     return app
 
 
@@ -56,6 +65,7 @@ def create_access_token(username: str, roles: list[str]) -> str:
         username=username,
         roles=roles,
         groups=[],
+        auth_type="jwt",
         token_type="access",
         ttl_minutes=30,
     )
@@ -124,6 +134,7 @@ def test_create_token_omits_empty_groups_and_iat():
             username="alice",
             roles=["admin"],
             groups=[],
+            auth_type="jwt",
             token_type="access",
             ttl_minutes=30,
         )
@@ -131,6 +142,7 @@ def test_create_token_omits_empty_groups_and_iat():
     payload = jwt.decode(token, TEST_JWT_SECRET, algorithms=["HS256"])
     assert payload["sub"] == "alice"
     assert payload["roles"] == ["admin"]
+    assert payload["auth_type"] == "jwt"
     assert payload["type"] == "access"
     assert "groups" not in payload
     assert "iat" not in payload
@@ -202,6 +214,28 @@ def test_auth_token_verify_refresh_happy_path():
                 assert refresh_data["access_token"]
                 assert refresh_data["refresh_token"]
                 assert set(refresh_data["roles"]) == {"viewer", "operator"}
+
+
+def test_verify_jwt_populates_request_actor():
+    app = make_app()
+    with TestClient(app) as client:
+        with override_settings(
+            jwt_secret_key=TEST_JWT_SECRET,
+            jwt_algorithm="HS256",
+            ldap_server_uri="",
+        ):
+            token = auth._create_token(
+                username="alice",
+                roles=["admin"],
+                groups=[],
+                auth_type="jwt",
+                token_type="access",
+                ttl_minutes=30,
+            )
+            resp = client.get("/api/v1/whoami", headers={"Authorization": f"Bearer {token}"})
+
+    assert resp.status_code == 200
+    assert resp.json() == {"username": "alice", "roles": ["admin"], "auth_type": "jwt"}
 
 
 def test_rbac_for_viewer_operator_admin_and_native_passthrough():
@@ -330,6 +364,7 @@ def test_refresh_rejects_access_token_type():
                 username="alice",
                 roles=["viewer"],
                 groups=[],
+                auth_type="ldap",
                 token_type="access",
                 ttl_minutes=30,
             )

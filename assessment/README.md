@@ -1215,6 +1215,131 @@ export ASSESSMENT_LOG_JSON=false
 export ASSESSMENT_LOG_TO_CONSOLE=true
 ```
 
+## Code Map
+
+The main Python files are layered deliberately. At a high level:
+
+- `main.py` boots the FastAPI app, logging, telemetry, routers, and database startup.
+- `auth.py` handles LDAP/JWT login, token minting/verification, and request actor extraction.
+- `routers.py` defines the HTTP API surface and translates requests into service calls.
+- `services.py` contains the core business logic for task/session creation, document upload, and assessment execution.
+- `db.py` persists task state, task events, audit events, and deduplication metadata.
+- `models.py` defines the request/response and internal state models shared across the app.
+- `ragflow_client.py` is the outbound client used by services to call RAGFlow APIs.
+- `ui.py` serves the built-in HTML/JS frontend for login, task operations, and API exploration.
+- `observability.py` wires logging, OpenTelemetry, span attributes, and request/actor context.
+- `config.py` loads and validates all `ASSESSMENT_*` environment variables.
+
+### Startup Flow
+
+```mermaid
+flowchart TD
+    A[config.py<br/>Settings()] --> B[main.py]
+    B --> C[configure_logging()<br/>observability.py]
+    B --> D[FastAPI app creation]
+    D --> E[include_router(router)<br/>routers.py]
+    D --> F[include_router(auth_router)<br/>auth.py]
+    D --> G[include_router(ui_router)<br/>ui.py]
+    B --> H[startup event]
+    H --> I[init_db()<br/>db.py]
+    H --> J[init_telemetry(app)<br/>observability.py]
+    H --> K[cleanup loop for old tasks<br/>main.py + db.py]
+```
+
+### API Request Flow
+
+```mermaid
+flowchart LR
+    A[Client / UI / API caller] --> B[main.py FastAPI app]
+    B --> C[routers.py endpoint]
+    C --> D{verify_jwt in auth.py}
+    D -->|JWT or LDAP-backed JWT valid| E[request.state auth context]
+    E --> F[services.py business logic]
+    F --> G[db.py persistence]
+    F --> H[ragflow_client.py outbound RAGFlow calls]
+    F --> I[observability.py spans/log enrichment]
+    G --> J[(SQLite / PostgreSQL)]
+    H --> K[RAGFlow API]
+```
+
+### UI Request Flow
+
+```mermaid
+flowchart LR
+    A[Browser] --> B[ui.py]
+    B --> C[Single-page HTML / JS]
+    C --> D[/api/v1/auth/*]
+    C --> E[/api/v1/*]
+    D --> F[auth.py]
+    E --> G[routers.py]
+    F --> H[JWT stored in browser]
+    H --> E
+```
+
+### File Responsibilities
+
+| File | Responsibility | Used By |
+| --- | --- | --- |
+| `main.py` | App entrypoint, router registration, startup/shutdown lifecycle | Process startup |
+| `config.py` | Environment-driven settings and validation | All modules |
+| `auth.py` | LDAP auth, JWT creation/refresh/verification, actor extraction | `main.py`, `routers.py`, `ui.py` |
+| `routers.py` | HTTP endpoints, request parsing, background task scheduling | `main.py` |
+| `services.py` | Task/session/document pipeline logic and orchestration | `routers.py` |
+| `db.py` | SQLAlchemy models plus async persistence helpers | `services.py`, `routers.py`, `main.py` |
+| `models.py` | Pydantic schemas and internal task/event models | `auth.py`, `routers.py`, `services.py`, `db.py` |
+| `ragflow_client.py` | Async HTTP client for datasets, documents, chats, completions | `services.py`, some passthrough routes |
+| `ui.py` | Built-in login page and dashboard HTML/JS | `main.py` |
+| `observability.py` | Logging, tracing, actor context, FastAPI/SQLAlchemy instrumentation | `main.py`, `auth.py`, `services.py` |
+
+### Typical Execution Paths
+
+**1. LDAP login**
+
+```text
+Browser/UI -> auth.py:/api/v1/auth/token -> LDAP bind/search -> JWT mint -> browser stores token
+```
+
+**2. Start assessment from uploaded questions**
+
+```text
+Client -> routers.py:start_assessment -> services.py:create_task
+       -> background run_assessment()
+       -> ragflow_client.py calls RAGFlow
+       -> db.py persists task status/events/results
+```
+
+**3. Session workflow with document upload**
+
+```text
+Client -> routers.py:create_assessment_session -> services.py:create_session
+       -> routers.py:upload_session_documents -> services.py:add_documents_to_session
+       -> db.py file hash tracking / task events
+       -> routers.py:start_session_assessment -> services.py:run_assessment_for_session
+```
+
+**4. Built-in UI**
+
+```text
+Browser -> ui.py:/ui -> HTML/JS app
+        -> auth.py for login/refresh
+        -> routers.py for task APIs
+        -> same JWT bearer token used underneath for protected API calls
+```
+
+### Reading Order
+
+If you are new to the codebase, this order is the most efficient:
+
+1. `config.py`
+2. `models.py`
+3. `main.py`
+4. `auth.py`
+5. `routers.py`
+6. `services.py`
+7. `db.py`
+8. `ui.py`
+9. `observability.py`
+
 ## Project Structure
 
 ```

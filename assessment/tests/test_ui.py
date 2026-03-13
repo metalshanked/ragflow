@@ -19,19 +19,38 @@ def test_ui_page_includes_icon_links_and_header_logo():
         response = client.get("/ui")
 
     assert response.status_code == 200
-    assert 'rel="icon" href="/favicon.ico"' in response.text
-    assert 'rel="shortcut icon" href="/favicon.ico"' in response.text
-    assert 'rel="apple-touch-icon" href="/favicon.ico"' in response.text
-    assert '<img src="/favicon.ico" alt=""/>' in response.text
+    assert 'rel="icon" href="favicon.ico"' in response.text
+    assert 'rel="shortcut icon" href="favicon.ico"' in response.text
+    assert 'rel="apple-touch-icon" href="favicon.ico"' in response.text
+    assert '<img src="favicon.ico" alt=""/>' in response.text
+    assert "<title>AI Assessments</title>" in response.text
+    assert ">AI Assessments</h2>" in response.text
+    assert ">AI Assessments</h1>" in response.text
     assert 'id="login-screen"' in response.text
     assert 'id="btn-logout"' in response.text
     assert 'data-tab="api"' in response.text
     assert 'id="panel-api"' in response.text
     assert 'id="link-docs"' in response.text
+    assert 'id="api-link-result"' in response.text
+    assert "assessment_access_token_expires_at" in response.text
+    assert "ensureActiveSession(false);" in response.text
+    assert "runApiLink('link-assessments')" in response.text
     assert "AUTH_MODE = authType;" in response.text
     assert "initApiLinks();" in response.text
     assert "Refresh Token" not in response.text
     assert ">Verify<" not in response.text
+
+
+def test_ui_page_uses_relative_favicon_links():
+    app = make_app()
+
+    with TestClient(app) as client:
+        response = client.get("/ui")
+
+    assert response.status_code == 200
+    assert 'rel="icon" href="favicon.ico"' in response.text
+    assert 'rel="shortcut icon" href="favicon.ico"' in response.text
+    assert '<img src="favicon.ico" alt=""/>' in response.text
 
 
 def test_icon_routes_serve_svg_and_png_assets():

@@ -13,6 +13,7 @@ import openpyxl
 
 import assessment.services as _services_mod
 from assessment.models import (
+    ActorInfo,
     DocumentStatus,
     PipelineStage,
     QuestionResult,
@@ -272,14 +273,17 @@ class TestCreateTask(unittest.TestCase):
         _mock_db_save.reset_mock()
         _mock_db_add_event.reset_mock()
         questions = [{"serial_no": 1, "question": "Test?"}]
-        record = _run(create_task(questions))
+        actor = ActorInfo(username="alice", roles=["admin"], auth_type="ldap")
+        record = _run(create_task(questions, actor=actor))
         self.assertIsInstance(record, TaskRecord)
         self.assertEqual(len(record.task_id), 32)  # uuid hex
         self.assertEqual(record.status.state, TaskState.PENDING)
         self.assertEqual(record.status.total_questions, 1)
+        self.assertEqual(record.status.created_by, actor)
         self.assertEqual(record.questions, questions)
         _mock_db_save.assert_called_once()
         _mock_db_add_event.assert_called_once()
+        self.assertEqual(_mock_db_add_event.await_args.kwargs["actor"], actor)
 
     def test_creates_with_custom_state(self):
         _mock_db_save.reset_mock()

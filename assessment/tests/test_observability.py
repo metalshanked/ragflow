@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from assessment.observability import (
+    actor_context,
     build_otlp_signal_endpoint,
+    get_actor_context,
     openinference_attributes,
     parse_key_value_map,
 )
@@ -42,3 +44,20 @@ def test_openinference_attributes_context_noop_safe():
     # Should not raise even if OpenInference package/version is unavailable.
     with openinference_attributes(session_id="task-1", user_id="alice"):
         pass
+
+
+class _Actor:
+    username = "alice"
+    roles = ["admin"]
+    auth_type = "ldap"
+
+
+def test_actor_context_exposes_current_actor_metadata():
+    with actor_context(_Actor(), request_method="POST", request_path="/api/v1/assessments"):
+        current = get_actor_context()
+
+    assert current["actor_username"] == "alice"
+    assert current["actor_roles"] == ["admin"]
+    assert current["actor_auth_type"] == "ldap"
+    assert current["request_method"] == "POST"
+    assert current["request_path"] == "/api/v1/assessments"

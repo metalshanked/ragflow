@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Iterator
@@ -69,6 +70,70 @@ logger = logging.getLogger(__name__)
 
 _LOGGING_INITIALIZED = False
 _TELEMETRY_INITIALIZED = False
+_ACTOR_CONTEXT: ContextVar[dict[str, Any]] = ContextVar("assessment_actor_context", default={})
+
+
+def get_actor_context() -> dict[str, Any]:
+    return dict(_ACTOR_CONTEXT.get({}) or {})
+
+
+def set_actor_context(
+    actor: Any | None,
+    *,
+    request_method: str | None = None,
+    request_path: str | None = None,
+) -> None:
+    if actor is None:
+        clear_actor_context()
+        return
+    payload = {
+        "actor_username": str(getattr(actor, "username", "") or ""),
+        "actor_roles": list(getattr(actor, "roles", []) or []),
+        "actor_auth_type": str(getattr(actor, "auth_type", "") or ""),
+        "request_method": str(request_method or ""),
+        "request_path": str(request_path or ""),
+    }
+    _ACTOR_CONTEXT.set(payload)
+
+
+def clear_actor_context() -> None:
+    _ACTOR_CONTEXT.set({})
+
+
+@contextmanager
+def actor_context(
+    actor: Any | None,
+    *,
+    request_method: str | None = None,
+    request_path: str | None = None,
+) -> Iterator[None]:
+    token = _ACTOR_CONTEXT.set(
+        {
+            "actor_username": str(getattr(actor, "username", "") or ""),
+            "actor_roles": list(getattr(actor, "roles", []) or []),
+            "actor_auth_type": str(getattr(actor, "auth_type", "") or ""),
+            "request_method": str(request_method or ""),
+            "request_path": str(request_path or ""),
+        }
+        if actor is not None
+        else {}
+    )
+    try:
+        yield
+    finally:
+        _ACTOR_CONTEXT.reset(token)
+
+
+class ActorContextFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        actor = get_actor_context()
+        record.actor_username = actor.get("actor_username", "") or "-"
+        record.actor_auth_type = actor.get("actor_auth_type", "") or "-"
+        roles = actor.get("actor_roles", []) or []
+        record.actor_roles = ",".join(str(role) for role in roles if str(role).strip()) or "-"
+        record.request_method = actor.get("request_method", "") or "-"
+        record.request_path = actor.get("request_path", "") or "-"
+        return True
 
 
 def _safe_json_load(raw: str, *, expect: type[dict] | type[list], fallback: Any) -> Any:
@@ -143,6 +208,7 @@ class JsonFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         trace_id, span_id = _trace_context_ids()
+        actor = get_actor_context()
         payload: dict[str, Any] = {
             "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
             "level": record.levelname,
@@ -151,6 +217,16 @@ class JsonFormatter(logging.Formatter):
             "module": record.module,
             "line": record.lineno,
         }
+        if actor.get("actor_username"):
+            payload["actor_username"] = actor["actor_username"]
+        if actor.get("actor_auth_type"):
+            payload["actor_auth_type"] = actor["actor_auth_type"]
+        if actor.get("actor_roles"):
+            payload["actor_roles"] = actor["actor_roles"]
+        if actor.get("request_method"):
+            payload["request_method"] = actor["request_method"]
+        if actor.get("request_path"):
+            payload["request_path"] = actor["request_path"]
         if trace_id:
             payload["trace_id"] = trace_id
         if span_id:
@@ -169,17 +245,19 @@ def configure_logging() -> None:
     root = logging.getLogger()
     root.setLevel(getattr(logging, settings.log_level.upper(), logging.INFO))
     root.handlers.clear()
+    actor_filter = ActorContextFilter()
 
     formatter: logging.Formatter
     if settings.log_json:
         formatter = JsonFormatter()
     else:
         formatter = logging.Formatter(
-            "%(asctime)s %(levelname)-8s %(name)s %(message)s"
+            "%(asctime)s %(levelname)-8s %(name)s [user=%(actor_username)s auth=%(actor_auth_type)s roles=%(actor_roles)s %(request_method)s %(request_path)s] %(message)s"
         )
 
     if settings.log_to_console:
         console = logging.StreamHandler()
+        console.addFilter(actor_filter)
         console.setFormatter(formatter)
         root.addHandler(console)
 
@@ -192,6 +270,7 @@ def configure_logging() -> None:
             backupCount=max(1, settings.log_backup_count),
             encoding="utf-8",
         )
+        file_handler.addFilter(actor_filter)
         file_handler.setFormatter(formatter)
         root.addHandler(file_handler)
 
@@ -340,11 +419,23 @@ def start_span(
     """Start a span and optionally add OpenInference semantic attributes."""
     tracer = trace.get_tracer("assessment")
     with tracer.start_as_current_span(name) as span:
+        actor = get_actor_context()
         if span_kind and settings.openinference_enabled:
             try:
                 span.set_attribute("openinference.span.kind", span_kind)
             except Exception:
                 pass
+        if actor:
+            set_span_attributes(
+                span,
+                {
+                    "enduser.id": actor.get("actor_username"),
+                    "assessment.user.roles": ",".join(actor.get("actor_roles", []) or []),
+                    "assessment.auth_type": actor.get("actor_auth_type"),
+                    "http.request.method": actor.get("request_method"),
+                    "url.path": actor.get("request_path"),
+                },
+            )
         if attributes:
             set_span_attributes(span, attributes)
         yield span

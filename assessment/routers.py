@@ -41,9 +41,10 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPExcepti
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from .auth import verify_jwt
+from .auth import actor_from_request, verify_jwt
 from .config import settings
 import json
+from .db import db_add_audit_event, db_add_task_event
 from .models import (
     DocumentUploadResponse,
     SessionCreateResponse,
@@ -104,6 +105,56 @@ _HOP_BY_HOP_HEADERS = {
     "host",
     "content-length",
 }
+
+
+async def _audit(
+    action: str,
+    request: Request,
+    *,
+    task_id: str | None = None,
+    dataset_id: str | None = None,
+    document_ids: list[str] | None = None,
+    status_code: int | None = None,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    try:
+        await db_add_audit_event(
+            action,
+            actor=actor_from_request(request),
+            task_id=task_id,
+            dataset_id=dataset_id,
+            document_ids=document_ids,
+            request_method=request.method,
+            request_path=request.url.path,
+            status_code=status_code,
+            payload=payload,
+        )
+    except Exception:
+        logger.exception("Failed to append audit event action=%s path=%s", action, request.url.path)
+
+
+async def _task_event(
+    task_id: str,
+    *,
+    event_type: str,
+    request: Request,
+    message: str,
+    payload: dict[str, Any] | None = None,
+    state: TaskState | None = None,
+    pipeline_stage: Any = None,
+) -> None:
+    try:
+        await db_add_task_event(
+            task_id,
+            event_type=event_type,
+            actor=actor_from_request(request),
+            state=state,
+            pipeline_stage=pipeline_stage,
+            message=message,
+            payload=payload,
+        )
+    except Exception:
+        logger.exception("Failed to append task event event_type=%s task_id=%s", event_type, task_id)
 
 
 def _extract_error_detail(resp: httpx.Response) -> str:
@@ -202,6 +253,7 @@ async def _request_ragflow_official(
 
 @router.post("/assessments", response_model=TaskStatus, status_code=202)
 async def start_assessment(
+    request: Request,
     background_tasks: BackgroundTasks,
     questions_file: UploadFile = File(
         ..., description="Excel file with columns A=Question_Serial_No, B=Question"
@@ -280,7 +332,8 @@ async def start_assessment(
     if not ev_files:
         raise HTTPException(status_code=400, detail="At least one evidence document is required.")
 
-    record = await create_task(questions)
+    actor = actor_from_request(request)
+    record = await create_task(questions, actor=actor)
 
     dataset_opts = {}
     if dataset_options:
@@ -308,6 +361,19 @@ async def start_assessment(
         chat_opts,
         process_vendor_response,
         only_cited_references,
+        actor,
+    )
+    await _audit(
+        "task.start_single_call",
+        request,
+        task_id=record.task_id,
+        status_code=202,
+        payload={
+            "question_count": len(questions),
+            "evidence_file_count": len(ev_files),
+            "dataset_name": dataset_name or "",
+            "reuse_existing_dataset": reuse_exisiting_dataset,
+        },
     )
 
     return record.status
@@ -319,6 +385,7 @@ async def start_assessment(
 
 @router.post("/assessments/from-dataset", response_model=TaskStatus, status_code=202)
 async def start_assessment_from_dataset(
+    request: Request,
     background_tasks: BackgroundTasks,
     questions_file: UploadFile = File(
         ..., description="Excel file with columns A=Question_Serial_No, B=Question"
@@ -392,7 +459,8 @@ async def start_assessment_from_dataset(
     if not questions:
         raise HTTPException(status_code=400, detail="No questions found in the uploaded Excel file.")
 
-    record = await create_task(questions)
+    actor = actor_from_request(request)
+    record = await create_task(questions, actor=actor)
 
     dataset_opts = {}
     if dataset_options:
@@ -417,6 +485,23 @@ async def start_assessment_from_dataset(
         dataset_opts,
         process_vendor_response,
         only_cited_references,
+        actor,
+    )
+    await _task_event(
+        record.task_id,
+        event_type="task_started_from_dataset",
+        request=request,
+        state=record.status.state,
+        pipeline_stage=record.status.pipeline_stage,
+        message="Assessment queued from existing dataset(s)",
+        payload={"dataset_ids": parsed_ids},
+    )
+    await _audit(
+        "task.start_from_dataset",
+        request,
+        task_id=record.task_id,
+        status_code=202,
+        payload={"question_count": len(questions), "dataset_ids": parsed_ids},
     )
 
     return record.status
@@ -428,6 +513,7 @@ async def start_assessment_from_dataset(
 
 @router.post("/assessments/sessions", response_model=SessionCreateResponse, status_code=201)
 async def create_assessment_session(
+    request: Request,
     questions_file: UploadFile = File(
         ..., description="Excel file with columns A=Question_Serial_No, B=Question"
     ),
@@ -489,7 +575,26 @@ async def create_assessment_session(
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON in dataset_options")
 
-    return await create_session(questions, dataset_name, reuse_exisiting_dataset, dataset_opts)
+    response = await create_session(
+        questions,
+        dataset_name,
+        reuse_exisiting_dataset,
+        dataset_opts,
+        actor_from_request(request),
+    )
+    await _audit(
+        "session.create",
+        request,
+        task_id=response.task_id,
+        dataset_id=response.dataset_id,
+        status_code=201,
+        payload={
+            "question_count": len(questions),
+            "dataset_name": dataset_name or "",
+            "reuse_existing_dataset": reuse_exisiting_dataset,
+        },
+    )
+    return response
 
 
 @router.post(
@@ -497,6 +602,7 @@ async def create_assessment_session(
     response_model=DocumentUploadResponse,
 )
 async def upload_session_documents(
+    request: Request,
     task_id: str,
     files: list[UploadFile] = File(..., description="Evidence documents to add"),
 ):
@@ -518,13 +624,24 @@ async def upload_session_documents(
         raise HTTPException(status_code=400, detail="At least one file is required.")
 
     try:
-        return await add_documents_to_session(task_id, file_pairs)
+        response = await add_documents_to_session(task_id, file_pairs, actor_from_request(request))
+        await _audit(
+            "session.upload_documents",
+            request,
+            task_id=task_id,
+            dataset_id=response.dataset_id,
+            document_ids=response.uploaded_document_ids,
+            status_code=200,
+            payload={"total_documents": response.total_documents},
+        )
+        return response
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
 
 @router.post("/assessments/sessions/{task_id}/start", response_model=TaskStatus, status_code=202)
 async def start_session_assessment(
+    request: Request,
     task_id: str,
     background_tasks: BackgroundTasks,
     chat_name: Optional[str] = Form(None, description="Custom chat assistant name in RAGFlow"),
@@ -557,6 +674,17 @@ async def start_session_assessment(
             raise HTTPException(status_code=400, detail=msg)
         raise HTTPException(status_code=409, detail=msg)
 
+    actor = actor_from_request(request)
+    await _task_event(
+        task_id,
+        event_type="session_assessment_started",
+        request=request,
+        state=record.status.state,
+        pipeline_stage=record.status.pipeline_stage,
+        message="Assessment session queued for processing",
+        payload={},
+    )
+
     dataset_opts = {}
     if dataset_options:
         try:
@@ -579,6 +707,16 @@ async def start_session_assessment(
         chat_opts,
         process_vendor_response,
         only_cited_references,
+        actor,
+    )
+    await _audit(
+        "session.start_assessment",
+        request,
+        task_id=task_id,
+        dataset_id=record.ragflow.dataset_id or None,
+        document_ids=record.ragflow.document_ids,
+        status_code=202,
+        payload={"chat_name": chat_name or ""},
     )
 
     return record.status
@@ -791,6 +929,7 @@ async def proxy_document(document_id: str):
 
 @router.post("/native/documents/upload", tags=["native-passthrough"])
 async def upload_documents(
+    request: Request,
     dataset_id: str = Form(..., description="Existing RAGFlow dataset ID"),
     files: list[UploadFile] = File(..., description="Documents to upload"),
     parse: bool = Form(True, description="Trigger parsing after upload"),
@@ -831,11 +970,20 @@ async def upload_documents(
                 json_body={"document_ids": doc_ids},
             )
             _parse_ragflow_json_or_raise(parse_resp)
-        return {
+        response_payload = {
             "dataset_id": dataset_id,
             "document_ids": doc_ids,
             "parsing_triggered": parse,
         }
+        await _audit(
+            "native.documents.upload",
+            request,
+            dataset_id=dataset_id,
+            document_ids=doc_ids,
+            status_code=200,
+            payload={"parsing_triggered": parse, "uploaded_count": len(doc_ids)},
+        )
+        return response_payload
     except HTTPException:
         raise
     except Exception as exc:
@@ -901,9 +1049,15 @@ async def list_datasets(
 
 
 @router.delete("/native/datasets", tags=["native-passthrough"])
-async def delete_datasets(req: DeleteDatasetsRequest):
+async def delete_datasets(request: Request, req: DeleteDatasetsRequest):
     resp = await _request_ragflow_official("DELETE", "datasets", json_body={"ids": req.ids})
     _parse_ragflow_json_or_raise(resp)
+    await _audit(
+        "native.datasets.delete",
+        request,
+        status_code=200,
+        payload={"dataset_ids": req.ids},
+    )
     return {"message": "Datasets deleted"}
 
 
@@ -953,13 +1107,21 @@ async def list_documents(
 
 
 @router.delete("/native/datasets/{dataset_id}/documents", tags=["native-passthrough"])
-async def delete_documents(dataset_id: str, req: DeleteDocumentsRequest):
+async def delete_documents(request: Request, dataset_id: str, req: DeleteDocumentsRequest):
     resp = await _request_ragflow_official(
         "DELETE",
         f"datasets/{dataset_id}/documents",
         json_body={"ids": req.ids},
     )
     _parse_ragflow_json_or_raise(resp)
+    await _audit(
+        "native.documents.delete",
+        request,
+        dataset_id=dataset_id,
+        document_ids=req.ids,
+        status_code=200,
+        payload={"deleted_count": len(req.ids)},
+    )
     return {"message": "Documents deleted"}
 
 @router.api_route(
@@ -993,6 +1155,17 @@ async def ragflow_official_passthrough(ragflow_path: str, request: Request):
         extra_headers=extra_headers,
         timeout=300.0,
     )
+
+    if method in {"POST", "PUT", "PATCH", "DELETE"}:
+        await _audit(
+            "native.passthrough",
+            request,
+            status_code=resp.status_code,
+            payload={
+                "ragflow_path": ragflow_path,
+                "query": list(request.query_params.multi_items()),
+            },
+        )
 
     return Response(
         content=resp.content,

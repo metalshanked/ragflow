@@ -18,6 +18,7 @@ import openpyxl
 
 from .config import settings
 from .models import (
+    ActorInfo,
     DocumentStatus,
     DocumentUploadResponse,
     PipelineStage,
@@ -40,7 +41,7 @@ from .db import (
     db_find_tasks_by_dataset_id,
     db_find_document_by_hash,
 )
-from .observability import openinference_attributes, set_span_attributes, start_span
+from .observability import actor_context, openinference_attributes, set_span_attributes, start_span
 from .ragflow_client import RagflowClient
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,7 @@ def _ordered_unique(values: list[str]) -> list[str]:
         seen.add(value)
         out.append(value)
     return out
+
 
 
 def _dedupe_files_by_hash(
@@ -499,6 +501,7 @@ async def run_assessment(
     chat_opts: dict | None = None,
     process_vendor_response: bool | None = None,
     only_cited_references: bool | None = None,
+    actor: ActorInfo | None = None,
 ) -> None:
     """
     Background coroutine that orchestrates the full assessment pipeline:
@@ -511,273 +514,265 @@ async def run_assessment(
     6. Ask each question (with concurrency)
     7. Collect results
     """
-    with start_span(
-        "assessment.run_assessment",
-        span_kind="CHAIN",
-        attributes={
-            "task.id": task_id,
-            "assessment.questions.count": len(questions),
-            "assessment.evidence.count": len(evidence_files),
-        },
-    ):
-        with openinference_attributes(
-            session_id=task_id,
-            metadata={
-                "workflow": "single_call",
-                "dataset_name": dataset_name or "",
-                "chat_name": chat_name or "",
+    with actor_context(actor, request_method="POST", request_path="/api/v1/assessments"):
+        with start_span(
+            "assessment.run_assessment",
+            span_kind="CHAIN",
+            attributes={
+                "task.id": task_id,
+                "assessment.questions.count": len(questions),
+                "assessment.evidence.count": len(evidence_files),
             },
         ):
-            record = await get_task(task_id)
-            if record is None:
-                raise ValueError(f"Task {task_id} not found")
-            client = RagflowClient()
+            with openinference_attributes(
+                session_id=task_id,
+                metadata={
+                    "workflow": "single_call",
+                    "dataset_name": dataset_name or "",
+                    "chat_name": chat_name or "",
+                },
+            ):
+                record = await get_task(task_id)
+                if record is None:
+                    raise ValueError(f"Task {task_id} not found")
+                client = RagflowClient()
 
-            dataset_opts = _effective_dataset_options(dataset_opts, include_defaults=True)
-            chat_opts = chat_opts or {}
-            reuse_mode = bool(dataset_name and reuse_exisiting_dataset)
+                dataset_opts = _effective_dataset_options(dataset_opts, include_defaults=True)
+                chat_opts = chat_opts or {}
+                reuse_mode = bool(dataset_name and reuse_exisiting_dataset)
 
-            try:
-                # -- 1. Create dataset ------------------------------------------------
-                await _update_status(
-                    record,
-                    state=TaskState.UPLOADING,
-                    stage=PipelineStage.DOCUMENT_UPLOAD,
-                    message="Creating dataset...",
-                )
-                ds_name = dataset_name or f"{settings.default_chat_name_prefix}_{task_id[:8]}"
-                dataset_id = await client.ensure_dataset(
-                    ds_name,
-                    reuse_existing_dataset=reuse_mode,
-                    **dataset_opts,
-                )
-                record.ragflow.dataset_id = dataset_id
-                record.ragflow.dataset_ids = [dataset_id]
-                record.ragflow.reuse_existing_dataset = reuse_mode
-
-                # -- 2. Upload evidence docs (parallel) --------------------------------
-                await _update_status(record, message="Uploading evidence documents...")
-                upload_sem = asyncio.Semaphore(settings.max_concurrent_questions)
-
-                files_with_hashes, skipped_count = _dedupe_files_by_hash(evidence_files)
-                if not files_with_hashes and evidence_files:
-                    raise RuntimeError(f"All {len(evidence_files)} evidence documents were duplicates of each other.")
-
-                docs_by_id: dict[str, dict[str, Any]] = {}
-                files_to_upload = list(files_with_hashes)
-                reused_success_doc_ids: list[str] = []
-                reused_pending_doc_ids: list[str] = []
-                reused_hash_mapping: dict[str, str] = {}
-                failed_doc_ids_to_delete: list[str] = []
-
-                # In reuse mode, upsert documents by hash:
-                # - reuse already-successful docs
-                # - reuse running/pending docs (wait for parse later)
-                # - re-upload failed/missing docs
-                if reuse_mode:
-                    existing_docs = await client.list_documents(dataset_id)
-                    docs_by_id = {
-                        str(doc.get("id", "")).strip(): doc
-                        for doc in existing_docs
-                        if str(doc.get("id", "")).strip()
-                    }
-                    hash_matches = await _lookup_dataset_document_ids_by_hash(
-                        dataset_id,
-                        [file_hash for _, _, file_hash in files_with_hashes],
-                    )
-
-                    files_to_upload = []
-                    for fname, fbytes, file_hash in files_with_hashes:
-                        candidate_ids = _ordered_unique([
-                            str(record.ragflow.file_hashes.get(file_hash, "")).strip(),
-                            *(hash_matches.get(file_hash, [])),
-                        ])
-
-                        selected_success = ""
-                        selected_pending = ""
-                        for candidate_id in candidate_ids:
-                            doc = docs_by_id.get(candidate_id)
-                            if not doc:
-                                continue
-                            status = str(doc.get("status", "")).lower()
-                            if status == "success":
-                                selected_success = candidate_id
-                                break
-                            if status in {"running", "pending"} and not selected_pending:
-                                selected_pending = candidate_id
-
-                        if selected_success:
-                            reused_success_doc_ids.append(selected_success)
-                            reused_hash_mapping[file_hash] = selected_success
-                            continue
-                        if selected_pending:
-                            reused_pending_doc_ids.append(selected_pending)
-                            reused_hash_mapping[file_hash] = selected_pending
-                            continue
-
-                        for candidate_id in candidate_ids:
-                            doc = docs_by_id.get(candidate_id)
-                            if not doc:
-                                continue
-                            if str(doc.get("status", "")).lower() == "failed":
-                                failed_doc_ids_to_delete.append(candidate_id)
-
-                        files_to_upload.append((fname, fbytes, file_hash))
-
-                    delete_ids = _ordered_unique(failed_doc_ids_to_delete)
-                    if delete_ids:
-                        await client.delete_documents(dataset_id, delete_ids)
-
-                async def _upload_one(fname: str, fbytes: bytes, fhash: str) -> tuple[str, str]:
-                    async with upload_sem:
-                        doc_id = await client.upload_document(dataset_id, fname, fbytes)
-                        return doc_id, fhash
-
-                uploaded_results = await asyncio.gather(
-                    *(_upload_one(fn, fb, fh) for fn, fb, fh in files_to_upload)
-                )
-
-                uploaded_doc_ids: list[str] = []
-                for doc_id, fhash in uploaded_results:
-                    uploaded_doc_ids.append(doc_id)
-                    record.ragflow.file_hashes[fhash] = doc_id
-
-                for fhash, doc_id in reused_hash_mapping.items():
-                    record.ragflow.file_hashes[fhash] = doc_id
-
-                reused_doc_ids = _ordered_unique(reused_success_doc_ids + reused_pending_doc_ids)
-                record.ragflow.document_ids = _ordered_unique(reused_doc_ids + uploaded_doc_ids)
-
-                if not record.ragflow.document_ids:
-                    raise RuntimeError("No evidence documents were uploaded or reused")
-
-                prep_msg = (
-                    f"Prepared evidence documents: uploaded {len(uploaded_doc_ids)}, "
-                    f"reused {len(reused_doc_ids)}."
-                )
-                if skipped_count > 0:
-                    prep_msg += f" Skipped {skipped_count} duplicate input file(s)."
-                await _update_status(record, message=prep_msg)
-
-                # -- 3. Parse documents -----------------------------------------------
-                reused_success_doc_ids = _ordered_unique(reused_success_doc_ids)
-                reused_success_statuses = [
-                    {
-                        "document_id": doc_id,
-                        "document_name": str(docs_by_id.get(doc_id, {}).get("name", "") or ""),
-                        "status": "success",
-                        "progress": 1.0,
-                        "message": "Reused existing parsed document",
-                    }
-                    for doc_id in reused_success_doc_ids
-                ]
-                docs_to_wait = _ordered_unique(reused_pending_doc_ids + uploaded_doc_ids)
-
-                if docs_to_wait:
+                try:
                     await _update_status(
                         record,
-                        state=TaskState.PARSING,
-                        stage=PipelineStage.DOCUMENT_PARSING,
-                        message="Parsing evidence documents...",
+                        state=TaskState.UPLOADING,
+                        stage=PipelineStage.DOCUMENT_UPLOAD,
+                        message="Creating dataset...",
                     )
-                    if uploaded_doc_ids:
-                        await client.start_parsing(dataset_id, uploaded_doc_ids)
-                    doc_statuses_raw = await client.wait_for_parsing(dataset_id, docs_to_wait)
-                    record.document_statuses = (
-                        [DocumentStatus(**ds) for ds in reused_success_statuses]
-                        + [DocumentStatus(**ds) for ds in doc_statuses_raw]
+                    ds_name = dataset_name or f"{settings.default_chat_name_prefix}_{task_id[:8]}"
+                    dataset_id = await client.ensure_dataset(
+                        ds_name,
+                        reuse_existing_dataset=reuse_mode,
+                        **dataset_opts,
                     )
+                    record.ragflow.dataset_id = dataset_id
+                    record.ragflow.dataset_ids = [dataset_id]
+                    record.ragflow.reuse_existing_dataset = reuse_mode
 
-                    ok_ids = _ordered_unique(
-                        reused_success_doc_ids
-                        + [ds["document_id"] for ds in doc_statuses_raw if ds["status"] == "success"]
-                    )
-                    failed = [ds for ds in doc_statuses_raw if ds["status"] != "success"]
-                    if failed:
-                        names = ", ".join(ds["document_name"] or ds["document_id"] for ds in failed)
-                        logger.warning("Documents with parsing issues: %s", names)
-                    if not ok_ids:
+                    await _update_status(record, message="Uploading evidence documents...")
+                    upload_sem = asyncio.Semaphore(settings.max_concurrent_questions)
+
+                    files_with_hashes, skipped_count = _dedupe_files_by_hash(evidence_files)
+                    if not files_with_hashes and evidence_files:
                         raise RuntimeError(
-                            "All documents failed to parse. "
-                            + "; ".join(
-                                f"{ds['document_name'] or ds['document_id']}: {ds['message']}"
-                                for ds in failed
-                            )
+                            f"All {len(evidence_files)} evidence documents were duplicates of each other."
                         )
+
+                    docs_by_id: dict[str, dict[str, Any]] = {}
+                    files_to_upload = list(files_with_hashes)
+                    reused_success_doc_ids: list[str] = []
+                    reused_pending_doc_ids: list[str] = []
+                    reused_hash_mapping: dict[str, str] = {}
+                    failed_doc_ids_to_delete: list[str] = []
+
+                    if reuse_mode:
+                        existing_docs = await client.list_documents(dataset_id)
+                        docs_by_id = {
+                            str(doc.get("id", "")).strip(): doc
+                            for doc in existing_docs
+                            if str(doc.get("id", "")).strip()
+                        }
+                        hash_matches = await _lookup_dataset_document_ids_by_hash(
+                            dataset_id,
+                            [file_hash for _, _, file_hash in files_with_hashes],
+                        )
+
+                        files_to_upload = []
+                        for fname, fbytes, file_hash in files_with_hashes:
+                            candidate_ids = _ordered_unique([
+                                str(record.ragflow.file_hashes.get(file_hash, "")).strip(),
+                                *(hash_matches.get(file_hash, [])),
+                            ])
+
+                            selected_success = ""
+                            selected_pending = ""
+                            for candidate_id in candidate_ids:
+                                doc = docs_by_id.get(candidate_id)
+                                if not doc:
+                                    continue
+                                status = str(doc.get("status", "")).lower()
+                                if status == "success":
+                                    selected_success = candidate_id
+                                    break
+                                if status in {"running", "pending"} and not selected_pending:
+                                    selected_pending = candidate_id
+
+                            if selected_success:
+                                reused_success_doc_ids.append(selected_success)
+                                reused_hash_mapping[file_hash] = selected_success
+                                continue
+                            if selected_pending:
+                                reused_pending_doc_ids.append(selected_pending)
+                                reused_hash_mapping[file_hash] = selected_pending
+                                continue
+
+                            for candidate_id in candidate_ids:
+                                doc = docs_by_id.get(candidate_id)
+                                if not doc:
+                                    continue
+                                if str(doc.get("status", "")).lower() == "failed":
+                                    failed_doc_ids_to_delete.append(candidate_id)
+
+                            files_to_upload.append((fname, fbytes, file_hash))
+
+                        delete_ids = _ordered_unique(failed_doc_ids_to_delete)
+                        if delete_ids:
+                            await client.delete_documents(dataset_id, delete_ids)
+
+                    async def _upload_one(fname: str, fbytes: bytes, fhash: str) -> tuple[str, str]:
+                        async with upload_sem:
+                            doc_id = await client.upload_document(dataset_id, fname, fbytes)
+                            return doc_id, fhash
+
+                    uploaded_results = await asyncio.gather(
+                        *(_upload_one(fn, fb, fh) for fn, fb, fh in files_to_upload)
+                    )
+
+                    uploaded_doc_ids: list[str] = []
+                    for doc_id, fhash in uploaded_results:
+                        uploaded_doc_ids.append(doc_id)
+                        record.ragflow.file_hashes[fhash] = doc_id
+
+                    for fhash, doc_id in reused_hash_mapping.items():
+                        record.ragflow.file_hashes[fhash] = doc_id
+
+                    reused_doc_ids = _ordered_unique(reused_success_doc_ids + reused_pending_doc_ids)
+                    record.ragflow.document_ids = _ordered_unique(reused_doc_ids + uploaded_doc_ids)
+
+                    if not record.ragflow.document_ids:
+                        raise RuntimeError("No evidence documents were uploaded or reused")
+
+                    prep_msg = (
+                        f"Prepared evidence documents: uploaded {len(uploaded_doc_ids)}, "
+                        f"reused {len(reused_doc_ids)}."
+                    )
+                    if skipped_count > 0:
+                        prep_msg += f" Skipped {skipped_count} duplicate input file(s)."
+                    await _update_status(record, message=prep_msg)
+
+                    reused_success_doc_ids = _ordered_unique(reused_success_doc_ids)
+                    reused_success_statuses = [
+                        {
+                            "document_id": doc_id,
+                            "document_name": str(docs_by_id.get(doc_id, {}).get("name", "") or ""),
+                            "status": "success",
+                            "progress": 1.0,
+                            "message": "Reused existing parsed document",
+                        }
+                        for doc_id in reused_success_doc_ids
+                    ]
+                    docs_to_wait = _ordered_unique(reused_pending_doc_ids + uploaded_doc_ids)
+
+                    if docs_to_wait:
+                        await _update_status(
+                            record,
+                            state=TaskState.PARSING,
+                            stage=PipelineStage.DOCUMENT_PARSING,
+                            message="Parsing evidence documents...",
+                        )
+                        if uploaded_doc_ids:
+                            await client.start_parsing(dataset_id, uploaded_doc_ids)
+                        doc_statuses_raw = await client.wait_for_parsing(dataset_id, docs_to_wait)
+                        record.document_statuses = (
+                            [DocumentStatus(**ds) for ds in reused_success_statuses]
+                            + [DocumentStatus(**ds) for ds in doc_statuses_raw]
+                        )
+
+                        ok_ids = _ordered_unique(
+                            reused_success_doc_ids
+                            + [ds["document_id"] for ds in doc_statuses_raw if ds["status"] == "success"]
+                        )
+                        failed = [ds for ds in doc_statuses_raw if ds["status"] != "success"]
+                        if failed:
+                            names = ", ".join(ds["document_name"] or ds["document_id"] for ds in failed)
+                            logger.warning("Documents with parsing issues: %s", names)
+                        if not ok_ids:
+                            raise RuntimeError(
+                                "All documents failed to parse. "
+                                + "; ".join(
+                                    f"{ds['document_name'] or ds['document_id']}: {ds['message']}"
+                                    for ds in failed
+                                )
+                            )
+                        await _update_status(
+                            record,
+                            message=f"Parsing complete: {len(ok_ids)} succeeded, {len(failed)} failed",
+                        )
+                    else:
+                        record.document_statuses = [DocumentStatus(**ds) for ds in reused_success_statuses]
+                        if not reused_success_doc_ids:
+                            raise RuntimeError("No evidence documents available for assessment")
+                        await _update_status(
+                            record,
+                            state=TaskState.PARSING,
+                            stage=PipelineStage.DOCUMENT_PARSING,
+                            message=f"Reused {len(reused_success_doc_ids)} parsed document(s); no parsing needed.",
+                        )
+
                     await _update_status(
                         record,
-                        message=f"Parsing complete: {len(ok_ids)} succeeded, {len(failed)} failed",
+                        state=TaskState.PROCESSING,
+                        stage=PipelineStage.CHAT_PROCESSING,
+                        message="Creating chat assistant...",
                     )
-                else:
-                    record.document_statuses = [DocumentStatus(**ds) for ds in reused_success_statuses]
-                    if not reused_success_doc_ids:
-                        raise RuntimeError("No evidence documents available for assessment")
+                    c_name = chat_name or f"{settings.default_chat_name_prefix}_chat_{task_id[:8]}"
+                    chat_id = await client.ensure_chat(
+                        c_name,
+                        [dataset_id],
+                        similarity_threshold=settings.default_similarity_threshold,
+                        top_n=settings.default_top_n,
+                        **chat_opts,
+                    )
+                    record.ragflow.chat_id = chat_id
+
+                    session_id = await client.create_session(chat_id)
+                    record.ragflow.session_id = session_id
+
+                    failed_count = await _process_questions(
+                        record=record,
+                        questions=questions,
+                        client=client,
+                        chat_id=chat_id,
+                        session_id=session_id,
+                        process_vendor_response=process_vendor_response,
+                        only_cited_references=only_cited_references,
+                    )
+
+                    final_msg = "Assessment completed"
+                    if failed_count:
+                        final_msg = f"Assessment completed with {failed_count} question failure(s)"
                     await _update_status(
                         record,
-                        state=TaskState.PARSING,
-                        stage=PipelineStage.DOCUMENT_PARSING,
-                        message=f"Reused {len(reused_success_doc_ids)} parsed document(s); no parsing needed.",
+                        state=TaskState.COMPLETED,
+                        stage=PipelineStage.FINALIZING,
+                        message=final_msg,
                     )
-
-                # -- 4. Create chat assistant -----------------------------------------
-                await _update_status(
-                    record,
-                    state=TaskState.PROCESSING,
-                    stage=PipelineStage.CHAT_PROCESSING,
-                    message="Creating chat assistant...",
-                )
-                c_name = chat_name or f"{settings.default_chat_name_prefix}_chat_{task_id[:8]}"
-                chat_id = await client.ensure_chat(
-                    c_name,
-                    [dataset_id],
-                    similarity_threshold=settings.default_similarity_threshold,
-                    top_n=settings.default_top_n,
-                    **chat_opts
-                )
-                record.ragflow.chat_id = chat_id
-
-                # -- 5. Create session ------------------------------------------------
-                session_id = await client.create_session(chat_id)
-                record.ragflow.session_id = session_id
-
-                # -- 6. Process questions concurrently --------------------------------
-                failed_count = await _process_questions(
-                    record=record,
-                    questions=questions,
-                    client=client,
-                    chat_id=chat_id,
-                    session_id=session_id,
-                    process_vendor_response=process_vendor_response,
-                    only_cited_references=only_cited_references,
-                )
-
-                # -- 7. Done ----------------------------------------------------------
-                final_msg = "Assessment completed"
-                if failed_count:
-                    final_msg = f"Assessment completed with {failed_count} question failure(s)"
-                await _update_status(
-                    record,
-                    state=TaskState.COMPLETED,
-                    stage=PipelineStage.FINALIZING,
-                    message=final_msg,
-                )
-
-            except Exception as exc:
-                logger.exception("Assessment pipeline failed for task %s", task_id)
-                await _update_status(
-                    record,
-                    state=TaskState.FAILED,
-                    stage=PipelineStage.IDLE,
-                    message="Pipeline failed",
-                    error=str(exc),
-                )
-            finally:
-                await client.close()
+                except Exception as exc:
+                    logger.exception("Assessment pipeline failed for task %s", task_id)
+                    await _update_status(
+                        record,
+                        state=TaskState.FAILED,
+                        stage=PipelineStage.IDLE,
+                        message="Pipeline failed",
+                        error=str(exc),
+                    )
+                finally:
+                    await client.close()
 
 
 async def create_task(
     questions: list[dict[str, Any]],
     state: TaskState = TaskState.PENDING,
+    actor: ActorInfo | None = None,
 ) -> TaskRecord:
     """Create a new task record and persist it to the database."""
     task_id = uuid.uuid4().hex
@@ -785,6 +780,7 @@ async def create_task(
         task_id=task_id,
         state=state,
         total_questions=len(questions),
+        created_by=actor,
     )
     record = TaskRecord(
         task_id=task_id,
@@ -796,6 +792,7 @@ async def create_task(
         await db_add_task_event(
             task_id,
             event_type="task_created",
+            actor=actor,
             state=status.state,
             pipeline_stage=status.pipeline_stage,
             message="Task created",
@@ -815,6 +812,7 @@ async def create_session(
     dataset_name: str | None = None,
     reuse_exisiting_dataset: bool = True,
     dataset_opts: dict | None = None,
+    actor: ActorInfo | None = None,
 ) -> SessionCreateResponse:
     """
     Phase 1: Create a task record and a RAGFlow dataset upfront.
@@ -823,7 +821,7 @@ async def create_session(
     ``add_documents_to_session`` and finally trigger the assessment
     with ``start_assessment_for_session``.
     """
-    record = await create_task(questions, state=TaskState.AWAITING_DOCUMENTS)
+    record = await create_task(questions, state=TaskState.AWAITING_DOCUMENTS, actor=actor)
     client = RagflowClient()
     dataset_id: str = ""
     dataset_opts = _effective_dataset_options(dataset_opts, include_defaults=True)
@@ -893,6 +891,7 @@ async def claim_session_start(task_id: str) -> TaskRecord:
 async def add_documents_to_session(
     task_id: str,
     files: list[tuple[str, bytes]],
+    actor: ActorInfo | None = None,
 ) -> DocumentUploadResponse:
     """
     Phase 2 (repeatable): Upload one or more evidence documents to the
@@ -904,146 +903,161 @@ async def add_documents_to_session(
     files.  The task is automatically moved back to
     ``AWAITING_DOCUMENTS`` so that the assessment can be re-started.
     """
-    async with db_task_lock(task_id):
-        record = await get_task(task_id)
-        if record is None:
-            raise ValueError(f"Task {task_id} not found")
-        if record.status.state not in (TaskState.AWAITING_DOCUMENTS, TaskState.FAILED):
-            raise ValueError(
-                f"Cannot upload documents in state '{record.status.state.value}'. "
-                f"Task must be in 'awaiting_documents' or 'failed' state."
-            )
-        dataset_id = record.ragflow.dataset_id
-        if not dataset_id:
-            raise ValueError("No dataset associated with this task")
-
-        client = RagflowClient()
-        try:
-            upload_sem = asyncio.Semaphore(settings.max_concurrent_questions)
-            reuse_mode = bool(record.ragflow.reuse_existing_dataset)
-            files_with_hashes, skipped_count = _dedupe_files_by_hash(files)
-            files_to_upload = list(files_with_hashes)
-            reused_doc_ids: list[str] = []
-            reused_hash_mapping: dict[str, str] = {}
-
-            if reuse_mode:
-                docs = await client.list_documents(dataset_id)
-                docs_by_id = {
-                    str(doc.get("id", "")).strip(): doc
-                    for doc in docs
-                    if str(doc.get("id", "")).strip()
-                }
-                hash_matches = await _lookup_dataset_document_ids_by_hash(
-                    dataset_id,
-                    [file_hash for _, _, file_hash in files_with_hashes],
+    with actor_context(actor, request_method="POST", request_path=f"/api/v1/assessments/sessions/{task_id}/documents"):
+        async with db_task_lock(task_id):
+            record = await get_task(task_id)
+            if record is None:
+                raise ValueError(f"Task {task_id} not found")
+            if record.status.state not in (TaskState.AWAITING_DOCUMENTS, TaskState.FAILED):
+                raise ValueError(
+                    f"Cannot upload documents in state '{record.status.state.value}'. "
+                    f"Task must be in 'awaiting_documents' or 'failed' state."
                 )
 
-                failed_doc_ids_to_delete: list[str] = []
-                files_to_upload = []
-                for fname, fbytes, file_hash in files_with_hashes:
-                    candidate_ids = _ordered_unique([
-                        str(record.ragflow.file_hashes.get(file_hash, "")).strip(),
-                        *(hash_matches.get(file_hash, [])),
-                    ])
+            dataset_id = record.ragflow.dataset_id
+            if not dataset_id:
+                raise ValueError("No dataset associated with this task")
 
-                    selected_existing = ""
-                    for candidate_id in candidate_ids:
-                        doc = docs_by_id.get(candidate_id)
-                        if not doc:
+            client = RagflowClient()
+            try:
+                upload_sem = asyncio.Semaphore(settings.max_concurrent_questions)
+                reuse_mode = bool(record.ragflow.reuse_existing_dataset)
+                files_with_hashes, skipped_count = _dedupe_files_by_hash(files)
+                files_to_upload = list(files_with_hashes)
+                reused_doc_ids: list[str] = []
+                reused_hash_mapping: dict[str, str] = {}
+
+                if reuse_mode:
+                    docs = await client.list_documents(dataset_id)
+                    docs_by_id = {
+                        str(doc.get("id", "")).strip(): doc
+                        for doc in docs
+                        if str(doc.get("id", "")).strip()
+                    }
+                    hash_matches = await _lookup_dataset_document_ids_by_hash(
+                        dataset_id,
+                        [file_hash for _, _, file_hash in files_with_hashes],
+                    )
+
+                    failed_doc_ids_to_delete: list[str] = []
+                    files_to_upload = []
+                    for fname, fbytes, file_hash in files_with_hashes:
+                        candidate_ids = _ordered_unique([
+                            str(record.ragflow.file_hashes.get(file_hash, "")).strip(),
+                            *(hash_matches.get(file_hash, [])),
+                        ])
+
+                        selected_existing = ""
+                        for candidate_id in candidate_ids:
+                            doc = docs_by_id.get(candidate_id)
+                            if not doc:
+                                continue
+                            status = str(doc.get("status", "")).lower()
+                            if status in {"success", "running", "pending"}:
+                                selected_existing = candidate_id
+                                break
+
+                        if selected_existing:
+                            reused_doc_ids.append(selected_existing)
+                            reused_hash_mapping[file_hash] = selected_existing
                             continue
-                        status = str(doc.get("status", "")).lower()
-                        if status in {"success", "running", "pending"}:
-                            selected_existing = candidate_id
-                            break
 
-                    if selected_existing:
-                        reused_doc_ids.append(selected_existing)
-                        reused_hash_mapping[file_hash] = selected_existing
-                        continue
+                        for candidate_id in candidate_ids:
+                            doc = docs_by_id.get(candidate_id)
+                            if not doc:
+                                continue
+                            if str(doc.get("status", "")).lower() == "failed":
+                                failed_doc_ids_to_delete.append(candidate_id)
 
-                    for candidate_id in candidate_ids:
-                        doc = docs_by_id.get(candidate_id)
-                        if not doc:
+                        files_to_upload.append((fname, fbytes, file_hash))
+
+                    delete_ids = _ordered_unique(failed_doc_ids_to_delete)
+                    if delete_ids:
+                        await client.delete_documents(dataset_id, delete_ids)
+                else:
+                    filtered: list[tuple[str, bytes, str]] = []
+                    for fname, fbytes, file_hash in files_with_hashes:
+                        if file_hash in record.ragflow.file_hashes:
+                            skipped_count += 1
                             continue
-                        if str(doc.get("status", "")).lower() == "failed":
-                            failed_doc_ids_to_delete.append(candidate_id)
+                        filtered.append((fname, fbytes, file_hash))
+                    files_to_upload = filtered
 
-                    files_to_upload.append((fname, fbytes, file_hash))
+                if not files_to_upload and not reused_doc_ids and skipped_count > 0:
+                    return DocumentUploadResponse(
+                        task_id=task_id,
+                        dataset_id=dataset_id,
+                        uploaded_document_ids=[],
+                        total_documents=len(record.ragflow.document_ids),
+                        message=f"All {skipped_count} document(s) were duplicates and skipped.",
+                    )
 
-                delete_ids = _ordered_unique(failed_doc_ids_to_delete)
-                if delete_ids:
-                    await client.delete_documents(dataset_id, delete_ids)
-            else:
-                # Legacy mode: deduplicate only within the task/session itself.
-                filtered: list[tuple[str, bytes, str]] = []
-                for fname, fbytes, file_hash in files_with_hashes:
-                    if file_hash in record.ragflow.file_hashes:
-                        skipped_count += 1
-                        continue
-                    filtered.append((fname, fbytes, file_hash))
-                files_to_upload = filtered
+                async def _upload_one(fname: str, fbytes: bytes, fhash: str) -> tuple[str, str]:
+                    async with upload_sem:
+                        doc_id = await client.upload_document(dataset_id, fname, fbytes)
+                        return doc_id, fhash
 
-            if not files_to_upload and not reused_doc_ids and skipped_count > 0:
-                return DocumentUploadResponse(
-                    task_id=task_id,
-                    dataset_id=dataset_id,
-                    uploaded_document_ids=[],
-                    total_documents=len(record.ragflow.document_ids),
-                    message=f"All {skipped_count} document(s) were duplicates and skipped.",
+                uploaded_results = await asyncio.gather(
+                    *(_upload_one(fn, fb, fh) for fn, fb, fh in files_to_upload)
                 )
 
-            async def _upload_one(fname: str, fbytes: bytes, fhash: str) -> tuple[str, str]:
-                async with upload_sem:
-                    doc_id = await client.upload_document(dataset_id, fname, fbytes)
-                    return doc_id, fhash
+                new_ids: list[str] = []
+                for doc_id, fhash in uploaded_results:
+                    new_ids.append(doc_id)
+                    record.ragflow.file_hashes[fhash] = doc_id
 
-            # Upload only new unique files
-            uploaded_results = await asyncio.gather(
-                *(_upload_one(fn, fb, fh) for fn, fb, fh in files_to_upload)
+                for fhash, doc_id in reused_hash_mapping.items():
+                    record.ragflow.file_hashes[fhash] = doc_id
+
+                record.ragflow.document_ids = _ordered_unique(
+                    record.ragflow.document_ids + reused_doc_ids + new_ids
+                )
+
+                new_state = (
+                    TaskState.AWAITING_DOCUMENTS
+                    if record.status.state == TaskState.FAILED
+                    else None
+                )
+
+                msg = f"Uploaded {len(new_ids)} document(s)."
+                if reused_doc_ids:
+                    msg += f" Reused {len(_ordered_unique(reused_doc_ids))} existing document(s)."
+                if skipped_count > 0:
+                    msg += f" Skipped {skipped_count} duplicate(s)."
+
+                await _update_status(
+                    record,
+                    state=new_state,
+                    message=f"{len(record.ragflow.document_ids)} document(s) available. {msg}",
+                    error="" if new_state == TaskState.AWAITING_DOCUMENTS else None,
+                )
+                try:
+                    await db_add_task_event(
+                        task_id,
+                        event_type="documents_uploaded",
+                        actor=actor,
+                        state=record.status.state,
+                        pipeline_stage=record.status.pipeline_stage,
+                        message=msg,
+                        payload={
+                            "uploaded_document_ids": new_ids,
+                            "reused_document_ids": _ordered_unique(reused_doc_ids),
+                            "total_documents": len(record.ragflow.document_ids),
+                            "skipped_count": skipped_count,
+                        },
+                    )
+                except Exception:
+                    logger.exception("Failed to append documents_uploaded event for %s", task_id)
+            finally:
+                await client.close()
+
+            return DocumentUploadResponse(
+                task_id=task_id,
+                dataset_id=dataset_id,
+                uploaded_document_ids=new_ids,
+                total_documents=len(record.ragflow.document_ids),
+                message=f"{msg} Total: {len(record.ragflow.document_ids)}.",
             )
-
-            new_ids: list[str] = []
-            for doc_id, fhash in uploaded_results:
-                new_ids.append(doc_id)
-                record.ragflow.file_hashes[fhash] = doc_id
-
-            for fhash, doc_id in reused_hash_mapping.items():
-                record.ragflow.file_hashes[fhash] = doc_id
-
-            record.ragflow.document_ids = _ordered_unique(
-                record.ragflow.document_ids + reused_doc_ids + new_ids
-            )
-
-            # If the task was FAILED, move it back to AWAITING_DOCUMENTS so the
-            # user can re-start the assessment after uploading new documents.
-            new_state = (
-                TaskState.AWAITING_DOCUMENTS
-                if record.status.state == TaskState.FAILED
-                else None
-            )
-
-            msg = f"Uploaded {len(new_ids)} document(s)."
-            if reused_doc_ids:
-                msg += f" Reused {len(_ordered_unique(reused_doc_ids))} existing document(s)."
-            if skipped_count > 0:
-                msg += f" Skipped {skipped_count} duplicate(s)."
-
-            await _update_status(
-                record,
-                state=new_state,
-                message=f"{len(record.ragflow.document_ids)} document(s) available. {msg}",
-                error="" if new_state == TaskState.AWAITING_DOCUMENTS else None,
-            )
-        finally:
-            await client.close()
-
-        return DocumentUploadResponse(
-            task_id=task_id,
-            dataset_id=dataset_id,
-            uploaded_document_ids=new_ids,
-            total_documents=len(record.ragflow.document_ids),
-            message=f"{msg} Total: {len(record.ragflow.document_ids)}.",
-        )
 
 
 async def run_assessment_for_session(
@@ -1053,6 +1067,7 @@ async def run_assessment_for_session(
     chat_opts: dict | None = None,
     process_vendor_response: bool | None = None,
     only_cited_references: bool | None = None,
+    actor: ActorInfo | None = None,
 ) -> None:
     """
     Phase 3: Trigger the assessment pipeline for a session that already has
@@ -1064,135 +1079,128 @@ async def run_assessment_for_session(
     user can retry after uploading replacement or additional documents.
     Previous results are cleared before the new run begins.
     """
-    with start_span(
-        "assessment.run_assessment_for_session",
-        span_kind="CHAIN",
-        attributes={"task.id": task_id},
-    ):
-        with openinference_attributes(
-            session_id=task_id,
-            metadata={"workflow": "two_phase_resume", "chat_name": chat_name or ""},
+    with actor_context(actor, request_method="POST", request_path=f"/api/v1/assessments/sessions/{task_id}/start"):
+        with start_span(
+            "assessment.run_assessment_for_session",
+            span_kind="CHAIN",
+            attributes={"task.id": task_id},
         ):
-            record = await get_task(task_id)
-            if record is None:
-                raise ValueError(f"Task {task_id} not found")
-            if record.status.state not in (
-                TaskState.PARSING,
-                TaskState.AWAITING_DOCUMENTS,
-                TaskState.FAILED,
+            with openinference_attributes(
+                session_id=task_id,
+                metadata={"workflow": "two_phase_resume", "chat_name": chat_name or ""},
             ):
-                raise ValueError(
-                    f"Cannot start assessment in state '{record.status.state.value}'. "
-                    f"Task must be in 'parsing', 'awaiting_documents' or 'failed' state."
-                )
-            if not record.ragflow.document_ids:
-                raise ValueError("No evidence documents have been uploaded yet.")
+                record = await get_task(task_id)
+                if record is None:
+                    raise ValueError(f"Task {task_id} not found")
+                if record.status.state not in (
+                    TaskState.PARSING,
+                    TaskState.AWAITING_DOCUMENTS,
+                    TaskState.FAILED,
+                ):
+                    raise ValueError(
+                        f"Cannot start assessment in state '{record.status.state.value}'. "
+                        f"Task must be in 'parsing', 'awaiting_documents' or 'failed' state."
+                    )
+                if not record.ragflow.document_ids:
+                    raise ValueError("No evidence documents have been uploaded yet.")
 
-            # Clear stale results from any previous (failed) run so that
-            # the new run starts from a clean slate.
-            record.results.clear()
-            record.document_statuses.clear()
-            record.status.questions_processed = 0
-            record.status.error = None
+                record.results.clear()
+                record.document_statuses.clear()
+                record.status.questions_processed = 0
+                record.status.error = None
 
-            dataset_id = record.ragflow.dataset_id
-            if not record.ragflow.dataset_ids and dataset_id:
-                record.ragflow.dataset_ids = [dataset_id]
-            doc_ids = record.ragflow.document_ids
-            questions = record.questions
-            client = RagflowClient()
-            effective_dataset_opts = _effective_dataset_options(dataset_opts, include_defaults=True)
+                dataset_id = record.ragflow.dataset_id
+                if not record.ragflow.dataset_ids and dataset_id:
+                    record.ragflow.dataset_ids = [dataset_id]
+                doc_ids = record.ragflow.document_ids
+                questions = record.questions
+                client = RagflowClient()
+                effective_dataset_opts = _effective_dataset_options(dataset_opts, include_defaults=True)
 
-            try:
-                if effective_dataset_opts:
+                try:
+                    if effective_dataset_opts:
+                        await _update_status(
+                            record,
+                            stage=PipelineStage.IDLE,
+                            message="Updating dataset settings...",
+                        )
+                        await client.update_dataset(dataset_id, **effective_dataset_opts)
+
                     await _update_status(
                         record,
+                        state=TaskState.PARSING,
+                        stage=PipelineStage.DOCUMENT_PARSING,
+                        message="Parsing evidence documents...",
+                    )
+                    await client.start_parsing(dataset_id, doc_ids)
+                    doc_statuses_raw = await client.wait_for_parsing(dataset_id, doc_ids)
+                    record.document_statuses = [DocumentStatus(**ds) for ds in doc_statuses_raw]
+
+                    ok_ids = [ds["document_id"] for ds in doc_statuses_raw if ds["status"] == "success"]
+                    failed = [ds for ds in doc_statuses_raw if ds["status"] != "success"]
+                    if failed:
+                        names = ", ".join(ds["document_name"] or ds["document_id"] for ds in failed)
+                        logger.warning("Documents with parsing issues: %s", names)
+                    if not ok_ids:
+                        raise RuntimeError(
+                            "All documents failed to parse. "
+                            + "; ".join(f"{ds['document_name'] or ds['document_id']}: {ds['message']}" for ds in failed)
+                        )
+                    await _update_status(
+                        record,
+                        message=f"Parsing complete: {len(ok_ids)} succeeded, {len(failed)} failed",
+                    )
+
+                    await _update_status(
+                        record,
+                        state=TaskState.PROCESSING,
+                        stage=PipelineStage.CHAT_PROCESSING,
+                        message="Creating chat assistant...",
+                    )
+                    c_name = chat_name or f"{settings.default_chat_name_prefix}_chat_{task_id[:8]}"
+                    chat_opts = chat_opts or {}
+                    chat_id = await client.ensure_chat(
+                        c_name,
+                        [dataset_id],
+                        similarity_threshold=settings.default_similarity_threshold,
+                        top_n=settings.default_top_n,
+                        **chat_opts,
+                    )
+                    record.ragflow.chat_id = chat_id
+
+                    session_id = await client.create_session(chat_id)
+                    record.ragflow.session_id = session_id
+
+                    failed_count = await _process_questions(
+                        record=record,
+                        questions=questions,
+                        client=client,
+                        chat_id=chat_id,
+                        session_id=session_id,
+                        process_vendor_response=process_vendor_response,
+                        only_cited_references=only_cited_references,
+                    )
+
+                    final_msg = "Assessment completed"
+                    if failed_count:
+                        final_msg = f"Assessment completed with {failed_count} question failure(s)"
+                    await _update_status(
+                        record,
+                        state=TaskState.COMPLETED,
+                        stage=PipelineStage.FINALIZING,
+                        message=final_msg,
+                    )
+                except Exception as exc:
+                    logger.exception("Assessment pipeline failed for task %s", task_id)
+                    await _update_status(
+                        record,
+                        state=TaskState.FAILED,
                         stage=PipelineStage.IDLE,
-                        message="Updating dataset settings...",
+                        message="Pipeline failed",
+                        error=str(exc),
                     )
-                    await client.update_dataset(dataset_id, **effective_dataset_opts)
-
-                # -- Parse documents --------------------------------------------------
-                await _update_status(
-                    record,
-                    state=TaskState.PARSING,
-                    stage=PipelineStage.DOCUMENT_PARSING,
-                    message="Parsing evidence documents...",
-                )
-                await client.start_parsing(dataset_id, doc_ids)
-                doc_statuses_raw = await client.wait_for_parsing(dataset_id, doc_ids)
-                record.document_statuses = [DocumentStatus(**ds) for ds in doc_statuses_raw]
-
-                ok_ids = [ds["document_id"] for ds in doc_statuses_raw if ds["status"] == "success"]
-                failed = [ds for ds in doc_statuses_raw if ds["status"] != "success"]
-                if failed:
-                    names = ", ".join(ds["document_name"] or ds["document_id"] for ds in failed)
-                    logger.warning("Documents with parsing issues: %s", names)
-                if not ok_ids:
-                    raise RuntimeError(
-                        "All documents failed to parse. "
-                        + "; ".join(f"{ds['document_name'] or ds['document_id']}: {ds['message']}" for ds in failed)
-                    )
-                await _update_status(
-                    record,
-                    message=f"Parsing complete: {len(ok_ids)} succeeded, {len(failed)} failed",
-                )
-
-                # -- Create chat assistant --------------------------------------------
-                await _update_status(
-                    record,
-                    state=TaskState.PROCESSING,
-                    stage=PipelineStage.CHAT_PROCESSING,
-                    message="Creating chat assistant...",
-                )
-                c_name = chat_name or f"{settings.default_chat_name_prefix}_chat_{task_id[:8]}"
-                chat_opts = chat_opts or {}
-                chat_id = await client.ensure_chat(
-                    c_name,
-                    [dataset_id],
-                    similarity_threshold=settings.default_similarity_threshold,
-                    top_n=settings.default_top_n,
-                    **chat_opts
-                )
-                record.ragflow.chat_id = chat_id
-
-                # -- Create session ---------------------------------------------------
-                session_id = await client.create_session(chat_id)
-                record.ragflow.session_id = session_id
-
-                # -- Process questions concurrently -----------------------------------
-                failed_count = await _process_questions(
-                    record=record,
-                    questions=questions,
-                    client=client,
-                    chat_id=chat_id,
-                    session_id=session_id,
-                    process_vendor_response=process_vendor_response,
-                    only_cited_references=only_cited_references,
-                )
-
-                # -- Done -------------------------------------------------------------
-                final_msg = "Assessment completed"
-                if failed_count:
-                    final_msg = f"Assessment completed with {failed_count} question failure(s)"
-                await _update_status(
-                    record,
-                    state=TaskState.COMPLETED,
-                    stage=PipelineStage.FINALIZING,
-                    message=final_msg,
-                )
-
-            except Exception as exc:
-                logger.exception("Assessment pipeline failed for task %s", task_id)
-                await _update_status(
-                    record,
-                    state=TaskState.FAILED,
-                    stage=PipelineStage.IDLE,
-                    message="Pipeline failed",
-                    error=str(exc),
-                )
-            finally:
-                await client.close()
+                finally:
+                    await client.close()
 
 
 async def run_assessment_from_dataset(
@@ -1203,6 +1211,7 @@ async def run_assessment_from_dataset(
     dataset_opts: dict | None = None,
     process_vendor_response: bool | None = None,
     only_cited_references: bool | None = None,
+    actor: ActorInfo | None = None,
 ) -> None:
     """
     Background coroutine for assessments against one or more **existing**
@@ -1211,98 +1220,90 @@ async def run_assessment_from_dataset(
     Skips dataset creation, document upload, and parsing.  Starts directly
     from chat assistant creation → session → question processing.
     """
-    with start_span(
-        "assessment.run_assessment_from_dataset",
-        span_kind="CHAIN",
-        attributes={
-            "task.id": task_id,
-            "assessment.dataset.count": len(dataset_ids),
-        },
-    ):
-        with openinference_attributes(
-            session_id=task_id,
-            metadata={"workflow": "from_dataset", "chat_name": chat_name or ""},
+    with actor_context(actor, request_method="POST", request_path="/api/v1/assessments/from-dataset"):
+        with start_span(
+            "assessment.run_assessment_from_dataset",
+            span_kind="CHAIN",
+            attributes={
+                "task.id": task_id,
+                "assessment.dataset.count": len(dataset_ids),
+            },
         ):
-            record = await get_task(task_id)
-            if record is None:
-                raise ValueError(f"Task {task_id} not found")
-            # Store the first dataset ID for backward-compatible status display;
-            # all IDs are passed to the chat assistant.
-            record.ragflow.dataset_id = dataset_ids[0] if dataset_ids else ""
-            record.ragflow.dataset_ids = list(dataset_ids)
-            client = RagflowClient()
-            # For from-dataset flow, only explicit runtime options should trigger
-            # updates to existing datasets.
-            effective_dataset_opts = _effective_dataset_options(dataset_opts, include_defaults=False)
+            with openinference_attributes(
+                session_id=task_id,
+                metadata={"workflow": "from_dataset", "chat_name": chat_name or ""},
+            ):
+                record = await get_task(task_id)
+                if record is None:
+                    raise ValueError(f"Task {task_id} not found")
+                record.ragflow.dataset_id = dataset_ids[0] if dataset_ids else ""
+                record.ragflow.dataset_ids = list(dataset_ids)
+                client = RagflowClient()
+                effective_dataset_opts = _effective_dataset_options(dataset_opts, include_defaults=False)
 
-            try:
-                if effective_dataset_opts:
+                try:
+                    if effective_dataset_opts:
+                        await _update_status(
+                            record,
+                            state=TaskState.PROCESSING,
+                            stage=PipelineStage.CHAT_PROCESSING,
+                            message="Updating dataset settings...",
+                        )
+                        await asyncio.gather(
+                            *(client.update_dataset(dataset_id, **effective_dataset_opts) for dataset_id in dataset_ids)
+                        )
+
                     await _update_status(
                         record,
                         state=TaskState.PROCESSING,
                         stage=PipelineStage.CHAT_PROCESSING,
-                        message="Updating dataset settings...",
+                        message="Creating chat assistant...",
                     )
-                    await asyncio.gather(
-                        *(client.update_dataset(dataset_id, **effective_dataset_opts) for dataset_id in dataset_ids)
+                    c_name = chat_name or f"{settings.default_chat_name_prefix}_chat_{task_id[:8]}"
+                    chat_opts = chat_opts or {}
+                    chat_id = await client.ensure_chat(
+                        c_name,
+                        dataset_ids,
+                        similarity_threshold=settings.default_similarity_threshold,
+                        top_n=settings.default_top_n,
+                        **chat_opts,
+                    )
+                    record.ragflow.chat_id = chat_id
+
+                    session_id = await client.create_session(chat_id)
+                    record.ragflow.session_id = session_id
+
+                    questions = record.questions
+                    failed_count = await _process_questions(
+                        record=record,
+                        questions=questions,
+                        client=client,
+                        chat_id=chat_id,
+                        session_id=session_id,
+                        process_vendor_response=process_vendor_response,
+                        only_cited_references=only_cited_references,
                     )
 
-                # -- Create chat assistant --------------------------------------------
-                await _update_status(
-                    record,
-                    state=TaskState.PROCESSING,
-                    stage=PipelineStage.CHAT_PROCESSING,
-                    message="Creating chat assistant...",
-                )
-                c_name = chat_name or f"{settings.default_chat_name_prefix}_chat_{task_id[:8]}"
-                chat_opts = chat_opts or {}
-                chat_id = await client.ensure_chat(
-                    c_name,
-                    dataset_ids,
-                    similarity_threshold=settings.default_similarity_threshold,
-                    top_n=settings.default_top_n,
-                    **chat_opts
-                )
-                record.ragflow.chat_id = chat_id
-
-                # -- Create session ---------------------------------------------------
-                session_id = await client.create_session(chat_id)
-                record.ragflow.session_id = session_id
-
-                # -- Process questions concurrently -----------------------------------
-                questions = record.questions
-                failed_count = await _process_questions(
-                    record=record,
-                    questions=questions,
-                    client=client,
-                    chat_id=chat_id,
-                    session_id=session_id,
-                    process_vendor_response=process_vendor_response,
-                    only_cited_references=only_cited_references,
-                )
-
-                # -- Done -------------------------------------------------------------
-                final_msg = "Assessment completed"
-                if failed_count:
-                    final_msg = f"Assessment completed with {failed_count} question failure(s)"
-                await _update_status(
-                    record,
-                    state=TaskState.COMPLETED,
-                    stage=PipelineStage.FINALIZING,
-                    message=final_msg,
-                )
-
-            except Exception as exc:
-                logger.exception("Assessment pipeline failed for task %s", task_id)
-                await _update_status(
-                    record,
-                    state=TaskState.FAILED,
-                    stage=PipelineStage.IDLE,
-                    message="Pipeline failed",
-                    error=str(exc),
-                )
-            finally:
-                await client.close()
+                    final_msg = "Assessment completed"
+                    if failed_count:
+                        final_msg = f"Assessment completed with {failed_count} question failure(s)"
+                    await _update_status(
+                        record,
+                        state=TaskState.COMPLETED,
+                        stage=PipelineStage.FINALIZING,
+                        message=final_msg,
+                    )
+                except Exception as exc:
+                    logger.exception("Assessment pipeline failed for task %s", task_id)
+                    await _update_status(
+                        record,
+                        state=TaskState.FAILED,
+                        stage=PipelineStage.IDLE,
+                        message="Pipeline failed",
+                        error=str(exc),
+                    )
+                finally:
+                    await client.close()
 
 
 def get_paginated_results(

@@ -23,6 +23,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from .config import settings
+from .models import ActorInfo
+from .observability import clear_actor_context, set_actor_context, set_span_attributes, trace
 
 try:
     from ldap3 import Connection, Server, Tls
@@ -240,6 +242,7 @@ def _create_token(
     username: str,
     roles: list[str],
     groups: list[str],
+    auth_type: str,
     token_type: str,
     ttl_minutes: int,
 ) -> str:
@@ -249,6 +252,7 @@ def _create_token(
     payload = {
         "sub": username,
         "roles": roles,
+        "auth_type": auth_type,
         "type": token_type,
         "exp": int(exp.timestamp()),
     }
@@ -285,6 +289,27 @@ def _decode_token(token: str, *, expected_type: str | None = None) -> dict[str, 
             headers={"WWW-Authenticate": "Bearer"},
         )
     return payload
+
+
+def actor_from_claims(claims: dict[str, Any] | None) -> ActorInfo | None:
+    if not claims:
+        return None
+    username = str(claims.get("sub", "")).strip()
+    auth_type = str(claims.get("auth_type", "")).strip()
+    roles = [str(r).strip().lower() for r in claims.get("roles", []) if str(r).strip()]
+    if not username and not roles and not auth_type:
+        return None
+    return ActorInfo(username=username, roles=roles, auth_type=auth_type)
+
+
+def actor_from_request(request: Request) -> ActorInfo | None:
+    actor = getattr(request.state, "auth_actor", None)
+    if isinstance(actor, ActorInfo):
+        return actor
+    claims = getattr(request.state, "auth_claims", None)
+    if isinstance(claims, dict):
+        return actor_from_claims(claims)
+    return None
 
 
 def _ldap_server() -> Server:
@@ -595,6 +620,10 @@ async def verify_jwt(
 
     If JWT signing key is not configured, auth is disabled (pass-through).
     """
+    request.state.auth_claims = None
+    request.state.auth_actor = None
+    clear_actor_context()
+
     if not _jwt_auth_enabled():
         return None
 
@@ -624,6 +653,18 @@ async def verify_jwt(
             ),
         )
 
+    actor = actor_from_claims(payload)
+    request.state.auth_claims = payload
+    request.state.auth_actor = actor
+    set_actor_context(actor, request_method=request.method, request_path=request.url.path)
+    set_span_attributes(
+        trace.get_current_span(),
+        {
+            "enduser.id": actor.username if actor else None,
+            "assessment.user.roles": ",".join(actor.roles) if actor else None,
+            "assessment.auth_type": actor.auth_type if actor else None,
+        },
+    )
     return payload
 
 
@@ -667,6 +708,7 @@ async def get_token(req: LoginRequest):
         username=req.username.strip(),
         roles=roles,
         groups=groups,
+        auth_type="ldap",
         token_type="access",
         ttl_minutes=access_ttl,
     )
@@ -674,6 +716,7 @@ async def get_token(req: LoginRequest):
         username=req.username.strip(),
         roles=roles,
         groups=groups,
+        auth_type="ldap",
         token_type="refresh",
         ttl_minutes=refresh_ttl,
     )
@@ -709,6 +752,7 @@ async def refresh_token(req: RefreshRequest):
 
     roles = [str(r).strip().lower() for r in payload.get("roles", []) if str(r).strip()]
     groups = [str(g) for g in payload.get("groups", []) if str(g).strip()]
+    auth_type = str(payload.get("auth_type", "")).strip() or "jwt"
 
     access_ttl = max(1, settings.jwt_access_token_ttl_minutes)
     refresh_ttl = max(1, settings.jwt_refresh_token_ttl_minutes)
@@ -716,6 +760,7 @@ async def refresh_token(req: RefreshRequest):
         username=username,
         roles=roles,
         groups=groups,
+        auth_type=auth_type,
         token_type="access",
         ttl_minutes=access_ttl,
     )
@@ -723,6 +768,7 @@ async def refresh_token(req: RefreshRequest):
         username=username,
         roles=roles,
         groups=groups,
+        auth_type=auth_type,
         token_type="refresh",
         ttl_minutes=refresh_ttl,
     )

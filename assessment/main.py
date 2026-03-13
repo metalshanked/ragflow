@@ -27,7 +27,7 @@ if _raw_base and not _raw_base.startswith("/"):
     _raw_base = "/" + _raw_base
 
 app = FastAPI(
-    title="RAGFlow Assessment API",
+    title="AI Assessments",
     description=(
         "Wrapper API that takes a list of assessment questions (Excel) and "
         "evidence documents, verifies each question against the evidence "

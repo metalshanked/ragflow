@@ -1,7 +1,7 @@
 """
-Simple web UI for the Assessment API.
+Simple web UI for AI Assessments.
 
-Serves an HTML dashboard at ``/ui`` (or ``/<base_path>/ui`` when a subpath
+Serves an HTML UI at ``/ui`` (or ``/<base_path>/ui`` when a subpath
 is configured) that provides a browser-based interface to all API features.
 """
 
@@ -45,17 +45,17 @@ def _base_path(request: Request) -> str:
     return root_path.rstrip("/")
 
 
-def _favicon_href(base_path: str) -> str:
-    return f"{base_path}/favicon.ico" if base_path else "/favicon.ico"
+def _ui_asset_href(request: Request, asset_name: str) -> str:
+    _ = request
+    return asset_name
 
 
 @router.get("/ui", response_class=HTMLResponse, include_in_schema=False)
 async def ui_page(request: Request):
     """Serve the single-page assessment UI."""
-    base_path = _base_path(request)
     return HTMLResponse(
         content=_build_html(
-            favicon_href=_favicon_href(base_path),
+            favicon_href=_ui_asset_href(request, "favicon.ico"),
         ),
         status_code=200,
     )
@@ -63,7 +63,7 @@ async def ui_page(request: Request):
 
 @router.get("/icon.svg", include_in_schema=False)
 async def app_icon() -> Response:
-    """Serve the dashboard app icon."""
+    """Serve the app icon."""
     return Response(
         content=APP_ICON_SVG,
         media_type="image/svg+xml",
@@ -100,7 +100,7 @@ def _build_html(*, favicon_href: str) -> str:
 <link rel="icon" href="__FAVICON_HREF__" sizes="any" type="image/x-icon"/>
 <link rel="shortcut icon" href="__FAVICON_HREF__" type="image/x-icon"/>
 <link rel="apple-touch-icon" href="__FAVICON_HREF__"/>
-<title>Assessment API – Dashboard</title>
+<title>AI Assessments</title>
 <style>
 :root{--bg:#f5f7fa;--card:#fff;--primary:#4361ee;--primary-hover:#3a56d4;--danger:#ef476f;--success:#06d6a0;--warn:#ffd166;--text:#212529;--muted:#6c757d;--border:#dee2e6;--radius:8px;--disabled:#a0aec0}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -174,10 +174,13 @@ th{background:var(--bg);font-weight:600;position:sticky;top:0}
 .ref-links a{color:var(--primary);text-decoration:none;cursor:pointer}
 .ref-links a:hover{text-decoration:underline}
 .link-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:.85rem;margin-top:1rem}
-.link-card{display:block;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:.9rem 1rem;color:var(--text);text-decoration:none}
+.link-card{display:block;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:.9rem 1rem;color:var(--text);text-decoration:none;cursor:pointer}
+button.link-card{width:100%;text-align:left;font:inherit}
 .link-card:hover{border-color:var(--primary);box-shadow:0 4px 16px rgba(67,97,238,.08)}
 .link-card strong{display:block;margin-bottom:.25rem}
 .link-card code{display:block;font-size:.8rem;color:var(--muted);word-break:break-all}
+.api-link-status{font-size:.84rem;color:var(--muted);margin-top:1rem;min-height:1.2rem}
+.api-link-result{margin-top:.75rem;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:1rem;font-size:.84rem;overflow:auto;max-height:360px;white-space:pre-wrap;word-break:break-word}
 /* Image modal */
 .modal-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6);z-index:1000;display:flex;align-items:center;justify-content:center}
 .modal-content{background:#fff;border-radius:var(--radius);padding:1rem;max-width:90vw;max-height:90vh;overflow:auto;position:relative}
@@ -196,7 +199,7 @@ th{background:var(--bg);font-weight:600;position:sticky;top:0}
     <div class="login-mark">
       <img src="__FAVICON_HREF__" alt=""/>
       <div>
-        <h2>Assessment Dashboard</h2>
+        <h2>AI Assessments</h2>
         <p>Sign in with your LDAP account to access the app.</p>
       </div>
     </div>
@@ -213,7 +216,7 @@ th{background:var(--bg);font-weight:600;position:sticky;top:0}
   </div>
 </div>
 <header>
-  <h1><img src="__FAVICON_HREF__" alt=""/>Assessment API Dashboard</h1>
+  <h1><img src="__FAVICON_HREF__" alt=""/>AI Assessments</h1>
   <div class="header-actions">
     <span class="info" id="hdr-info"></span>
     <span class="session-pill hidden" id="session-summary"></span>
@@ -421,7 +424,7 @@ th{background:var(--bg);font-weight:600;position:sticky;top:0}
   <!-- API DOCS PANEL -->
   <div class="panel" id="panel-api">
     <h3>API Docs & Links</h3>
-    <p style="color:var(--muted);font-size:.88rem;margin:.4rem 0">Quick links to the generated API documentation and commonly used endpoints.</p>
+    <p style="color:var(--muted);font-size:.88rem;margin:.4rem 0">Quick links to the generated API documentation and common endpoints. Protected endpoint cards use the current UI session token automatically.</p>
     <div class="link-grid">
       <a class="link-card" id="link-docs" target="_blank" rel="noreferrer">
         <strong>Swagger UI</strong>
@@ -439,15 +442,17 @@ th{background:var(--bg);font-weight:600;position:sticky;top:0}
         <strong>Health</strong>
         <code></code>
       </a>
-      <a class="link-card" id="link-assessments" target="_blank" rel="noreferrer">
+      <button class="link-card" id="link-assessments" type="button" onclick="runApiLink('link-assessments')">
         <strong>Assessments List</strong>
         <code></code>
-      </a>
-      <a class="link-card" id="link-datasets" target="_blank" rel="noreferrer">
+      </button>
+      <button class="link-card" id="link-datasets" type="button" onclick="runApiLink('link-datasets')">
         <strong>Native Datasets</strong>
         <code></code>
-      </a>
+      </button>
     </div>
+    <div class="api-link-status" id="api-link-status">Click a protected endpoint card to run it with the current UI session token.</div>
+    <pre class="api-link-result" id="api-link-result">No API endpoint response loaded yet.</pre>
   </div>
 
   <!-- TASK DETAIL MODAL -->
@@ -510,10 +515,17 @@ function initApiLinks(){
     'link-assessments': API + '/assessments',
     'link-datasets': API + '/native/datasets',
   };
+  const protectedLinks = {'link-assessments': true, 'link-datasets': true};
   Object.keys(links).forEach(function(id){
     const el = document.getElementById(id);
     if(!el)return;
-    el.href = links[id];
+    if(el.tagName === 'A'){
+      el.href = links[id];
+    }
+    el.dataset.url = links[id];
+    if(protectedLinks[id]){
+      el.dataset.auth = 'required';
+    }
     const codeEl = el.querySelector('code');
     if(codeEl)codeEl.textContent = links[id];
   });
@@ -521,24 +533,115 @@ function initApiLinks(){
 
 let ACCESS_TOKEN = localStorage.getItem('assessment_access_token') || '';
 let REFRESH_TOKEN = localStorage.getItem('assessment_refresh_token') || '';
+let ACCESS_TOKEN_EXPIRES_AT = parseInt(localStorage.getItem('assessment_access_token_expires_at') || '0', 10) || 0;
+let REFRESH_TOKEN_EXPIRES_AT = parseInt(localStorage.getItem('assessment_refresh_token_expires_at') || '0', 10) || 0;
 let AUTH_USERNAME = localStorage.getItem('assessment_auth_username') || '';
 let AUTH_ROLES = (localStorage.getItem('assessment_auth_roles') || '').split(',').filter(Boolean);
 let AUTH_MODE = 'disabled';
+let _sessionRefreshTimer = null;
+let _sessionLogoutTimer = null;
+let _sessionRefreshPromise = null;
 
 document.getElementById('auth-username').value = AUTH_USERNAME;
 updateAuthUi();
 
 function headers(){const h={};if(ACCESS_TOKEN)h['Authorization']='Bearer '+ACCESS_TOKEN;return h;}
+function _epochNow(){return Math.floor(Date.now()/1000);}
+function _isAccessTokenExpired(skewSeconds){return !!ACCESS_TOKEN_EXPIRES_AT && ACCESS_TOKEN_EXPIRES_AT <= (_epochNow() + (skewSeconds || 0));}
+function _isRefreshTokenExpired(skewSeconds){return !!REFRESH_TOKEN_EXPIRES_AT && REFRESH_TOKEN_EXPIRES_AT <= (_epochNow() + (skewSeconds || 0));}
+function _clearSessionTimers(){
+  if(_sessionRefreshTimer){clearTimeout(_sessionRefreshTimer);_sessionRefreshTimer=null;}
+  if(_sessionLogoutTimer){clearTimeout(_sessionLogoutTimer);_sessionLogoutTimer=null;}
+}
+function _setStoredInt(key, value){
+  if(value && value > 0){localStorage.setItem(key, String(value));}
+  else{localStorage.removeItem(key);}
+}
+function _persistSession(){
+  if(ACCESS_TOKEN){localStorage.setItem('assessment_access_token', ACCESS_TOKEN);}else{localStorage.removeItem('assessment_access_token');}
+  if(REFRESH_TOKEN){localStorage.setItem('assessment_refresh_token', REFRESH_TOKEN);}else{localStorage.removeItem('assessment_refresh_token');}
+  if(AUTH_USERNAME){localStorage.setItem('assessment_auth_username', AUTH_USERNAME);}else{localStorage.removeItem('assessment_auth_username');}
+  localStorage.setItem('assessment_auth_roles', AUTH_ROLES.join(','));
+  _setStoredInt('assessment_access_token_expires_at', ACCESS_TOKEN_EXPIRES_AT);
+  _setStoredInt('assessment_refresh_token_expires_at', REFRESH_TOKEN_EXPIRES_AT);
+}
+function _setLoginStatus(message){
+  const loginStatus=document.getElementById('login-status');
+  if(loginStatus)loginStatus.textContent=message||'';
+}
+function setApiLinkResult(message, isError){
+  const statusEl=document.getElementById('api-link-status');
+  const resultEl=document.getElementById('api-link-result');
+  if(statusEl){
+    statusEl.textContent=isError ? 'API request failed.' : 'API request completed.';
+    statusEl.style.color=isError ? 'var(--danger)' : 'var(--muted)';
+  }
+  if(resultEl)resultEl.textContent=message;
+}
+function clearSession(message, showToast){
+  ACCESS_TOKEN='';
+  REFRESH_TOKEN='';
+  ACCESS_TOKEN_EXPIRES_AT=0;
+  REFRESH_TOKEN_EXPIRES_AT=0;
+  AUTH_USERNAME='';
+  AUTH_ROLES=[];
+  _clearSessionTimers();
+  _persistSession();
+  updateAuthUi();
+  if(message){_setLoginStatus(message);}
+  if(showToast && message){toast(message,'err');}
+}
+function scheduleSessionTimers(){
+  _clearSessionTimers();
+  if(AUTH_MODE !== 'ldap'){return;}
+  if(REFRESH_TOKEN && _isRefreshTokenExpired()){
+    clearSession('Session expired. Please sign in again.', true);
+    return;
+  }
+  if(REFRESH_TOKEN && REFRESH_TOKEN_EXPIRES_AT){
+    const logoutDelay=Math.max(0, (REFRESH_TOKEN_EXPIRES_AT - _epochNow()) * 1000);
+    _sessionLogoutTimer=setTimeout(function(){
+      clearSession('Session expired. Please sign in again.', true);
+    }, logoutDelay);
+  }
+  if(!REFRESH_TOKEN || !ACCESS_TOKEN_EXPIRES_AT){return;}
+  const leadSeconds=Math.min(60, Math.max(15, Math.floor((ACCESS_TOKEN_EXPIRES_AT - _epochNow()) / 4) || 15));
+  const refreshDelay=Math.max(0, (ACCESS_TOKEN_EXPIRES_AT - _epochNow() - leadSeconds) * 1000);
+  _sessionRefreshTimer=setTimeout(function(){
+    void refreshSessionToken({showFeedback:false, keepLoginMessage:false, showToastOnFailure:false});
+  }, refreshDelay);
+}
+async function ensureActiveSession(showToastOnFailure){
+  if(AUTH_MODE !== 'ldap'){return !!ACCESS_TOKEN;}
+  if(!ACCESS_TOKEN && !REFRESH_TOKEN){
+    if(showToastOnFailure){toast('Sign in required','err');}
+    return false;
+  }
+  if(_isRefreshTokenExpired()){
+    clearSession('Session expired. Please sign in again.', !!showToastOnFailure);
+    return false;
+  }
+  if(!ACCESS_TOKEN || _isAccessTokenExpired(30)){
+    return await refreshSessionToken({showFeedback:false, keepLoginMessage:false, showToastOnFailure:!!showToastOnFailure});
+  }
+  scheduleSessionTimers();
+  return true;
+}
 
 function _storeSession(data){
   ACCESS_TOKEN = data.access_token || ACCESS_TOKEN;
   REFRESH_TOKEN = data.refresh_token || REFRESH_TOKEN;
   AUTH_USERNAME = data.username || AUTH_USERNAME || '';
   AUTH_ROLES = Array.isArray(data.roles) ? data.roles : AUTH_ROLES;
-  if(ACCESS_TOKEN){localStorage.setItem('assessment_access_token', ACCESS_TOKEN);}else{localStorage.removeItem('assessment_access_token');}
-  if(REFRESH_TOKEN){localStorage.setItem('assessment_refresh_token', REFRESH_TOKEN);}else{localStorage.removeItem('assessment_refresh_token');}
-  if(AUTH_USERNAME){localStorage.setItem('assessment_auth_username', AUTH_USERNAME);}else{localStorage.removeItem('assessment_auth_username');}
-  localStorage.setItem('assessment_auth_roles', AUTH_ROLES.join(','));
+  const now=_epochNow();
+  if(typeof data.expires_in === 'number' && data.expires_in > 0){
+    ACCESS_TOKEN_EXPIRES_AT = now + data.expires_in;
+  }
+  if(typeof data.refresh_expires_in === 'number' && data.refresh_expires_in > 0){
+    REFRESH_TOKEN_EXPIRES_AT = now + data.refresh_expires_in;
+  }
+  _persistSession();
+  scheduleSessionTimers();
   updateAuthUi();
 }
 
@@ -549,7 +652,7 @@ function updateAuthUi(){
   const sessionSummary=document.getElementById('session-summary');
   const logoutBtn=document.getElementById('btn-logout');
   const requiresLogin = AUTH_MODE === 'ldap';
-  const signedIn = !!ACCESS_TOKEN;
+  const signedIn = (!!ACCESS_TOKEN || !!REFRESH_TOKEN) && !_isRefreshTokenExpired();
 
   if(sessionSummary){
     if(signedIn){
@@ -572,8 +675,10 @@ function updateAuthUi(){
   }
   if(loginStatus){
     if(requiresLogin && !signedIn){
-      loginStatus.textContent='Sign in with LDAP to continue.';
-    }else{
+      if(!loginStatus.textContent){
+        loginStatus.textContent='Sign in with LDAP to continue.';
+      }
+    }else if(signedIn){
       loginStatus.textContent='';
     }
   }
@@ -594,78 +699,114 @@ async function loginLdap(){
     if(!r.ok)throw new Error(data.detail||('Login failed ('+r.status+')'));
     _storeSession(data);
     document.getElementById('auth-password').value='';
-    const loginStatus=document.getElementById('login-status');
-    if(loginStatus)loginStatus.textContent='';
+    _setLoginStatus('');
     toast('Login successful','ok');
   }catch(e){
-    const loginStatus=document.getElementById('login-status');
-    if(loginStatus)loginStatus.textContent=e.message;
+    _setLoginStatus(e.message);
     toast(e.message,'err');
   }finally{
     btnReset('btn-login');
   }
 }
 
-async function refreshSessionToken(){
-  if(!REFRESH_TOKEN){toast('No refresh token available','err');return;}
-  btnLoading('btn-refresh-token','Refreshing\u2026');
-  try{
-    const r=await fetch(API+'/auth/refresh',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({refresh_token:REFRESH_TOKEN}),
-    });
-    const data=await r.json().catch(()=>({detail:'Invalid server response'}));
-    if(!r.ok)throw new Error(data.detail||('Refresh failed ('+r.status+')'));
-    _storeSession(data);
-    toast('Token refreshed','ok');
-  }catch(e){
-    toast(e.message,'err');
-  }finally{
-    btnReset('btn-refresh-token');
+async function refreshSessionToken(options){
+  const opts=options||{};
+  if(_sessionRefreshPromise)return _sessionRefreshPromise;
+  if(!REFRESH_TOKEN){
+    clearSession('Session expired. Please sign in again.', !!opts.showToastOnFailure);
+    return false;
   }
+  if(_isRefreshTokenExpired()){
+    clearSession('Session expired. Please sign in again.', !!opts.showToastOnFailure);
+    return false;
+  }
+  _sessionRefreshPromise=(async function(){
+    try{
+      const r=await fetch(API+'/auth/refresh',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({refresh_token:REFRESH_TOKEN}),
+      });
+      const data=await r.json().catch(()=>({detail:'Invalid server response'}));
+      if(!r.ok)throw new Error(data.detail||('Refresh failed ('+r.status+')'));
+      _storeSession(data);
+      if(opts.showFeedback)toast('Session refreshed','ok');
+      if(opts.keepLoginMessage === false)_setLoginStatus('');
+      return true;
+    }catch(e){
+      clearSession('Session expired. Please sign in again.', opts.showToastOnFailure !== false);
+      return false;
+    }finally{
+      _sessionRefreshPromise=null;
+    }
+  })();
+  return _sessionRefreshPromise;
 }
 
 async function verifySessionToken(showFeedback=true){
   try{
+    const sessionOk=await ensureActiveSession(showFeedback);
+    if(!sessionOk)throw new Error('Session expired. Please sign in again.');
     const r=await fetch(API+'/auth/verify',{headers:headers()});
     const data=await r.json().catch(()=>({detail:'Invalid server response'}));
     if(!r.ok)throw new Error(data.detail||('Verify failed ('+r.status+')'));
     if(data && data.valid){
       AUTH_USERNAME = data.username || AUTH_USERNAME;
       AUTH_ROLES = Array.isArray(data.roles) ? data.roles : AUTH_ROLES;
-      localStorage.setItem('assessment_auth_username', AUTH_USERNAME || '');
-      localStorage.setItem('assessment_auth_roles', AUTH_ROLES.join(','));
+      if(data.expires_at){ACCESS_TOKEN_EXPIRES_AT = parseInt(data.expires_at, 10) || ACCESS_TOKEN_EXPIRES_AT;}
+      _persistSession();
+      scheduleSessionTimers();
       updateAuthUi();
       if(showFeedback)toast('Token is valid','ok');
     }else{
       if(showFeedback)toast('Token is invalid','err');
     }
   }catch(e){
-    ACCESS_TOKEN='';
-    REFRESH_TOKEN='';
-    AUTH_USERNAME='';
-    AUTH_ROLES=[];
-    localStorage.removeItem('assessment_access_token');
-    localStorage.removeItem('assessment_refresh_token');
-    localStorage.removeItem('assessment_auth_username');
-    localStorage.removeItem('assessment_auth_roles');
-    updateAuthUi();
-    if(showFeedback)toast(e.message,'err');
+    clearSession(e.message || 'Session expired. Please sign in again.', !!showFeedback);
   }
 }
 
 function logout(){
-  ACCESS_TOKEN='';
-  REFRESH_TOKEN='';
-  AUTH_USERNAME='';
-  AUTH_ROLES=[];
-  localStorage.removeItem('assessment_access_token');
-  localStorage.removeItem('assessment_refresh_token');
-  localStorage.removeItem('assessment_auth_username');
-  localStorage.removeItem('assessment_auth_roles');
-  updateAuthUi();
+  clearSession('', false);
+  _setLoginStatus('Sign in with LDAP to continue.');
   toast('Logged out','ok');
+}
+
+async function runApiLink(id){
+  const el=document.getElementById(id);
+  const url=(el && el.dataset && el.dataset.url) || '';
+  if(!url)return;
+  const needsAuth=!!(el && el.dataset && el.dataset.auth === 'required');
+  const statusEl=document.getElementById('api-link-status');
+  const resultEl=document.getElementById('api-link-result');
+  if(statusEl){
+    statusEl.textContent='Loading...';
+    statusEl.style.color='var(--muted)';
+  }
+  if(resultEl)resultEl.textContent='Fetching ' + url + ' ...';
+  if(needsAuth){
+    const sessionOk=await ensureActiveSession(true);
+    if(!sessionOk){
+      setApiLinkResult('Sign in again to call protected API endpoints.', true);
+      return;
+    }
+  }
+  try{
+    const response=await fetch(url,{headers:needsAuth ? headers() : {}});
+    const text=await response.text();
+    let body=text;
+    try{
+      body=JSON.stringify(JSON.parse(text), null, 2);
+    }catch(parseErr){
+      body=text;
+    }
+    if(!response.ok){
+      throw new Error((body && body.substring(0,1000)) || ('Request failed ('+response.status+')'));
+    }
+    setApiLinkResult(body, false);
+  }catch(e){
+    setApiLinkResult(e.message || 'Request failed.', true);
+  }
 }
 
 function toast(msg,type){const t=document.getElementById('toast');t.textContent=msg;t.className='toast show toast-'+(type||'ok');setTimeout(()=>t.className='toast',3000);}
@@ -1149,8 +1290,9 @@ async function checkHealth(){
     AUTH_MODE = authType;
     document.getElementById('hdr-info').textContent='RAGFlow: '+d.ragflow_url+' | Auth: '+authType;
     updateAuthUi();
-    if(authType === 'ldap' && ACCESS_TOKEN){
-      await verifySessionToken(false);
+    scheduleSessionTimers();
+    if(authType === 'ldap' && (ACCESS_TOKEN || REFRESH_TOKEN)){
+      await ensureActiveSession(false);
     }
   }catch(e){el.textContent='Error: '+e.message;}
   finally{btn.disabled=false;}
@@ -1207,6 +1349,14 @@ function escAttr(s){return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').
 // Auto-check health on load
 initApiLinks();
 checkHealth();
+document.addEventListener('visibilitychange', function(){
+  if(document.visibilityState === 'visible'){
+    void ensureActiveSession(false);
+  }
+});
+window.addEventListener('focus', function(){
+  void ensureActiveSession(false);
+});
 /* ------------------------------------------------------------------ */
 /* Manage Data                                                         */
 /* ------------------------------------------------------------------ */

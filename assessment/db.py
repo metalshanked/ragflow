@@ -19,12 +19,13 @@ from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import urlparse
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, text
+from sqlalchemy import Column, DateTime, Integer, String, Text, inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
 from .config import settings
 from .models import (
+    ActorInfo,
     DocumentStatus,
     PipelineStage,
     QuestionResult,
@@ -61,6 +62,9 @@ class TaskRow(Base):
     error = Column(Text, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_by_username = Column(String(255), nullable=True, index=True)
+    created_by_roles_json = Column(Text, nullable=False, default="[]")
+    created_by_auth_type = Column(String(32), nullable=True)
 
     # JSON-serialised blobs
     ragflow_json = Column(Text, nullable=False, default="{}")
@@ -77,10 +81,33 @@ class TaskEventRow(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     task_id = Column(String(64), nullable=False, index=True)
     event_type = Column(String(64), nullable=False, default="status_update")
+    actor_username = Column(String(255), nullable=True, index=True)
+    actor_roles_json = Column(Text, nullable=False, default="[]")
+    actor_auth_type = Column(String(32), nullable=True)
     state = Column(String(32), nullable=True)
     pipeline_stage = Column(String(32), nullable=True)
     message = Column(Text, nullable=False, default="")
     error = Column(Text, nullable=True)
+    payload_json = Column(Text, nullable=False, default="{}")
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+
+class AuditEventRow(Base):
+    """Append-only request/user audit trail."""
+
+    __tablename__ = "audit_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    action = Column(String(128), nullable=False, index=True)
+    actor_username = Column(String(255), nullable=True, index=True)
+    actor_roles_json = Column(Text, nullable=False, default="[]")
+    actor_auth_type = Column(String(32), nullable=True)
+    task_id = Column(String(64), nullable=True, index=True)
+    dataset_id = Column(String(128), nullable=True, index=True)
+    document_ids_json = Column(Text, nullable=False, default="[]")
+    request_method = Column(String(16), nullable=False, default="")
+    request_path = Column(Text, nullable=False, default="")
+    status_code = Column(Integer, nullable=True)
     payload_json = Column(Text, nullable=False, default="{}")
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
 
@@ -118,6 +145,38 @@ def _cleanup_lock_id() -> int:
     ns = b"assessment:task_cleanup_v1"
     d = hashlib.sha256(ns).digest()
     return int.from_bytes(d[:8], byteorder="big", signed=False) & 0x7FFF_FFFF_FFFF_FFFF
+
+
+def _schema_missing_columns(sync_conn: Any) -> dict[str, set[str]]:
+    inspector = inspect(sync_conn)
+    required = {
+        "tasks": {"created_by_username", "created_by_roles_json", "created_by_auth_type"},
+        "task_events": {"actor_username", "actor_roles_json", "actor_auth_type"},
+        "audit_events": {
+            "action",
+            "actor_username",
+            "actor_roles_json",
+            "actor_auth_type",
+            "task_id",
+            "dataset_id",
+            "document_ids_json",
+            "request_method",
+            "request_path",
+            "status_code",
+            "payload_json",
+            "created_at",
+        },
+    }
+    missing: dict[str, set[str]] = {}
+    for table_name, expected in required.items():
+        if not inspector.has_table(table_name):
+            missing[table_name] = set(expected)
+            continue
+        actual = {str(col.get("name", "")) for col in inspector.get_columns(table_name)}
+        absent = expected - actual
+        if absent:
+            missing[table_name] = absent
+    return missing
 
 
 @asynccontextmanager
@@ -208,12 +267,48 @@ async def init_db() -> None:
             )
             await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
+        if bootstrap_mode == "create":
+            missing = await conn.run_sync(_schema_missing_columns)
+            if missing:
+                logger.warning(
+                    "Assessment schema drift detected; recreating tables without backward compatibility. Missing columns=%s",
+                    {table: sorted(cols) for table, cols in missing.items()},
+                )
+                await conn.run_sync(Base.metadata.drop_all)
+                await conn.run_sync(Base.metadata.create_all)
     logger.info("Database tables ensured at %s", settings.database_url)
 
 
 # ---------------------------------------------------------------------------
 # Serialisation helpers
 # ---------------------------------------------------------------------------
+
+
+def _actor_info(username: str | None, roles_json: str | None, auth_type: str | None) -> ActorInfo | None:
+    raw_username = str(username or "").strip()
+    raw_auth_type = str(auth_type or "").strip()
+    try:
+        raw_roles = json.loads(roles_json or "[]")
+    except Exception:
+        raw_roles = []
+    roles = [str(role).strip() for role in raw_roles if str(role).strip()]
+    if not raw_username and not raw_auth_type and not roles:
+        return None
+    return ActorInfo(username=raw_username, roles=roles, auth_type=raw_auth_type)
+
+
+def _actor_columns(actor: ActorInfo | None) -> dict[str, Any]:
+    if actor is None:
+        return {
+            "created_by_username": None,
+            "created_by_roles_json": "[]",
+            "created_by_auth_type": None,
+        }
+    return {
+        "created_by_username": actor.username or None,
+        "created_by_roles_json": json.dumps(actor.roles or [], default=str),
+        "created_by_auth_type": actor.auth_type or None,
+    }
 
 def _task_record_from_row(row: TaskRow) -> TaskRecord:
     status = TaskStatus(
@@ -226,6 +321,11 @@ def _task_record_from_row(row: TaskRow) -> TaskRecord:
         created_at=row.created_at,
         updated_at=row.updated_at,
         error=row.error,
+        created_by=_actor_info(
+            row.created_by_username,
+            row.created_by_roles_json,
+            row.created_by_auth_type,
+        ),
     )
     ragflow = RagflowContext(**json.loads(row.ragflow_json))
     questions = json.loads(row.questions_json)
@@ -261,6 +361,7 @@ def _row_from_task_record(record: TaskRecord) -> dict[str, Any]:
         "error": s.error,
         "created_at": s.created_at,
         "updated_at": s.updated_at,
+        **_actor_columns(s.created_by),
         "ragflow_json": record.ragflow.model_dump_json(),
         "questions_json": json.dumps(record.questions),
         "results_json": json.dumps([r.model_dump() for r in record.results], default=str),
@@ -319,6 +420,7 @@ async def db_add_task_event(
     task_id: str,
     *,
     event_type: str = "status_update",
+    actor: ActorInfo | None = None,
     state: TaskState | None = None,
     pipeline_stage: PipelineStage | None = None,
     message: str = "",
@@ -329,6 +431,9 @@ async def db_add_task_event(
     row = TaskEventRow(
         task_id=task_id,
         event_type=event_type,
+        actor_username=actor.username if actor else None,
+        actor_roles_json=json.dumps(actor.roles if actor else [], default=str),
+        actor_auth_type=actor.auth_type if actor else None,
         state=state.value if state else None,
         pipeline_stage=pipeline_stage.value if pipeline_stage else None,
         message=message or "",
@@ -369,6 +474,11 @@ async def db_list_task_events(
                     "id": row.id,
                     "task_id": row.task_id,
                     "event_type": row.event_type,
+                    "actor": _actor_info(
+                        row.actor_username,
+                        row.actor_roles_json,
+                        row.actor_auth_type,
+                    ),
                     "state": TaskState(row.state) if row.state else None,
                     "pipeline_stage": PipelineStage(row.pipeline_stage) if row.pipeline_stage else None,
                     "message": row.message or "",
@@ -378,6 +488,37 @@ async def db_list_task_events(
                 }
             )
         return events, total
+
+
+async def db_add_audit_event(
+    action: str,
+    *,
+    actor: ActorInfo | None = None,
+    task_id: str | None = None,
+    dataset_id: str | None = None,
+    document_ids: list[str] | None = None,
+    request_method: str = "",
+    request_path: str = "",
+    status_code: int | None = None,
+    payload: dict[str, Any] | None = None,
+) -> None:
+    """Append an audit event row."""
+    row = AuditEventRow(
+        action=action,
+        actor_username=actor.username if actor else None,
+        actor_roles_json=json.dumps(actor.roles if actor else [], default=str),
+        actor_auth_type=actor.auth_type if actor else None,
+        task_id=task_id,
+        dataset_id=dataset_id,
+        document_ids_json=json.dumps(document_ids or [], default=str),
+        request_method=request_method or "",
+        request_path=request_path or "",
+        status_code=status_code,
+        payload_json=json.dumps(payload or {}, default=str),
+    )
+    async with async_session_factory() as session:
+        async with session.begin():
+            session.add(row)
 
 
 async def db_purge_old_tasks(retention_days: int) -> int:
@@ -418,6 +559,9 @@ async def db_purge_old_tasks(retention_days: int) -> int:
             # Purge event rows first (safe even without FK constraints).
             await session.execute(
                 delete(TaskEventRow).where(TaskEventRow.created_at < cutoff)
+            )
+            await session.execute(
+                delete(AuditEventRow).where(AuditEventRow.created_at < cutoff)
             )
             result = await session.execute(
                 delete(TaskRow).where(TaskRow.created_at < cutoff)
