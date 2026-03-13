@@ -21,8 +21,9 @@ from .observability import openinference_attributes, set_span_attributes, start_
 
 logger = logging.getLogger(__name__)
 
-# Timeout for individual HTTP calls (seconds).
-_TIMEOUT = httpx.Timeout(timeout=120.0, connect=15.0)
+
+class TransientRagflowError(RuntimeError):
+    """Raised when a transient upstream/network failure is likely retryable."""
 
 
 class RagflowClient:
@@ -52,10 +53,18 @@ class RagflowClient:
             return settings.ssl_ca_cert
         return settings.verify_ssl
 
+    @staticmethod
+    def _http_timeout() -> httpx.Timeout:
+        """Return the per-request timeout used for outbound RAGFlow HTTP calls."""
+        return httpx.Timeout(
+            timeout=settings.ragflow_http_timeout_seconds,
+            connect=min(15.0, settings.ragflow_http_timeout_seconds),
+        )
+
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
-                timeout=_TIMEOUT,
+                timeout=self._http_timeout(),
                 verify=self._ssl_verify(),
             )
         return self._client
@@ -83,13 +92,19 @@ class RagflowClient:
         data: dict | None = None,
         files: Any = None,
         params: dict | None = None,
+        retry_attempts: int | None = None,
     ) -> dict:
         url = f"{self.base_url}{path}"
+        method_upper = method.upper()
+        retries = retry_attempts
+        if retries is None:
+            retries = settings.ragflow_http_retry_attempts if method_upper in {"GET", "PUT", "DELETE"} else 0
+        max_attempts = max(1, int(retries or 0) + 1)
         with start_span(
             "ragflow.http.request",
             span_kind="TOOL",
             attributes={
-                "http.method": method.upper(),
+                "http.method": method_upper,
                 "url.full": url,
                 "ragflow.path": path,
             },
@@ -100,63 +115,104 @@ class RagflowClient:
                     "tool.path": path,
                 }
             ):
-                try:
-                    client = await self._get_client()
-                    headers = dict(self.headers)
-                    if json is not None:
-                        headers["Content-Type"] = "application/json"
-
-                    resp = await client.request(
-                        method,
-                        url,
-                        headers=headers,
-                        json=json,
-                        data=data,
-                        files=files,
-                        params=params,
-                    )
-                    set_span_attributes(
-                        span,
-                        {
-                            "http.status_code": resp.status_code,
-                        },
-                    )
-                    resp.raise_for_status()
-                except httpx.ConnectError as exc:
-                    set_span_attributes(span, {"error.type": "connect_error", "error.message": str(exc)})
-                    raise RuntimeError(
-                        f"Cannot connect to RAGFlow at {self.base_url}: {exc}"
-                    ) from exc
-                except httpx.TimeoutException as exc:
-                    set_span_attributes(span, {"error.type": "timeout", "error.message": str(exc)})
-                    raise RuntimeError(
-                        f"Request to RAGFlow timed out ({method} {url}): {exc}"
-                    ) from exc
-                except httpx.HTTPStatusError as exc:
-                    detail = ""
+                headers = dict(self.headers)
+                if json is not None:
+                    headers["Content-Type"] = "application/json"
+                resp: httpx.Response | None = None
+                for attempt in range(1, max_attempts + 1):
                     try:
-                        detail = exc.response.text[:500]
-                    except Exception:
-                        pass
-                    set_span_attributes(
-                        span,
-                        {
-                            "http.status_code": exc.response.status_code,
-                            "error.type": "http_status_error",
-                            "error.message": detail,
-                        },
-                    )
-                    raise RuntimeError(
-                        f"RAGFlow returned HTTP {exc.response.status_code} "
-                        f"for {method} {path}: {detail}"
-                    ) from exc
+                        client = await self._get_client()
+                        resp = await client.request(
+                            method,
+                            url,
+                            headers=headers,
+                            json=json,
+                            data=data,
+                            files=files,
+                            params=params,
+                        )
+                        set_span_attributes(
+                            span,
+                            {
+                                "http.status_code": resp.status_code,
+                            },
+                        )
+                        resp.raise_for_status()
+                        break
+                    except httpx.ConnectError as exc:
+                        is_last = attempt >= max_attempts
+                        set_span_attributes(span, {"error.type": "connect_error", "error.message": str(exc)})
+                        if is_last:
+                            raise TransientRagflowError(
+                                f"Cannot connect to RAGFlow at {self.base_url}: {exc}"
+                            ) from exc
+                        logger.warning(
+                            "Retrying RAGFlow request after connect error attempt=%s/%s method=%s path=%s",
+                            attempt,
+                            max_attempts,
+                            method_upper,
+                            path,
+                        )
+                        await asyncio.sleep(settings.ragflow_retry_backoff_seconds * attempt)
+                        continue
+                    except httpx.TimeoutException as exc:
+                        is_last = attempt >= max_attempts
+                        set_span_attributes(span, {"error.type": "timeout", "error.message": str(exc)})
+                        if is_last:
+                            raise TransientRagflowError(
+                                f"Request to RAGFlow timed out ({method_upper} {url}): {exc}"
+                            ) from exc
+                        logger.warning(
+                            "Retrying RAGFlow request after timeout attempt=%s/%s method=%s path=%s",
+                            attempt,
+                            max_attempts,
+                            method_upper,
+                            path,
+                        )
+                        await asyncio.sleep(settings.ragflow_retry_backoff_seconds * attempt)
+                        continue
+                    except httpx.HTTPStatusError as exc:
+                        detail = ""
+                        try:
+                            detail = exc.response.text[:500]
+                        except Exception:
+                            pass
+                        status_code = exc.response.status_code
+                        set_span_attributes(
+                            span,
+                            {
+                                "http.status_code": status_code,
+                                "error.type": "http_status_error",
+                                "error.message": detail,
+                            },
+                        )
+                        is_retryable = status_code == 429 or status_code >= 500
+                        is_last = attempt >= max_attempts
+                        if is_retryable and not is_last:
+                            logger.warning(
+                                "Retrying RAGFlow request after HTTP %s attempt=%s/%s method=%s path=%s",
+                                status_code,
+                                attempt,
+                                max_attempts,
+                                method_upper,
+                                path,
+                            )
+                            await asyncio.sleep(settings.ragflow_retry_backoff_seconds * attempt)
+                            continue
+                        error_cls = TransientRagflowError if is_retryable else RuntimeError
+                        raise error_cls(
+                            f"RAGFlow returned HTTP {status_code} "
+                            f"for {method_upper} {path}: {detail}"
+                        ) from exc
 
                 try:
+                    if resp is None:
+                        raise RuntimeError(f"No response received from RAGFlow for {method_upper} {path}")
                     body = resp.json()
                 except Exception as exc:
                     set_span_attributes(span, {"error.type": "invalid_json", "error.message": resp.text[:300]})
                     raise RuntimeError(
-                        f"RAGFlow returned non-JSON response for {method} {path}: "
+                        f"RAGFlow returned non-JSON response for {method_upper} {path}: "
                         f"{resp.text[:300]}"
                     ) from exc
 

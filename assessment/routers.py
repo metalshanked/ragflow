@@ -60,6 +60,7 @@ from .models import (
     TaskEventListResponse,
     TaskListResponse,
     TaskResultResponse,
+    TaskExecutionConfig,
     TaskState,
     TaskStatus,
 )
@@ -89,6 +90,9 @@ from .services import (
     run_assessment,
     run_assessment_for_session,
     run_assessment_from_dataset,
+    retry_failed_questions_for_task,
+    retry_task,
+    claim_task_retry,
     find_tasks_by_dataset_id,
     find_document_by_hash,
 )
@@ -428,6 +432,10 @@ async def start_assessment(
         settings.only_cited_references,
         description="If true (default), only include references actually cited as [ID:N] in the answer.",
     ),
+    fail_on_document_parse_issue: bool = Form(
+        False,
+        description="If true, stop the task before Q&A when any intended evidence document is not successfully parsed.",
+    ),
 ):
     """
     **Single-call flow** – upload a questions Excel file and *all* evidence
@@ -465,8 +473,6 @@ async def start_assessment(
         raise HTTPException(status_code=400, detail="At least one evidence document is required.")
 
     actor = actor_from_request(request)
-    record = await create_task(questions, actor=actor)
-
     dataset_opts = {}
     if dataset_options:
         try:
@@ -481,6 +487,22 @@ async def start_assessment(
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON in chat_options")
 
+    record = await create_task(
+        questions,
+        actor=actor,
+        execution=TaskExecutionConfig(
+            workflow="single_call",
+            dataset_name=dataset_name or "",
+            chat_name=chat_name or "",
+            reuse_existing_dataset=bool(dataset_name and reuse_exisiting_dataset),
+            dataset_options=dataset_opts,
+            chat_options=chat_opts,
+            process_vendor_response=process_vendor_response,
+            only_cited_references=only_cited_references,
+            fail_on_document_parse_issue=fail_on_document_parse_issue,
+        ),
+    )
+
     background_tasks.add_task(
         run_assessment,
         record.task_id,
@@ -493,6 +515,7 @@ async def start_assessment(
         chat_opts,
         process_vendor_response,
         only_cited_references,
+        fail_on_document_parse_issue,
         actor,
     )
     await _audit(
@@ -505,6 +528,7 @@ async def start_assessment(
             "evidence_file_count": len(ev_files),
             "dataset_name": dataset_name or "",
             "reuse_existing_dataset": reuse_exisiting_dataset,
+            "fail_on_document_parse_issue": fail_on_document_parse_issue,
         },
     )
 
@@ -557,6 +581,10 @@ async def start_assessment_from_dataset(
         settings.only_cited_references,
         description="If true (default), only include references actually cited as [ID:N] in the answer.",
     ),
+    fail_on_document_parse_issue: bool = Form(
+        False,
+        description="If true, stop the task before Q&A when any intended uploaded document is not successfully parsed.",
+    ),
 ):
     """
     Run an assessment against one or more **existing** RAGFlow datasets.
@@ -591,9 +619,6 @@ async def start_assessment_from_dataset(
     if not questions:
         raise HTTPException(status_code=400, detail="No questions found in the uploaded Excel file.")
 
-    actor = actor_from_request(request)
-    record = await create_task(questions, actor=actor)
-
     dataset_opts = {}
     if dataset_options:
         try:
@@ -607,6 +632,21 @@ async def start_assessment_from_dataset(
             chat_opts = json.loads(chat_options)
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON in chat_options")
+
+    actor = actor_from_request(request)
+    record = await create_task(
+        questions,
+        actor=actor,
+        execution=TaskExecutionConfig(
+            workflow="from_dataset",
+            chat_name=chat_name or "",
+            source_dataset_ids=parsed_ids,
+            dataset_options=dataset_opts,
+            chat_options=chat_opts,
+            process_vendor_response=process_vendor_response,
+            only_cited_references=only_cited_references,
+        ),
+    )
 
     background_tasks.add_task(
         run_assessment_from_dataset,
@@ -706,12 +746,19 @@ async def create_assessment_session(
             dataset_opts = json.loads(dataset_options)
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON in dataset_options")
+    chat_opts = {}
+    if chat_options:
+        try:
+            chat_opts = json.loads(chat_options)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON in chat_options")
 
     response = await create_session(
         questions,
         dataset_name,
         reuse_exisiting_dataset,
         dataset_opts,
+        chat_opts,
         actor_from_request(request),
     )
     await _audit(
@@ -787,6 +834,10 @@ async def start_session_assessment(
         settings.only_cited_references,
         description="If true (default), only include references actually cited as [ID:N] in the answer.",
     ),
+    fail_on_document_parse_issue: bool = Form(
+        False,
+        description="If true, stop the task before Q&A when any intended uploaded document is not successfully parsed.",
+    ),
 ):
     """
     **Phase 3** – Trigger the assessment pipeline.
@@ -814,7 +865,7 @@ async def start_session_assessment(
         state=record.status.state,
         pipeline_stage=record.status.pipeline_stage,
         message="Assessment session queued for processing",
-        payload={},
+        payload={"fail_on_document_parse_issue": fail_on_document_parse_issue},
     )
 
     dataset_opts = {}
@@ -839,6 +890,7 @@ async def start_session_assessment(
         chat_opts,
         process_vendor_response,
         only_cited_references,
+        fail_on_document_parse_issue,
         actor,
     )
     await _audit(
@@ -848,9 +900,159 @@ async def start_session_assessment(
         dataset_id=record.ragflow.dataset_id or None,
         document_ids=record.ragflow.document_ids,
         status_code=202,
-        payload={"chat_name": chat_name or ""},
+        payload={
+            "chat_name": chat_name or "",
+            "fail_on_document_parse_issue": fail_on_document_parse_issue,
+        },
     )
 
+    return record.status
+
+
+@router.post("/assessments/{task_id}/retry", response_model=TaskStatus, status_code=202)
+async def retry_assessment_task(
+    request: Request,
+    task_id: str,
+    background_tasks: BackgroundTasks,
+    chat_name: Optional[str] = Form(None, description="Optional replacement chat assistant name in RAGFlow"),
+    dataset_options: Optional[str] = Form(None, description="Optional JSON string of dataset update options"),
+    chat_options: Optional[str] = Form(None, description="Optional JSON string of chat creation options"),
+    process_vendor_response: Optional[bool] = Form(
+        None,
+        description="Optional override for vendor response verification during retry.",
+    ),
+    only_cited_references: Optional[bool] = Form(
+        None,
+        description="Optional override for cited-reference filtering during retry.",
+    ),
+):
+    dataset_opts = {}
+    if dataset_options:
+        try:
+            dataset_opts = json.loads(dataset_options)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON in dataset_options")
+
+    chat_opts = {}
+    if chat_options:
+        try:
+            chat_opts = json.loads(chat_options)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON in chat_options")
+
+    try:
+        record = await claim_task_retry(
+            task_id,
+            chat_name=chat_name,
+            dataset_opts=dataset_opts if dataset_options is not None else None,
+            chat_opts=chat_opts if chat_options is not None else None,
+            process_vendor_response=process_vendor_response,
+            only_cited_references=only_cited_references,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        if "not found" in msg.lower():
+            raise HTTPException(status_code=404, detail=msg)
+        raise HTTPException(status_code=409, detail=msg)
+
+    actor = actor_from_request(request)
+    background_tasks.add_task(
+        retry_task,
+        task_id,
+        chat_name=chat_name,
+        dataset_opts=dataset_opts if dataset_options is not None else None,
+        chat_opts=chat_opts if chat_options is not None else None,
+        process_vendor_response=process_vendor_response,
+        only_cited_references=only_cited_references,
+        actor=actor,
+    )
+    await _task_event(
+        task_id,
+        event_type="task_retry_queued",
+        request=request,
+        state=record.status.state,
+        pipeline_stage=record.status.pipeline_stage,
+        message="Task retry queued",
+        payload={"workflow": record.execution.workflow},
+    )
+    await _audit(
+        "task.retry",
+        request,
+        task_id=task_id,
+        dataset_id=record.ragflow.dataset_id or None,
+        document_ids=record.ragflow.document_ids,
+        status_code=202,
+        payload={"workflow": record.execution.workflow},
+    )
+    return record.status
+
+
+@router.post("/assessments/{task_id}/retry-failed-questions", response_model=TaskStatus, status_code=202)
+async def retry_failed_assessment_questions(
+    request: Request,
+    task_id: str,
+    background_tasks: BackgroundTasks,
+    chat_name: Optional[str] = Form(None, description="Optional replacement chat assistant name in RAGFlow"),
+    chat_options: Optional[str] = Form(None, description="Optional JSON string of chat creation options"),
+    process_vendor_response: Optional[bool] = Form(
+        None,
+        description="Optional override for vendor response verification during retry.",
+    ),
+    only_cited_references: Optional[bool] = Form(
+        None,
+        description="Optional override for cited-reference filtering during retry.",
+    ),
+):
+    chat_opts = {}
+    if chat_options:
+        try:
+            chat_opts = json.loads(chat_options)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON in chat_options")
+
+    try:
+        record = await claim_task_retry(
+            task_id,
+            failed_questions_only=True,
+            chat_name=chat_name,
+            chat_opts=chat_opts if chat_options is not None else None,
+            process_vendor_response=process_vendor_response,
+            only_cited_references=only_cited_references,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        if "not found" in msg.lower():
+            raise HTTPException(status_code=404, detail=msg)
+        raise HTTPException(status_code=409, detail=msg)
+
+    actor = actor_from_request(request)
+    background_tasks.add_task(
+        retry_failed_questions_for_task,
+        task_id,
+        chat_name=chat_name,
+        chat_opts=chat_opts if chat_options is not None else None,
+        process_vendor_response=process_vendor_response,
+        only_cited_references=only_cited_references,
+        actor=actor,
+    )
+    await _task_event(
+        task_id,
+        event_type="task_failed_question_retry_queued",
+        request=request,
+        state=record.status.state,
+        pipeline_stage=record.status.pipeline_stage,
+        message="Failed-question retry queued",
+        payload={},
+    )
+    await _audit(
+        "task.retry_failed_questions",
+        request,
+        task_id=task_id,
+        dataset_id=record.ragflow.dataset_id or None,
+        document_ids=record.ragflow.document_ids,
+        status_code=202,
+        payload={},
+    )
     return record.status
 
 

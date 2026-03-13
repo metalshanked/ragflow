@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     max_concurrent_questions: int = 5
     polling_interval_seconds: float = 3.0
     document_parse_timeout_seconds: float = 600.0
+    ragflow_http_timeout_seconds: float = 300.0
+    ragflow_http_retry_attempts: int = 2
+    ragflow_question_retry_attempts: int = 2
+    ragflow_retry_backoff_seconds: float = 1.0
 
     # Chat assistant defaults
     default_chat_name_prefix: str = "assessment"

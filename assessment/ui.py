@@ -474,7 +474,7 @@ button.link-card{width:100%;text-align:left;font:inherit}
       <h3 id="detail-title">Task Details</h3>
       <div style="display:flex;align-items:center;gap:.6rem;flex-wrap:wrap">
         <button class="btn btn-outline btn-sm" onclick="closeDetail()">&#10005; Close</button>
-        <button class="btn btn-primary btn-sm" onclick="refreshDetail()">&#128260; Refresh</button>
+        <button class="btn btn-primary btn-sm" onclick="refreshDetail()">Refresh</button>
         <button class="btn btn-danger btn-sm" id="btn-delete-detail-task" onclick="deleteCurrentTask()">Delete Task</button>
         <button class="btn btn-outline btn-sm" onclick="downloadExcel()">&#128229; Excel</button>
       </div>

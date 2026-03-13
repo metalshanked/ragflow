@@ -39,6 +39,9 @@ The API supports **three workflows** for running assessments:
 > **Retry support:** If the pipeline fails at any stage (e.g. documents fail to parse), you can
 > upload replacement or additional documents and re-start the assessment without losing the
 > existing dataset or previously uploaded files. See [Error Handling & Retry](#error-handling--retry).
+>
+> **Automatic transient retry:** Individual question completions are automatically retried on transient upstream
+> failures such as timeouts, connection errors, HTTP `429`, or upstream `5xx` responses.
 
 ### File Deduplication & Redundancy Checks
 
@@ -152,11 +155,15 @@ All settings (see `config.py`). Examples below use shell-style `export`, but the
 | `ASSESSMENT_MAX_CONCURRENT_QUESTIONS` | `5` | `10` | Parallel question processing limit |
 | `ASSESSMENT_POLLING_INTERVAL_SECONDS` | `3.0` | `2.5` | Seconds between parsing status polls |
 | `ASSESSMENT_DOCUMENT_PARSE_TIMEOUT_SECONDS` | `600.0` | `1800` | Max wait for document parsing |
+| `ASSESSMENT_RAGFLOW_HTTP_TIMEOUT_SECONDS` | `300.0` | `600` | Per-request timeout for outbound RAGFlow HTTP calls, including chat completions, dataset APIs, uploads, and parsing polls |
+| `ASSESSMENT_RAGFLOW_HTTP_RETRY_ATTEMPTS` | `2` | `3` | Additional retry attempts for transient idempotent upstream RAGFlow HTTP calls (`GET` / `PUT` / `DELETE`) |
+| `ASSESSMENT_RAGFLOW_QUESTION_RETRY_ATTEMPTS` | `2` | `3` | Additional retry attempts for transient per-question chat completion failures |
+| `ASSESSMENT_RAGFLOW_RETRY_BACKOFF_SECONDS` | `1.0` | `0.5` | Base backoff in seconds between transient retry attempts |
 | `ASSESSMENT_DEFAULT_CHAT_NAME_PREFIX` | `assessment` | `vendor-assessment` | Prefix used when the app auto-generates chat names |
 | `ASSESSMENT_DEFAULT_SIMILARITY_THRESHOLD` | `0.1` | `0.2` | RAG similarity threshold |
 | `ASSESSMENT_DEFAULT_TOP_N` | `8` | `12` | Number of chunks to retrieve |
 | `ASSESSMENT_DEFAULT_DATASET_OPTIONS` | `{}` | `{"permission":"team","parser_config":{"enable_metadata":true}}` | JSON object of default dataset options merged into dataset create/update operations |
-| `ASSESSMENT_DEFAULT_CHAT_OPTIONS` | `{}` | `{"llm":{"temperature":0.2},"prompt":{"top_n":12}}` | JSON object of default chat options merged into chat creation operations |
+| `ASSESSMENT_DEFAULT_CHAT_OPTIONS` | `{}` | `{"llm":{"temperature":0.2},"prompt":{"top_n":12,"system":"You are a strict assessment assistant. Return Answer: Yes/No/N/A and concise Details only."}}` | JSON object of default chat options merged into chat creation operations |
 | `ASSESSMENT_QUESTION_ID_COLUMN` | `A` | `A` | Default Excel column for Question Serial No |
 | `ASSESSMENT_QUESTION_COLUMN` | `B` | `B` | Default Excel column for Question text |
 | `ASSESSMENT_VENDOR_RESPONSE_COLUMN` | `C` | `C` | Default Excel column for vendor response |
@@ -247,11 +254,27 @@ Default chat options example:
 export ASSESSMENT_DEFAULT_CHAT_OPTIONS='{"llm":{"temperature":0.2},"prompt":{"top_n":12}}'
 ```
 
+Default chat prompt example:
+
+```bash
+export ASSESSMENT_DEFAULT_CHAT_OPTIONS='{
+  "llm": {
+    "temperature": 0.1
+  },
+  "prompt": {
+    "top_n": 12,
+    "system": "You are a strict assessment assistant. For each question, respond in exactly this format: Answer: Yes/No/N/A and Details: <brief explanation>. Use only the retrieved knowledge and do not invent evidence.",
+    "quote": true
+  }
+}'
+```
+
 Forward chat contract:
 
 - `chat_options` and `ASSESSMENT_DEFAULT_CHAT_OPTIONS` are merged and sent to RAGFlow's public chat creation API.
 - Use forward chat fields such as `llm`, `prompt`, and other public chat-create options supported by upstream RAGFlow.
 - Request `chat_options` override the configured defaults, including nested fields.
+- These settings configure the upstream RAGFlow chat assistant. The assessment app itself does not persist the full prompt config as part of task state; it stores the resulting `chat_id` and related resource IDs.
 
 Merge precedence:
 
@@ -262,6 +285,61 @@ Chat merge precedence:
 
 1. `ASSESSMENT_DEFAULT_CHAT_OPTIONS`
 2. Request `chat_options` (overrides defaults, including nested fields)
+
+Common `prompt` fields you can customize:
+
+| Field | Example | Purpose |
+|---|---|---|
+| `prompt.system` | `"You are a strict assessment assistant..."` | Main instruction template for how the assistant should answer |
+| `prompt.top_n` | `12` | Retrieval depth used by the upstream chat assistant |
+| `prompt.quote` | `true` | Ask RAGFlow to include quoted/cited support behavior when supported |
+| `llm.temperature` | `0.1` | Lower values make answers more deterministic |
+
+Per-request `chat_options` examples:
+
+Single-call:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/assessments \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "questions_file=@questions.xlsx" \
+  -F "evidence_files=@policy.pdf" \
+  -F 'chat_options={
+    "llm":{"temperature":0.1},
+    "prompt":{
+      "top_n":10,
+      "system":"You are a strict assessment assistant. Return exactly Answer: Yes/No/N/A and Details: <brief explanation>. If evidence is insufficient, use N/A."
+    }
+  }'
+```
+
+From existing dataset(s):
+
+```bash
+curl -X POST http://localhost:8000/api/v1/assessments/from-dataset \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "questions_file=@questions.xlsx" \
+  -F "dataset_ids=dataset-123" \
+  -F 'chat_options={
+    "prompt":{
+      "top_n":15,
+      "system":"You are a citation-heavy assessment assistant. Prefer concise answers and rely only on retrieved evidence."
+    }
+  }'
+```
+
+Two-phase start:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/assessments/sessions/$TASK_ID/start \
+  -H "Authorization: Bearer $TOKEN" \
+  -F 'chat_options={
+    "llm":{"temperature":0.0},
+    "prompt":{
+      "system":"You are a compliance assessment assistant. Answer with Yes, No, or N/A only when evidence supports it, then provide a short Details line."
+    }
+  }'
+```
 
 ### Observability (OpenTelemetry + OpenInference)
 
@@ -500,6 +578,7 @@ Content-Type: multipart/form-data
 - `vendor_comment_column` (string, optional) – Column for Vendor comments (letter e.g. `F` or 1-based number e.g. `6`). Defaults to server setting.
 - `process_vendor_response` (boolean, optional) – If true, verify vendor response and comments in determining results. Defaults to server setting.
 - `only_cited_references` (boolean, optional) – If true (default), only include references actually cited as `[ID:N]` in the LLM answer. Set to false to return all retrieved chunks. Defaults to server setting.
+- `fail_on_document_parse_issue` (boolean, optional) – If true, stop the task before Q&A when any intended uploaded/reused evidence document is not successfully parsed. Default: `false`.
 
 **Response** (202 Accepted):
 ```json
@@ -614,6 +693,7 @@ Content-Type: multipart/form-data
 - `chat_name` (string, optional) – Custom chat assistant name
 - `process_vendor_response` (boolean, optional) – If true, verify vendor response and comments in determining results. Defaults to server setting.
 - `only_cited_references` (boolean, optional) – If true (default), only include references actually cited as `[ID:N]` in the LLM answer. Set to false to return all retrieved chunks. Defaults to server setting.
+- `fail_on_document_parse_issue` (boolean, optional) – If true, stop the task before Q&A when any intended uploaded session document is not successfully parsed. Default: `false`.
 
 **Response** (202 Accepted):
 ```json
@@ -627,6 +707,32 @@ Content-Type: multipart/form-data
 ```
 
 The pipeline starts in the background. Poll `GET /assessments/{task_id}` for progress.
+
+#### Manual Retry Endpoints
+
+Use these when you want to manually replay a failed task or retry only the questions that failed:
+
+```text
+POST /api/v1/assessments/{task_id}/retry
+POST /api/v1/assessments/{task_id}/retry-failed-questions
+```
+
+`/retry`:
+- Replays the stored task configuration using the existing dataset/documents.
+- For single-call and two-phase tasks, the app re-runs parsing and then chat/question processing.
+- For `from-dataset` tasks, the app skips parsing and re-runs chat/question processing only.
+
+`/retry-failed-questions`:
+- Re-runs only the failed questions from the current task.
+- Keeps successful question results intact.
+- Creates a fresh upstream chat/session for the retry pass so transient completion failures can be retried cleanly.
+
+Both endpoints accept optional form fields:
+- `chat_name`
+- `chat_options`
+- `dataset_options` (`/retry` only)
+- `process_vendor_response`
+- `only_cited_references`
 
 ---
 
@@ -1201,6 +1307,16 @@ curl -X POST http://localhost:8000/api/v1/assessments/sessions/$TASK_ID/start \
   -H "Authorization: Bearer $TOKEN"
 ```
 
+### Automatic Transient Retry
+
+The assessment app automatically retries these transient failures:
+
+- per-question chat completions that fail with upstream timeout / connect errors
+- per-question chat completions that return HTTP `429` or upstream `5xx`
+- idempotent upstream RAGFlow HTTP requests (`GET`, `PUT`, `DELETE`) that fail transiently
+
+The app does **not** blindly auto-retry document uploads or dataset/chat creation POSTs, because duplicate side effects are harder to guarantee safely. Use the manual retry endpoints above when those setup stages fail.
+
 ## Postman Collection
 
 A ready-to-use Postman collection is included at `assessment/postman_collection.json`.
@@ -1302,6 +1418,7 @@ curl -X POST http://localhost:8000/api/v1/assessments \
   -H "Authorization: Bearer $TOKEN" \
   -F "questions_file=@questions_with_responses.xlsx" \
   -F "evidence_files=@policy_doc.pdf" \
+  -F "fail_on_document_parse_issue=true" \
   -F "process_vendor_response=true" \
   -F "vendor_response_column=C" \
   -F "vendor_comment_column=D"
@@ -1350,6 +1467,11 @@ curl -X POST http://localhost:8000/api/v1/assessments/sessions/$TASK_ID/start \
 curl -X POST http://localhost:8000/api/v1/assessments/sessions/$TASK_ID/start \
   -H "Authorization: Bearer $TOKEN" \
   -F 'chat_options={"prompt":{"system":"You are a helpful assistant."}}'
+
+# Phase 3: Require every intended uploaded document to parse successfully
+curl -X POST http://localhost:8000/api/v1/assessments/sessions/$TASK_ID/start \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "fail_on_document_parse_issue=true"
 
 # Poll status (same as single-call)
 curl -H "Authorization: Bearer $TOKEN" \

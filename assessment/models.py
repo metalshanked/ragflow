@@ -286,12 +286,28 @@ class RagflowContext(BaseModel):
     session_id: str = ""
 
 
+class TaskExecutionConfig(BaseModel):
+    """Stored execution config used for manual retries/replays."""
+
+    workflow: str = ""  # single_call | session | from_dataset
+    dataset_name: str = ""
+    chat_name: str = ""
+    source_dataset_ids: list[str] = Field(default_factory=list)
+    reuse_existing_dataset: bool = False
+    dataset_options: dict[str, Any] = Field(default_factory=dict)
+    chat_options: dict[str, Any] = Field(default_factory=dict)
+    process_vendor_response: Optional[bool] = None
+    only_cited_references: Optional[bool] = None
+    fail_on_document_parse_issue: bool = False
+
+
 class TaskRecord(BaseModel):
     """Full internal record kept in the in-memory store."""
 
     task_id: str
     status: TaskStatus
     ragflow: RagflowContext = Field(default_factory=RagflowContext)
+    execution: TaskExecutionConfig = Field(default_factory=TaskExecutionConfig)
     questions: list[dict[str, Any]] = Field(default_factory=list)
     results: list[QuestionResult] = Field(default_factory=list)
     document_statuses: list[DocumentStatus] = Field(default_factory=list)

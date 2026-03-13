@@ -385,6 +385,11 @@
                   "key": "only_cited_references",
                   "type": "text",
                   "value": "true"
+                },
+                {
+                  "key": "fail_on_document_parse_issue",
+                  "type": "text",
+                  "value": "false"
                 }
               ]
             }
@@ -499,6 +504,11 @@
                   "key": "only_cited_references",
                   "type": "text",
                   "value": "true"
+                },
+                {
+                  "key": "fail_on_document_parse_issue",
+                  "type": "text",
+                  "value": "false"
                 }
               ]
             }
@@ -851,6 +861,123 @@
               "status": "OK",
               "code": 200,
               "body": "{\n  \"message\": \"Task deleted\",\n  \"task_id\": \"tsk_01HXYZ123456\",\n  \"deleted\": true,\n  \"deleted_chat_id\": \"chat_123\",\n  \"deleted_dataset_ids\": [\n    \"ds_123\"\n  ]\n}"
+            }
+          ]
+        },
+        {
+          "name": "Retry Task",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}/retry"
+            },
+            "description": "Queue a full task retry using the stored workflow configuration, with optional chat/dataset overrides.",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "chat_name",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "dataset_options",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true,
+                  "description": "JSON string"
+                },
+                {
+                  "key": "chat_options",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true,
+                  "description": "JSON string"
+                },
+                {
+                  "key": "process_vendor_response",
+                  "type": "text",
+                  "value": "true",
+                  "disabled": true
+                },
+                {
+                  "key": "only_cited_references",
+                  "type": "text",
+                  "value": "true",
+                  "disabled": true
+                }
+              ]
+            }
+          },
+          "response": [
+            {
+              "name": "Retry Queued",
+              "originalRequest": {
+                "method": "POST",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}/retry"
+                }
+              },
+              "status": "Accepted",
+              "code": 202,
+              "body": "{\n  \"task_id\": \"tsk_01HXYZ123456\",\n  \"state\": \"processing\",\n  \"pipeline_stage\": \"document_parsing\",\n  \"progress_message\": \"Task retry queued\",\n  \"total_questions\": 25,\n  \"questions_processed\": 0,\n  \"questions_succeeded\": 0,\n  \"questions_failed\": 0,\n  \"created_at\": \"2026-03-13T00:00:00Z\",\n  \"updated_at\": \"2026-03-13T00:12:00Z\",\n  \"error\": null,\n  \"created_by\": {\n    \"username\": \"alice\",\n    \"roles\": [\n      \"admin\"\n    ],\n    \"auth_type\": \"ldap\"\n  },\n  \"dataset_ids\": [\n    \"ds_123\"\n  ],\n  \"chat_id\": \"chat_123\",\n  \"session_id\": \"session_123\",\n  \"document_ids\": [\n    \"doc_123\",\n    \"doc_456\"\n  ],\n  \"document_statuses\": []\n}"
+            }
+          ]
+        },
+        {
+          "name": "Retry Failed Questions",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}/retry-failed-questions"
+            },
+            "description": "Retry only the questions currently marked failed for a completed or failed task.",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "chat_name",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "chat_options",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true,
+                  "description": "JSON string"
+                },
+                {
+                  "key": "process_vendor_response",
+                  "type": "text",
+                  "value": "true",
+                  "disabled": true
+                },
+                {
+                  "key": "only_cited_references",
+                  "type": "text",
+                  "value": "true",
+                  "disabled": true
+                }
+              ]
+            }
+          },
+          "response": [
+            {
+              "name": "Failed Questions Retry Queued",
+              "originalRequest": {
+                "method": "POST",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}/retry-failed-questions"
+                }
+              },
+              "status": "Accepted",
+              "code": 202,
+              "body": "{\n  \"task_id\": \"tsk_01HXYZ123456\",\n  \"state\": \"processing\",\n  \"pipeline_stage\": \"chat_processing\",\n  \"progress_message\": \"Retrying failed questions\",\n  \"total_questions\": 25,\n  \"questions_processed\": 24,\n  \"questions_succeeded\": 24,\n  \"questions_failed\": 1,\n  \"created_at\": \"2026-03-13T00:00:00Z\",\n  \"updated_at\": \"2026-03-13T00:15:00Z\",\n  \"error\": null,\n  \"created_by\": {\n    \"username\": \"alice\",\n    \"roles\": [\n      \"admin\"\n    ],\n    \"auth_type\": \"ldap\"\n  },\n  \"dataset_ids\": [\n    \"ds_123\"\n  ],\n  \"chat_id\": \"chat_123\",\n  \"session_id\": \"session_123\",\n  \"document_ids\": [\n    \"doc_123\",\n    \"doc_456\"\n  ],\n  \"document_statuses\": [\n    {\n      \"document_id\": \"doc_123\",\n      \"document_name\": \"policy.pdf\",\n      \"status\": \"success\",\n      \"progress\": 1.0,\n      \"message\": \"Parsed\"\n    }\n  ]\n}"
             }
           ]
         },

@@ -26,15 +26,18 @@ from assessment.models import (
     TaskState,
     TaskStatus,
 )
+from assessment.ragflow_client import TransientRagflowError
 from assessment.services import (
     _process_questions,
     add_documents_to_session,
+    claim_task_retry,
     build_results_excel,
     create_session,
     create_task,
     delete_task_and_resources,
     get_paginated_results,
     parse_questions_excel,
+    run_assessment,
     run_assessment_for_session,
 )
 
@@ -52,6 +55,8 @@ _TEST_SETTINGS = {
     "polling_interval_seconds": 0.01,
     "document_parse_timeout_seconds": 0.1,
     "max_concurrent_questions": 2,
+    "ragflow_question_retry_attempts": 2,
+    "ragflow_retry_backoff_seconds": 0.0,
     "default_chat_name_prefix": "test",
     "default_similarity_threshold": 0.1,
     "default_top_n": 8,
@@ -394,6 +399,89 @@ class TestCreateSessionReuse(unittest.TestCase):
 
         _, kwargs = mock_client.ensure_dataset.await_args
         self.assertFalse(kwargs["reuse_existing_dataset"])
+
+
+class TestStrictDocumentParseFailures(unittest.TestCase):
+    @patch.object(_services_mod, "_process_questions", new_callable=AsyncMock)
+    @patch.object(_services_mod, "RagflowClient")
+    def test_single_call_strict_parse_failure_stops_before_qna(self, MockClient, mock_process_questions):
+        record = TaskRecord(
+            task_id="strict-001",
+            status=TaskStatus(task_id="strict-001", state=TaskState.PENDING, total_questions=1),
+            ragflow=RagflowContext(),
+            questions=[{"serial_no": 1, "question": "Q1"}],
+        )
+        _mock_db_get.reset_mock()
+        _mock_db_get.return_value = record
+        _mock_db_save.reset_mock()
+
+        mock_client = AsyncMock()
+        mock_client.ensure_dataset = AsyncMock(return_value="ds-1")
+        mock_client.upload_document = AsyncMock(side_effect=["doc-1", "doc-2"])
+        mock_client.start_parsing = AsyncMock()
+        mock_client.wait_for_parsing = AsyncMock(
+            return_value=[
+                {"document_id": "doc-1", "document_name": "good.pdf", "status": "success", "progress": 1.0, "message": "ok"},
+                {"document_id": "doc-2", "document_name": "bad.pdf", "status": "failed", "progress": 0.2, "message": "parser failed"},
+            ]
+        )
+        mock_client.ensure_chat = AsyncMock(return_value="chat-1")
+        mock_client.create_session = AsyncMock(return_value="sess-1")
+        mock_client.close = AsyncMock()
+        MockClient.return_value = mock_client
+
+        _run(
+            run_assessment(
+                "strict-001",
+                record.questions,
+                [("good.pdf", b"a"), ("bad.pdf", b"b")],
+                fail_on_document_parse_issue=True,
+            )
+        )
+
+        self.assertEqual(record.status.state, TaskState.FAILED)
+        self.assertIn("one or more intended documents", record.status.error or "")
+        mock_process_questions.assert_not_awaited()
+        mock_client.ensure_chat.assert_not_awaited()
+
+    @patch.object(_services_mod, "_process_questions", new_callable=AsyncMock)
+    @patch.object(_services_mod, "RagflowClient")
+    def test_session_start_strict_parse_failure_stops_before_qna(self, MockClient, mock_process_questions):
+        record = TaskRecord(
+            task_id="strict-sess-001",
+            status=TaskStatus(task_id="strict-sess-001", state=TaskState.AWAITING_DOCUMENTS, total_questions=1),
+            ragflow=RagflowContext(dataset_id="ds-1", dataset_ids=["ds-1"], document_ids=["doc-1", "doc-2"]),
+            questions=[{"serial_no": 1, "question": "Q1"}],
+        )
+        _mock_db_get.reset_mock()
+        _mock_db_get.return_value = record
+        _mock_db_save.reset_mock()
+
+        mock_client = AsyncMock()
+        mock_client.update_dataset = AsyncMock(return_value={"id": "ds-1"})
+        mock_client.start_parsing = AsyncMock()
+        mock_client.wait_for_parsing = AsyncMock(
+            return_value=[
+                {"document_id": "doc-1", "document_name": "good.pdf", "status": "success", "progress": 1.0, "message": "ok"},
+                {"document_id": "doc-2", "document_name": "bad.pdf", "status": "timeout", "progress": 0.5, "message": "Document parsing timed out"},
+            ]
+        )
+        mock_client.ensure_chat = AsyncMock(return_value="chat-1")
+        mock_client.create_session = AsyncMock(return_value="sess-1")
+        mock_client.close = AsyncMock()
+        MockClient.return_value = mock_client
+
+        _run(
+            run_assessment_for_session(
+                "strict-sess-001",
+                fail_on_document_parse_issue=True,
+            )
+        )
+
+        self.assertEqual(record.status.state, TaskState.FAILED)
+        self.assertIn("one or more intended documents", record.status.error or "")
+        mock_process_questions.assert_not_awaited()
+        mock_client.ensure_chat.assert_not_awaited()
 
 
 class TestGetPaginatedResults(unittest.TestCase):
@@ -798,6 +886,40 @@ class TestOnlyCitedReferences(unittest.TestCase):
         self.assertEqual(record.results[0].status, "completed")
         self.assertEqual(record.results[1].status, "failed")
         self.assertEqual(record.results[1].failure_reason, "Upstream timeout")
+
+    @patch.object(_services_mod, "RagflowClient")
+    def test_transient_question_failure_is_retried_with_new_session(self, MockClient):
+        from assessment.ragflow_client import RagflowClient as _RealClient
+
+        questions = [{"serial_no": 1, "question": "Q1"}]
+        record = self._make_record(questions)
+        _mock_db_save.reset_mock()
+
+        mock_client = AsyncMock()
+        mock_client.create_session = AsyncMock(return_value="retry-session")
+        mock_client.ask = AsyncMock(
+            side_effect=[
+                TransientRagflowError("Request to RAGFlow timed out"),
+                {"answer": "Answer: Yes\nDetails: OK", "reference": {}},
+            ]
+        )
+        MockClient.return_value = mock_client
+        MockClient.parse_yes_no = _RealClient.parse_yes_no
+        MockClient.extract_references = _RealClient.extract_references
+        MockClient.get_cited_indices = _RealClient.get_cited_indices
+
+        failed = _run(_process_questions(
+            record=record,
+            questions=questions,
+            client=mock_client,
+            chat_id="chat1",
+            session_id="sess1",
+        ))
+
+        self.assertEqual(failed, 0)
+        self.assertEqual(record.results[0].status, "completed")
+        self.assertEqual(mock_client.ask.await_count, 2)
+        mock_client.create_session.assert_awaited_once_with("chat1")
 
     @patch.object(_services_mod, "RagflowClient")
     def test_all_refs_when_disabled(self, MockClient):

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
+import httpx
 
 # ---------------------------------------------------------------------------
 # We need to mock settings before importing the client so that the module
@@ -20,6 +21,9 @@ _fake_settings.verify_ssl = True
 _fake_settings.ssl_ca_cert = ""
 _fake_settings.polling_interval_seconds = 0.01
 _fake_settings.document_parse_timeout_seconds = 0.1
+_fake_settings.ragflow_http_retry_attempts = 2
+_fake_settings.ragflow_question_retry_attempts = 2
+_fake_settings.ragflow_retry_backoff_seconds = 0.0
 
 import sys
 import types
@@ -183,6 +187,25 @@ class TestRagflowBugWorkarounds(unittest.TestCase):
         client._request = AsyncMock(return_value={"code": 0, "data": "unexpected"})
         docs = _run(client.list_documents("ds1"))
         self.assertEqual(docs, [])
+
+    def test_request_retries_transient_get_error(self):
+        """Transient GET failures should retry automatically."""
+        client = self._make_client()
+        request = httpx.Request("GET", "http://test:9380/api/v1/datasets")
+        response = httpx.Response(200, json={"code": 0, "data": {"id": "ds-1"}}, request=request)
+        fake_http_client = AsyncMock()
+        fake_http_client.request = AsyncMock(
+            side_effect=[
+                httpx.ConnectError("boom", request=request),
+                response,
+            ]
+        )
+        client._get_client = AsyncMock(return_value=fake_http_client)
+
+        payload = _run(client._request("GET", "/api/v1/datasets"))
+
+        self.assertEqual(payload["data"]["id"], "ds-1")
+        self.assertEqual(fake_http_client.request.await_count, 2)
 
 
 class TestWaitForParsing(unittest.TestCase):

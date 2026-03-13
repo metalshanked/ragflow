@@ -31,6 +31,7 @@ from .models import (
     QuestionResult,
     RagflowContext,
     TaskRecord,
+    TaskExecutionConfig,
     TaskState,
     TaskStatus,
 )
@@ -68,6 +69,7 @@ class TaskRow(Base):
 
     # JSON-serialised blobs
     ragflow_json = Column(Text, nullable=False, default="{}")
+    execution_json = Column(Text, nullable=False, default="{}")
     questions_json = Column(Text, nullable=False, default="[]")
     results_json = Column(Text, nullable=False, default="[]")
     document_statuses_json = Column(Text, nullable=False, default="[]")
@@ -150,7 +152,12 @@ def _cleanup_lock_id() -> int:
 def _schema_missing_columns(sync_conn: Any) -> dict[str, set[str]]:
     inspector = inspect(sync_conn)
     required = {
-        "tasks": {"created_by_username", "created_by_roles_json", "created_by_auth_type"},
+        "tasks": {
+            "created_by_username",
+            "created_by_roles_json",
+            "created_by_auth_type",
+            "execution_json",
+        },
         "task_events": {"actor_username", "actor_roles_json", "actor_auth_type"},
         "audit_events": {
             "action",
@@ -328,6 +335,7 @@ def _task_record_from_row(row: TaskRow) -> TaskRecord:
         ),
     )
     ragflow = RagflowContext(**json.loads(row.ragflow_json))
+    execution = TaskExecutionConfig(**json.loads(row.execution_json or "{}"))
     questions = json.loads(row.questions_json)
     results = [QuestionResult(**r) for r in json.loads(row.results_json)]
     doc_statuses = [DocumentStatus(**ds) for ds in json.loads(row.document_statuses_json or "[]")]
@@ -343,6 +351,7 @@ def _task_record_from_row(row: TaskRow) -> TaskRecord:
         task_id=row.task_id,
         status=status,
         ragflow=ragflow,
+        execution=execution,
         questions=questions,
         results=results,
         document_statuses=doc_statuses,
@@ -364,6 +373,7 @@ def _row_from_task_record(record: TaskRecord) -> dict[str, Any]:
         "updated_at": s.updated_at,
         **_actor_columns(s.created_by),
         "ragflow_json": record.ragflow.model_dump_json(),
+        "execution_json": record.execution.model_dump_json(),
         "questions_json": json.dumps(record.questions),
         "results_json": json.dumps([r.model_dump() for r in record.results], default=str),
         "document_statuses_json": json.dumps([ds.model_dump() for ds in record.document_statuses], default=str),

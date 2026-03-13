@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 import openpyxl
 
 from assessment import routers
-from assessment.models import SessionCreateResponse, TaskState, TaskStatus
+from assessment.models import RagflowContext, SessionCreateResponse, TaskRecord, TaskState, TaskStatus
 
 
 @contextmanager
@@ -379,6 +379,59 @@ def test_delete_task_endpoint_maps_conflict_state():
             assert "Cannot delete task in state" in resp.json()["detail"]
 
 
+def test_retry_task_endpoint_queues_background_retry():
+    app = make_app()
+    with TestClient(app) as client:
+        with override_settings(jwt_secret_key=""):
+            mock_claim = AsyncMock(
+                return_value=type(
+                    "_RetryRecord",
+                    (),
+                    {
+                        "status": TaskStatus(task_id="task-1", state=TaskState.PARSING),
+                        "execution": type("_Exec", (), {"workflow": "session"})(),
+                        "ragflow": type("_Rag", (), {"dataset_id": "ds-1", "document_ids": ["doc-1"]})(),
+                    },
+                )()
+            )
+            mock_retry = AsyncMock()
+            with patch("assessment.routers.claim_task_retry", mock_claim), patch(
+                "assessment.routers.retry_task", mock_retry
+            ):
+                resp = client.post("/api/v1/assessments/task-1/retry")
+
+            assert resp.status_code == 202
+            assert resp.json()["task_id"] == "task-1"
+            mock_claim.assert_awaited_once()
+            mock_retry.assert_awaited_once()
+
+
+def test_retry_failed_questions_endpoint_queues_background_retry():
+    app = make_app()
+    with TestClient(app) as client:
+        with override_settings(jwt_secret_key=""):
+            mock_claim = AsyncMock(
+                return_value=type(
+                    "_RetryRecord",
+                    (),
+                    {
+                        "status": TaskStatus(task_id="task-1", state=TaskState.PROCESSING),
+                        "ragflow": type("_Rag", (), {"dataset_id": "ds-1", "document_ids": ["doc-1"]})(),
+                    },
+                )()
+            )
+            mock_retry = AsyncMock()
+            with patch("assessment.routers.claim_task_retry", mock_claim), patch(
+                "assessment.routers.retry_failed_questions_for_task", mock_retry
+            ):
+                resp = client.post("/api/v1/assessments/task-1/retry-failed-questions")
+
+            assert resp.status_code == 202
+            assert resp.json()["task_id"] == "task-1"
+            mock_claim.assert_awaited_once()
+            mock_retry.assert_awaited_once()
+
+
 def test_start_assessment_defaults_reuse_existing_dataset_true():
     app = make_app()
     with TestClient(app) as client:
@@ -414,6 +467,42 @@ def test_start_assessment_defaults_reuse_existing_dataset_true():
             assert args[5] is True
 
 
+def test_start_assessment_passes_fail_on_document_parse_issue_true():
+    app = make_app()
+    with TestClient(app) as client:
+        with override_settings(jwt_secret_key=""):
+            mock_parse = MagicMock(return_value=[{"serial_no": 1, "question": "Q1"}])
+            mock_create_task = AsyncMock(
+                return_value=type(
+                    "_R",
+                    (),
+                    {
+                        "task_id": "task-123",
+                        "status": TaskStatus(task_id="task-123", state=TaskState.PENDING, total_questions=1),
+                    },
+                )()
+            )
+            mock_run = AsyncMock()
+
+            with patch("assessment.routers.parse_questions_excel", mock_parse), patch(
+                "assessment.routers.create_task", mock_create_task
+            ), patch("assessment.routers.run_assessment", mock_run):
+                resp = client.post(
+                    "/api/v1/assessments",
+                    files={
+                        "questions_file": ("q.xlsx", b"xlsx-bytes", "application/octet-stream"),
+                        "evidence_files": ("evidence.pdf", b"pdf-bytes", "application/pdf"),
+                    },
+                    data={"fail_on_document_parse_issue": "true"},
+                )
+
+            assert resp.status_code == 202
+            execution = mock_create_task.await_args.kwargs["execution"]
+            assert execution.fail_on_document_parse_issue is True
+            args = mock_run.await_args.args
+            assert args[10] is True
+
+
 def test_create_session_endpoint_accepts_reuse_existing_dataset_false():
     app = make_app()
     with TestClient(app) as client:
@@ -440,3 +529,32 @@ def test_create_session_endpoint_accepts_reuse_existing_dataset_false():
             args = mock_create_session.await_args.args
             assert args[1] == "shared-ds"
             assert args[2] is False
+
+
+def test_start_session_assessment_passes_fail_on_document_parse_issue_true():
+    app = make_app()
+    with TestClient(app) as client:
+        with override_settings(jwt_secret_key=""):
+            record = TaskRecord(
+                task_id="task-1",
+                status=TaskStatus(task_id="task-1", state=TaskState.PARSING, total_questions=1),
+                ragflow=RagflowContext(dataset_id="ds-1", document_ids=["doc-1"]),
+            )
+            mock_claim = AsyncMock(return_value=record)
+            mock_run = AsyncMock()
+            mock_task_event = AsyncMock()
+            mock_audit = AsyncMock()
+
+            with patch("assessment.routers.claim_session_start", mock_claim), patch(
+                "assessment.routers.run_assessment_for_session", mock_run
+            ), patch("assessment.routers._task_event", mock_task_event), patch(
+                "assessment.routers._audit", mock_audit
+            ):
+                resp = client.post(
+                    "/api/v1/assessments/sessions/task-1/start",
+                    data={"fail_on_document_parse_issue": "true"},
+                )
+
+            assert resp.status_code == 202
+            args = mock_run.await_args.args
+            assert args[6] is True

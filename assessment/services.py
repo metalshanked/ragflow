@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import Any
 
 import openpyxl
+from sqlalchemy.exc import OperationalError
 
 from .config import settings
 from .models import (
@@ -27,6 +28,7 @@ from .models import (
     Reference,
     SessionCreateResponse,
     TaskEvent,
+    TaskExecutionConfig,
     TaskRecord,
     TaskState,
     TaskStatus,
@@ -43,7 +45,7 @@ from .db import (
     db_find_document_by_hash,
 )
 from .observability import actor_context, openinference_attributes, set_span_attributes, start_span
-from .ragflow_client import RagflowClient
+from .ragflow_client import RagflowClient, TransientRagflowError
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +109,120 @@ def _effective_chat_options(
 
     defaults = settings.default_chat_options if isinstance(settings.default_chat_options, dict) else {}
     return _deep_merge_dicts(defaults, runtime)
+
+
+def _build_execution_config(
+    *,
+    workflow: str,
+    dataset_name: str | None = None,
+    chat_name: str | None = None,
+    source_dataset_ids: list[str] | None = None,
+    reuse_existing_dataset: bool = False,
+    dataset_options: dict[str, Any] | None = None,
+    chat_options: dict[str, Any] | None = None,
+    process_vendor_response: bool | None = None,
+    only_cited_references: bool | None = None,
+    fail_on_document_parse_issue: bool = False,
+) -> TaskExecutionConfig:
+    return TaskExecutionConfig(
+        workflow=workflow,
+        dataset_name=(dataset_name or "").strip(),
+        chat_name=(chat_name or "").strip(),
+        source_dataset_ids=list(source_dataset_ids or []),
+        reuse_existing_dataset=bool(reuse_existing_dataset),
+        dataset_options=deepcopy(dataset_options if isinstance(dataset_options, dict) else {}),
+        chat_options=deepcopy(chat_options if isinstance(chat_options, dict) else {}),
+        process_vendor_response=process_vendor_response,
+        only_cited_references=only_cited_references,
+        fail_on_document_parse_issue=fail_on_document_parse_issue,
+    )
+
+
+def _merged_execution_config(
+    record: TaskRecord,
+    *,
+    chat_name: str | None = None,
+    dataset_options: dict[str, Any] | None = None,
+    chat_options: dict[str, Any] | None = None,
+    process_vendor_response: bool | None = None,
+    only_cited_references: bool | None = None,
+    fail_on_document_parse_issue: bool | None = None,
+) -> TaskExecutionConfig:
+    base = record.execution.model_copy(deep=True)
+    if chat_name is not None:
+        base.chat_name = chat_name.strip()
+    if dataset_options is not None:
+        base.dataset_options = deepcopy(dataset_options)
+    if chat_options is not None:
+        base.chat_options = deepcopy(chat_options)
+    if process_vendor_response is not None:
+        base.process_vendor_response = process_vendor_response
+    if only_cited_references is not None:
+        base.only_cited_references = only_cited_references
+    if fail_on_document_parse_issue is not None:
+        base.fail_on_document_parse_issue = fail_on_document_parse_issue
+    return base
+
+
+def _raise_if_strict_parse_failures(
+    *,
+    failed_document_statuses: list[dict[str, Any]],
+    fail_on_document_parse_issue: bool,
+) -> None:
+    if not fail_on_document_parse_issue or not failed_document_statuses:
+        return
+    raise RuntimeError(
+        "Stopping assessment because one or more intended documents were not successfully parsed: "
+        + "; ".join(
+            f"{status['document_name'] or status['document_id']}: {status['message']}"
+            for status in failed_document_statuses
+        )
+    )
+
+
+def _question_key(serial_no: Any) -> str:
+    return str(serial_no)
+
+
+async def _save_task_execution_best_effort(record: TaskRecord) -> None:
+    """Persist execution metadata when DB tables are available."""
+    try:
+        await db_save_task(record)
+    except OperationalError as exc:
+        message = str(exc).lower()
+        if "no such table" not in message and "does not exist" not in message:
+            raise
+        logger.debug(
+            "Skipping execution metadata persistence because assessment tables are unavailable: task_id=%s",
+            record.task_id,
+        )
+
+
+async def _ask_question_with_retry(
+    *,
+    client: RagflowClient,
+    chat_id: str,
+    session_id: str,
+    question_text: str,
+) -> tuple[str, dict[str, Any]]:
+    attempts = max(1, settings.ragflow_question_retry_attempts + 1)
+    current_session_id = session_id
+    for attempt in range(1, attempts + 1):
+        try:
+            response = await client.ask(chat_id, current_session_id, question_text, stream=False)
+            return current_session_id, response
+        except TransientRagflowError:
+            if attempt >= attempts:
+                raise
+            logger.warning(
+                "Retrying failed question completion attempt=%s/%s chat_id=%s",
+                attempt,
+                attempts,
+                chat_id,
+            )
+            await asyncio.sleep(settings.ragflow_retry_backoff_seconds * attempt)
+            current_session_id = await client.create_session(chat_id)
+    raise RuntimeError("Unreachable retry branch for question completion")
 
 
 def _ordered_unique(values: list[str]) -> list[str]:
@@ -205,12 +321,16 @@ def _is_missing_upstream_resource_error(exc: Exception) -> bool:
     )
 
 
-def _task_is_deletable(record: TaskRecord) -> bool:
-    return record.status.state not in {
+def _task_is_active(record: TaskRecord) -> bool:
+    return record.status.state in {
         TaskState.UPLOADING,
         TaskState.PARSING,
         TaskState.PROCESSING,
     }
+
+
+def _task_is_deletable(record: TaskRecord) -> bool:
+    return not _task_is_active(record)
 
 
 async def delete_task_and_resources(
@@ -491,6 +611,8 @@ async def _process_questions(
     session_id: str,
     process_vendor_response: bool | None = None,
     only_cited_references: bool | None = None,
+    merge_existing_results: bool = False,
+    existing_processed_count: int = 0,
 ) -> int:
     """Process all *questions* concurrently and return the count of failures.
 
@@ -514,6 +636,15 @@ async def _process_questions(
         total = len(questions)
         ordered_results: list[QuestionResult | None] = [None] * total
         settled_count = 0
+        base_results = [result.model_copy(deep=True) for result in record.results] if merge_existing_results else []
+        base_results_by_key = {
+            _question_key(result.question_serial_no): result for result in base_results
+        }
+        question_order_keys = [
+            _question_key(question.get("serial_no", ""))
+            for question in (record.questions or questions)
+        ]
+        updated_results_by_key: dict[str, QuestionResult] = {}
 
         do_process_vendor = process_vendor_response if process_vendor_response is not None else settings.process_vendor_response
         do_only_cited = only_cited_references if only_cited_references is not None else settings.only_cited_references
@@ -542,8 +673,11 @@ async def _process_questions(
                                 f"Question: {q_text}"
                             )
 
-                        response = await client.ask(
-                            chat_id, session_id, q_text, stream=False
+                        _, response = await _ask_question_with_retry(
+                            client=client,
+                            chat_id=chat_id,
+                            session_id=session_id,
+                            question_text=q_text,
                         )
                         answer_text = response.get("answer", "")
                         verdict, details = RagflowClient.parse_yes_no(answer_text)
@@ -605,13 +739,23 @@ async def _process_questions(
                     nonlocal settled_count
                     async with progress_lock:
                         ordered_results[idx] = result
-                        record.results = [r for r in ordered_results if r is not None]
+                        if merge_existing_results:
+                            updated_results_by_key[_question_key(result.question_serial_no)] = result
+                            merged_results = dict(base_results_by_key)
+                            merged_results.update(updated_results_by_key)
+                            record.results = [
+                                merged_results[key]
+                                for key in question_order_keys
+                                if key in merged_results
+                            ]
+                        else:
+                            record.results = [r for r in ordered_results if r is not None]
                         settled_count += 1
                         if settled_count % _PROGRESS_BATCH_SIZE == 0 or settled_count == total:
                             await _update_status(
                                 record,
-                                questions_processed=settled_count,
-                                message=f"Processed {settled_count}/{total} questions",
+                                questions_processed=existing_processed_count + settled_count,
+                                message=f"Processed {existing_processed_count + settled_count}/{record.status.total_questions or total} questions",
                             )
                     return result
 
@@ -620,11 +764,22 @@ async def _process_questions(
         failed_count = sum(1 for result in gathered if result.status == "failed")
         if failed_count:
             logger.warning("%d out of %d questions failed", failed_count, total)
-        record.results = [result for result in gathered]
+        if merge_existing_results:
+            merged_results = dict(base_results_by_key)
+            merged_results.update({
+                _question_key(result.question_serial_no): result for result in gathered
+            })
+            record.results = [
+                merged_results[key]
+                for key in question_order_keys
+                if key in merged_results
+            ]
+        else:
+            record.results = [result for result in gathered]
         await _update_status(
             record,
-            questions_processed=total,
-            message=f"Processed {total}/{total} questions",
+            questions_processed=existing_processed_count + total,
+            message=f"Processed {existing_processed_count + total}/{record.status.total_questions or total} questions",
         )
         return failed_count
 
@@ -644,6 +799,7 @@ async def run_assessment(
     chat_opts: dict | None = None,
     process_vendor_response: bool | None = None,
     only_cited_references: bool | None = None,
+    fail_on_document_parse_issue: bool = False,
     actor: ActorInfo | None = None,
 ) -> None:
     """
@@ -683,6 +839,18 @@ async def run_assessment(
                 dataset_opts = _effective_dataset_options(dataset_opts, include_defaults=True)
                 chat_opts = _effective_chat_options(chat_opts, include_defaults=True)
                 reuse_mode = bool(dataset_name and reuse_exisiting_dataset)
+                record.execution = _build_execution_config(
+                    workflow="single_call",
+                    dataset_name=dataset_name,
+                    chat_name=chat_name,
+                    reuse_existing_dataset=reuse_mode,
+                    dataset_options=dataset_opts,
+                    chat_options=chat_opts,
+                    process_vendor_response=process_vendor_response,
+                    only_cited_references=only_cited_references,
+                    fail_on_document_parse_issue=fail_on_document_parse_issue,
+                )
+                await _save_task_execution_best_effort(record)
 
                 try:
                     await _update_status(
@@ -838,6 +1006,10 @@ async def run_assessment(
                         if failed:
                             names = ", ".join(ds["document_name"] or ds["document_id"] for ds in failed)
                             logger.warning("Documents with parsing issues: %s", names)
+                        _raise_if_strict_parse_failures(
+                            failed_document_statuses=failed,
+                            fail_on_document_parse_issue=record.execution.fail_on_document_parse_issue,
+                        )
                         if not ok_ids:
                             raise RuntimeError(
                                 "All documents failed to parse. "
@@ -867,7 +1039,7 @@ async def run_assessment(
                         stage=PipelineStage.CHAT_PROCESSING,
                         message="Creating chat assistant...",
                     )
-                    c_name = chat_name or f"{settings.default_chat_name_prefix}_chat_{task_id[:8]}"
+                    c_name = record.execution.chat_name or f"{settings.default_chat_name_prefix}_chat_{task_id[:8]}"
                     chat_id = await client.ensure_chat(
                         c_name,
                         [dataset_id],
@@ -915,6 +1087,7 @@ async def create_task(
     questions: list[dict[str, Any]],
     state: TaskState = TaskState.PENDING,
     actor: ActorInfo | None = None,
+    execution: TaskExecutionConfig | None = None,
 ) -> TaskRecord:
     """Create a new task record and persist it to the database."""
     task_id = uuid.uuid4().hex
@@ -928,6 +1101,7 @@ async def create_task(
         task_id=task_id,
         status=status,
         questions=questions,
+        execution=execution.model_copy(deep=True) if execution else TaskExecutionConfig(),
     )
     await db_save_task(record)
     try:
@@ -954,6 +1128,7 @@ async def create_session(
     dataset_name: str | None = None,
     reuse_exisiting_dataset: bool = True,
     dataset_opts: dict | None = None,
+    chat_opts: dict | None = None,
     actor: ActorInfo | None = None,
 ) -> SessionCreateResponse:
     """
@@ -963,11 +1138,23 @@ async def create_session(
     ``add_documents_to_session`` and finally trigger the assessment
     with ``start_assessment_for_session``.
     """
-    record = await create_task(questions, state=TaskState.AWAITING_DOCUMENTS, actor=actor)
+    dataset_opts = _effective_dataset_options(dataset_opts, include_defaults=True)
+    chat_opts = _effective_chat_options(chat_opts, include_defaults=True)
+    reuse_mode = bool(dataset_name and reuse_exisiting_dataset)
+    record = await create_task(
+        questions,
+        state=TaskState.AWAITING_DOCUMENTS,
+        actor=actor,
+        execution=_build_execution_config(
+            workflow="session",
+            dataset_name=dataset_name,
+            reuse_existing_dataset=reuse_mode,
+            dataset_options=dataset_opts,
+            chat_options=chat_opts,
+        ),
+    )
     client = RagflowClient()
     dataset_id: str = ""
-    dataset_opts = _effective_dataset_options(dataset_opts, include_defaults=True)
-    reuse_mode = bool(dataset_name and reuse_exisiting_dataset)
     try:
         ds_name = dataset_name or f"{settings.default_chat_name_prefix}_{record.task_id[:8]}"
         dataset_id = await client.ensure_dataset(
@@ -1028,6 +1215,225 @@ async def claim_session_start(task_id: str) -> TaskRecord:
             error="",
         )
         return record
+
+
+def _failed_results(record: TaskRecord) -> list[QuestionResult]:
+    return [result for result in record.results if str(result.status) == "failed"]
+
+
+async def claim_task_retry(
+    task_id: str,
+    *,
+    failed_questions_only: bool = False,
+    chat_name: str | None = None,
+    dataset_opts: dict | None = None,
+    chat_opts: dict | None = None,
+    process_vendor_response: bool | None = None,
+    only_cited_references: bool | None = None,
+) -> TaskRecord:
+    async with db_task_lock(task_id):
+        record = await get_task(task_id)
+        if record is None:
+            raise ValueError(f"Task {task_id} not found")
+        if _task_is_active(record):
+            raise ValueError(
+                f"Cannot retry task in state '{record.status.state.value}'. "
+                "Task is currently active."
+            )
+        if not record.execution.workflow:
+            raise ValueError("Task is missing retry execution metadata")
+
+        record.execution = _merged_execution_config(
+            record,
+            chat_name=chat_name,
+            dataset_options=_effective_dataset_options(
+                dataset_opts,
+                include_defaults=(record.execution.workflow != "from_dataset"),
+            ) if dataset_opts is not None else None,
+            chat_options=_effective_chat_options(chat_opts, include_defaults=True)
+            if chat_opts is not None else None,
+            process_vendor_response=process_vendor_response,
+            only_cited_references=only_cited_references,
+        )
+
+        if failed_questions_only:
+            failed = _failed_results(record)
+            if not failed:
+                raise ValueError("Task has no failed questions to retry")
+            await _update_status(
+                record,
+                state=TaskState.PROCESSING,
+                stage=PipelineStage.CHAT_PROCESSING,
+                questions_processed=sum(1 for result in record.results if str(result.status) != "failed"),
+                message=f"Retrying {len(failed)} failed question(s)...",
+                error="",
+            )
+            return record
+
+        if record.execution.workflow == "from_dataset":
+            if not record.ragflow.dataset_ids:
+                raise ValueError("Task has no stored dataset IDs for retry")
+            record.results.clear()
+            record.document_statuses.clear()
+            await _update_status(
+                record,
+                state=TaskState.PROCESSING,
+                stage=PipelineStage.CHAT_PROCESSING,
+                questions_processed=0,
+                message="Assessment retry queued. Starting chat processing...",
+                error="",
+            )
+            return record
+
+        if not record.ragflow.document_ids:
+            raise ValueError("Task has no stored evidence documents for retry")
+
+        record.results.clear()
+        record.document_statuses.clear()
+        await _update_status(
+            record,
+            state=TaskState.PARSING,
+            stage=PipelineStage.DOCUMENT_PARSING,
+            questions_processed=0,
+            message="Assessment retry queued. Starting document parsing...",
+            error="",
+        )
+        return record
+
+
+async def retry_failed_questions_for_task(
+    task_id: str,
+    *,
+    chat_name: str | None = None,
+    chat_opts: dict | None = None,
+    process_vendor_response: bool | None = None,
+    only_cited_references: bool | None = None,
+    actor: ActorInfo | None = None,
+) -> None:
+    with actor_context(actor, request_method="POST", request_path=f"/api/v1/assessments/{task_id}/retry-failed-questions"):
+        record = await get_task(task_id)
+        if record is None:
+            raise ValueError(f"Task {task_id} not found")
+        failed_questions = _failed_results(record)
+        if not failed_questions:
+            raise ValueError("Task has no failed questions to retry")
+
+        record.execution = _merged_execution_config(
+            record,
+            chat_name=chat_name,
+            chat_options=_effective_chat_options(chat_opts, include_defaults=True)
+            if chat_opts is not None else record.execution.chat_options,
+            process_vendor_response=process_vendor_response,
+            only_cited_references=only_cited_references,
+        )
+        await _save_task_execution_best_effort(record)
+
+        dataset_ids = record.ragflow.dataset_ids or ([record.ragflow.dataset_id] if record.ragflow.dataset_id else [])
+        if not dataset_ids:
+            raise ValueError("Task has no stored dataset IDs for retry")
+
+        failed_keys = {_question_key(result.question_serial_no) for result in failed_questions}
+        questions = [question for question in record.questions if _question_key(question.get("serial_no", "")) in failed_keys]
+        base_processed_count = len(record.results) - len(failed_questions)
+        client = RagflowClient()
+        try:
+            c_name = record.execution.chat_name or f"{settings.default_chat_name_prefix}_chat_{task_id[:8]}_retry"
+            chat_id = await client.ensure_chat(
+                c_name,
+                dataset_ids,
+                similarity_threshold=settings.default_similarity_threshold,
+                top_n=settings.default_top_n,
+                **deepcopy(record.execution.chat_options),
+            )
+            record.ragflow.chat_id = chat_id
+            session_id = await client.create_session(chat_id)
+            record.ragflow.session_id = session_id
+            failed_count = await _process_questions(
+                record=record,
+                questions=questions,
+                client=client,
+                chat_id=chat_id,
+                session_id=session_id,
+                process_vendor_response=record.execution.process_vendor_response,
+                only_cited_references=record.execution.only_cited_references,
+                merge_existing_results=True,
+                existing_processed_count=base_processed_count,
+            )
+            final_failed = len(_failed_results(record))
+            final_succeeded = len(record.results) - final_failed
+            await _update_status(
+                record,
+                state=TaskState.COMPLETED if final_failed == 0 else TaskState.COMPLETED,
+                stage=PipelineStage.FINALIZING,
+                questions_processed=len(record.results),
+                message=f"Assessment completed: {final_succeeded} succeeded, {final_failed} failed",
+                error="" if failed_count < len(questions) else record.status.error,
+            )
+        except Exception as exc:
+            logger.exception("Failed-question retry failed for task %s", task_id)
+            await _update_status(
+                record,
+                state=TaskState.FAILED,
+                stage=PipelineStage.IDLE,
+                message="Failed-question retry failed",
+                error=str(exc),
+            )
+        finally:
+            await client.close()
+
+
+async def retry_task(
+    task_id: str,
+    *,
+    chat_name: str | None = None,
+    dataset_opts: dict | None = None,
+    chat_opts: dict | None = None,
+    process_vendor_response: bool | None = None,
+    only_cited_references: bool | None = None,
+    actor: ActorInfo | None = None,
+) -> None:
+    record = await get_task(task_id)
+    if record is None:
+        raise ValueError(f"Task {task_id} not found")
+
+    execution = _merged_execution_config(
+        record,
+        chat_name=chat_name,
+        dataset_options=_effective_dataset_options(
+            dataset_opts,
+            include_defaults=(record.execution.workflow != "from_dataset"),
+        ) if dataset_opts is not None else None,
+        chat_options=_effective_chat_options(chat_opts, include_defaults=True)
+        if chat_opts is not None else None,
+        process_vendor_response=process_vendor_response,
+        only_cited_references=only_cited_references,
+    )
+    record.execution = execution
+    await _save_task_execution_best_effort(record)
+
+    if execution.workflow == "from_dataset":
+        await run_assessment_from_dataset(
+            task_id,
+            execution.source_dataset_ids or record.ragflow.dataset_ids,
+            execution.chat_name or None,
+            execution.chat_options,
+            execution.dataset_options,
+            execution.process_vendor_response,
+            execution.only_cited_references,
+            actor,
+        )
+        return
+
+    await run_assessment_for_session(
+        task_id,
+        execution.chat_name or None,
+        execution.dataset_options,
+        execution.chat_options,
+        execution.process_vendor_response,
+        execution.only_cited_references,
+        execution.fail_on_document_parse_issue,
+        actor,
+    )
 
 
 async def add_documents_to_session(
@@ -1209,6 +1615,7 @@ async def run_assessment_for_session(
     chat_opts: dict | None = None,
     process_vendor_response: bool | None = None,
     only_cited_references: bool | None = None,
+    fail_on_document_parse_issue: bool | None = None,
     actor: ActorInfo | None = None,
 ) -> None:
     """
@@ -1246,6 +1653,15 @@ async def run_assessment_for_session(
                 if not record.ragflow.document_ids:
                     raise ValueError("No evidence documents have been uploaded yet.")
 
+                record.execution = _merged_execution_config(
+                    record,
+                    chat_name=chat_name,
+                    dataset_options=_effective_dataset_options(dataset_opts, include_defaults=True),
+                    chat_options=_effective_chat_options(chat_opts, include_defaults=True),
+                    process_vendor_response=process_vendor_response,
+                    only_cited_references=only_cited_references,
+                    fail_on_document_parse_issue=fail_on_document_parse_issue,
+                )
                 record.results.clear()
                 record.document_statuses.clear()
                 record.status.questions_processed = 0
@@ -1257,7 +1673,7 @@ async def run_assessment_for_session(
                 doc_ids = record.ragflow.document_ids
                 questions = record.questions
                 client = RagflowClient()
-                effective_dataset_opts = _effective_dataset_options(dataset_opts, include_defaults=True)
+                effective_dataset_opts = deepcopy(record.execution.dataset_options)
 
                 try:
                     if effective_dataset_opts:
@@ -1283,6 +1699,10 @@ async def run_assessment_for_session(
                     if failed:
                         names = ", ".join(ds["document_name"] or ds["document_id"] for ds in failed)
                         logger.warning("Documents with parsing issues: %s", names)
+                    _raise_if_strict_parse_failures(
+                        failed_document_statuses=failed,
+                        fail_on_document_parse_issue=record.execution.fail_on_document_parse_issue,
+                    )
                     if not ok_ids:
                         raise RuntimeError(
                             "All documents failed to parse. "
@@ -1300,7 +1720,7 @@ async def run_assessment_for_session(
                         message="Creating chat assistant...",
                     )
                     c_name = chat_name or f"{settings.default_chat_name_prefix}_chat_{task_id[:8]}"
-                    chat_opts = _effective_chat_options(chat_opts, include_defaults=True)
+                    chat_opts = deepcopy(record.execution.chat_options)
                     chat_id = await client.ensure_chat(
                         c_name,
                         [dataset_id],
@@ -1319,8 +1739,8 @@ async def run_assessment_for_session(
                         client=client,
                         chat_id=chat_id,
                         session_id=session_id,
-                        process_vendor_response=process_vendor_response,
-                        only_cited_references=only_cited_references,
+                        process_vendor_response=record.execution.process_vendor_response,
+                        only_cited_references=record.execution.only_cited_references,
                     )
 
                     succeeded_count = len(questions) - failed_count
@@ -1379,8 +1799,18 @@ async def run_assessment_from_dataset(
                     raise ValueError(f"Task {task_id} not found")
                 record.ragflow.dataset_id = dataset_ids[0] if dataset_ids else ""
                 record.ragflow.dataset_ids = list(dataset_ids)
+                record.execution = _build_execution_config(
+                    workflow="from_dataset",
+                    chat_name=chat_name,
+                    source_dataset_ids=dataset_ids,
+                    dataset_options=_effective_dataset_options(dataset_opts, include_defaults=False),
+                    chat_options=_effective_chat_options(chat_opts, include_defaults=True),
+                    process_vendor_response=process_vendor_response,
+                    only_cited_references=only_cited_references,
+                )
+                await _save_task_execution_best_effort(record)
                 client = RagflowClient()
-                effective_dataset_opts = _effective_dataset_options(dataset_opts, include_defaults=False)
+                effective_dataset_opts = deepcopy(record.execution.dataset_options)
 
                 try:
                     if effective_dataset_opts:
@@ -1400,8 +1830,8 @@ async def run_assessment_from_dataset(
                         stage=PipelineStage.CHAT_PROCESSING,
                         message="Creating chat assistant...",
                     )
-                    c_name = chat_name or f"{settings.default_chat_name_prefix}_chat_{task_id[:8]}"
-                    chat_opts = _effective_chat_options(chat_opts, include_defaults=True)
+                    c_name = record.execution.chat_name or f"{settings.default_chat_name_prefix}_chat_{task_id[:8]}"
+                    chat_opts = deepcopy(record.execution.chat_options)
                     chat_id = await client.ensure_chat(
                         c_name,
                         dataset_ids,
@@ -1421,8 +1851,8 @@ async def run_assessment_from_dataset(
                         client=client,
                         chat_id=chat_id,
                         session_id=session_id,
-                        process_vendor_response=process_vendor_response,
-                        only_cited_references=only_cited_references,
+                        process_vendor_response=record.execution.process_vendor_response,
+                        only_cited_references=record.execution.only_cited_references,
                     )
 
                     succeeded_count = len(questions) - failed_count
