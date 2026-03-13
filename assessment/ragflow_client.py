@@ -668,17 +668,124 @@ class RagflowClient:
     # PPT:  [slide, 0, 0, 0, 0]   — real slide number, coordinates always zero.
     _PAGE_NUMBER_TYPES = frozenset({"pdf", "ppt"})
     # Subset that also carries meaningful bounding-box coordinates.
-    _COORDINATE_TYPES = frozenset({"pdf"})
 
     @staticmethod
     def _has_page_number(doc_type: str) -> bool:
         """Return *True* when *doc_type* has real page/slide numbers."""
         return doc_type in RagflowClient._PAGE_NUMBER_TYPES
 
+    _IMAGE_TYPES = frozenset({"png", "jpg", "jpeg", "gif", "bmp", "webp", "svg", "tiff"})
+    _TEXT_TYPES = frozenset({"txt", "md", "markdown", "html", "htm", "json", "xml", "yaml", "yml"})
+    _SPREADSHEET_TYPES = frozenset({"excel"})
+    _WORD_TYPES = frozenset({"docx", "rtf", "odt"})
+
     @staticmethod
-    def _has_coordinates(doc_type: str) -> bool:
-        """Return *True* when *doc_type* has real bounding-box coordinates."""
-        return doc_type in RagflowClient._COORDINATE_TYPES
+    def _detect_media_family(doc_type: str) -> str:
+        if doc_type == "pdf":
+            return "pdf"
+        if doc_type == "ppt":
+            return "presentation"
+        if doc_type in RagflowClient._SPREADSHEET_TYPES:
+            return "spreadsheet"
+        if doc_type in RagflowClient._WORD_TYPES:
+            return "document"
+        if doc_type in RagflowClient._IMAGE_TYPES:
+            return "image"
+        if doc_type in RagflowClient._TEXT_TYPES:
+            return "text"
+        return "other"
+
+    @staticmethod
+    def _build_location(doc_type: str, positions: Any) -> dict[str, Any]:
+        location: dict[str, Any] = {
+            "kind": "",
+            "value": None,
+            "label": "",
+            "page_number": None,
+            "highlight_box": None,
+        }
+        if not isinstance(positions, list) or not positions:
+            return location
+        pos = positions[0]
+        if not isinstance(pos, list) or not pos:
+            return location
+        try:
+            first_value = int(pos[0])
+        except (TypeError, ValueError):
+            return location
+
+        if RagflowClient._has_page_number(doc_type):
+            location["page_number"] = first_value
+            if doc_type == "pdf":
+                location["kind"] = "page"
+                location["value"] = first_value
+                location["label"] = f"Page {first_value}"
+                if len(pos) >= 5:
+                    location["highlight_box"] = {
+                        "left": float(pos[1]),
+                        "right": float(pos[2]),
+                        "top": float(pos[3]),
+                        "bottom": float(pos[4]),
+                    }
+            else:
+                location["kind"] = "slide"
+                location["value"] = first_value
+                location["label"] = f"Slide {first_value}"
+            return location
+
+        location["value"] = first_value
+        if doc_type in RagflowClient._SPREADSHEET_TYPES:
+            location["kind"] = "row"
+            location["label"] = f"Row {first_value}"
+        else:
+            location["kind"] = "chunk"
+            location["label"] = f"Chunk {first_value}"
+        return location
+
+    @staticmethod
+    def _strip_html(html: str) -> str:
+        text = re.sub(r"<[^>]+>", " ", html or "")
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _build_preview(reference_type: str, content: Any, image_url: str | None) -> dict[str, Any]:
+        raw_content = str(content or "").strip()
+        html_content = ""
+        table_html = ""
+        content_format = "none"
+        excerpt_source = raw_content
+
+        if raw_content:
+            lower_content = raw_content.lower()
+            if reference_type == "table" or "<table" in lower_content:
+                content_format = "table_html"
+                table_html = raw_content
+                html_content = raw_content
+                excerpt_source = RagflowClient._strip_html(raw_content)
+            elif bool(re.search(r"<(div|p|span|ul|ol|li|img|table|tr|td|th)\b", raw_content, re.IGNORECASE)):
+                content_format = "html"
+                html_content = raw_content
+                excerpt_source = RagflowClient._strip_html(raw_content)
+            else:
+                content_format = "text"
+
+        text_excerpt = excerpt_source[:300] + "..." if len(excerpt_source) > 300 else excerpt_source
+        return {
+            "text_excerpt": text_excerpt,
+            "full_content": raw_content,
+            "content_format": content_format,
+            "html_content": html_content,
+            "table_html": table_html,
+            "has_inline_preview": bool(raw_content or image_url),
+        }
+
+    @staticmethod
+    def _first_present(chunk: dict[str, Any], *keys: str) -> Any:
+        for key in keys:
+            value = chunk.get(key)
+            if value not in (None, ""):
+                return value
+        return None
 
     @staticmethod
     def extract_references(response_data: dict) -> list[dict]:
@@ -686,9 +793,8 @@ class RagflowClient:
         Given the ``reference`` block from a completion response, return a
         list of cleaned-up reference dicts usable by the assessment models.
 
-        Each dict has:
-        - document_name, document_type, page_number, chunk_index,
-          coordinates, snippet, image_url, document_url
+        Each dict has nested document, location, preview, links, retrieval,
+        and source-metadata sections.
 
         Position interpretation varies by document type:
         - **PDF**: ``positions`` encodes ``[page, x1, x2, y1, y2]`` with real
@@ -706,56 +812,67 @@ class RagflowClient:
         if not ref_block:
             return []
         chunks = ref_block.get("chunks", [])
+        known_keys = {
+            "content",
+            "content_with_weight",
+            "document_id",
+            "doc_id",
+            "document_name",
+            "docnm_kwd",
+            "dataset_id",
+            "kb_id",
+            "image_id",
+            "img_id",
+            "positions",
+            "position_int",
+            "url",
+            "similarity",
+            "vector_similarity",
+            "term_similarity",
+            "doc_type",
+            "doc_type_kwd",
+        }
         results = []
         for chunk in chunks:
-            doc_name = chunk.get("document_name", "")
+            doc_name = str(chunk.get("document_name", "") or "")
             doc_type = RagflowClient._detect_doc_type(doc_name)
-            positions = chunk.get("positions", [])
-
-            page_num = None
-            chunk_index = None
-            coords = None
-
-            if positions and isinstance(positions, list) and len(positions) > 0:
-                pos = positions[0]
-                if isinstance(pos, list) and len(pos) >= 1:
-                    if RagflowClient._has_page_number(doc_type):
-                        # PDF / PPT: first value is a real page or slide number
-                        page_num = int(pos[0])
-                        if RagflowClient._has_coordinates(doc_type) and len(pos) >= 5:
-                            coords = [float(pos[1]), float(pos[2]),
-                                       float(pos[3]), float(pos[4])]
-                    else:
-                        # Excel / DOCX / other: chunk/row index only
-                        chunk_index = int(pos[0])
-
-            # Build URLs through the assessment proxy so that raw RAGFlow
-            # links are never exposed to clients.
-            image_id = chunk.get("image_id")
-            image_url = None
-            if image_id:
-                image_url = f"/api/v1/proxy/image/{image_id}"
-
-            doc_id = chunk.get("document_id")
-            doc_url = None
-            if doc_id:
-                doc_url = f"/api/v1/proxy/document/{doc_id}"
-                if page_num is not None:
-                    doc_url += f"#page={page_num}"
-
-            content = chunk.get("content", "").strip()
-            snippet = (content[:300] + "...") if len(content) > 300 else content
+            reference_type = str(chunk.get("doc_type") or chunk.get("doc_type_kwd") or "").strip() or "text"
+            image_id = RagflowClient._first_present(chunk, "image_id", "img_id")
+            image_url = f"/api/v1/proxy/image/{image_id}" if image_id else None
+            doc_id = RagflowClient._first_present(chunk, "document_id", "doc_id")
+            doc_url = f"/api/v1/proxy/document/{doc_id}" if doc_id else None
+            dataset_id = RagflowClient._first_present(chunk, "dataset_id", "kb_id")
+            preview = RagflowClient._build_preview(reference_type, chunk.get("content", ""), image_url)
+            extra_fields = {k: v for k, v in chunk.items() if k not in known_keys}
 
             results.append(
                 {
-                    "document_name": doc_name,
-                    "document_type": doc_type,
-                    "page_number": page_num,
-                    "chunk_index": chunk_index,
-                    "coordinates": coords,
-                    "snippet": snippet,
-                    "image_url": image_url,
-                    "document_url": doc_url,
+                    "reference_type": reference_type,
+                    "document": {
+                        "document_id": doc_id,
+                        "dataset_id": dataset_id,
+                        "image_id": image_id,
+                        "document_name": doc_name,
+                        "document_type": doc_type,
+                        "media_family": RagflowClient._detect_media_family(doc_type),
+                    },
+                    "location": RagflowClient._build_location(doc_type, chunk.get("positions", [])),
+                    "preview": preview,
+                    "links": {
+                        "document_url": doc_url,
+                        "image_url": image_url,
+                        "source_url": chunk.get("url"),
+                    },
+                    "retrieval": {
+                        "score": chunk.get("similarity"),
+                        "vector_score": chunk.get("vector_similarity"),
+                        "term_score": chunk.get("term_similarity"),
+                    },
+                    "source_metadata": {
+                        "provider": "ragflow",
+                        "provider_reference_type": str(chunk.get("doc_type") or chunk.get("doc_type_kwd") or "").strip(),
+                        "extra_fields": extra_fields,
+                    },
                 }
             )
         return results

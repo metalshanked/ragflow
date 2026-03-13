@@ -335,15 +335,13 @@ def build_results_excel(results: list[QuestionResult]) -> bytes:
     for r in results:
         ref_texts = []
         for ref in r.references:
-            parts = [ref.document_name]
-            if ref.document_type:
-                parts.append(f"[{ref.document_type.upper()}]")
-            if ref.page_number is not None:
-                parts.append(f"Page {ref.page_number}")
-            elif ref.chunk_index is not None:
-                parts.append(f"Chunk/Row {ref.chunk_index}")
-            if ref.snippet:
-                parts.append(ref.snippet[:120])
+            parts = [ref.document.document_name]
+            if ref.document.document_type:
+                parts.append(f"[{ref.document.document_type.upper()}]")
+            if ref.location.label:
+                parts.append(ref.location.label)
+            if ref.preview.text_excerpt:
+                parts.append(ref.preview.text_excerpt[:120])
             ref_texts.append(" | ".join(parts))
         ws.append([
             r.question_serial_no,

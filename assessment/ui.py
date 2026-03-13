@@ -173,11 +173,24 @@ button.link-card{width:100%;text-align:left;font:inherit}
 .link-card code{display:block;font-size:.8rem;color:var(--muted);word-break:break-all}
 .api-link-status{font-size:.84rem;color:var(--muted);margin-top:1rem;min-height:1.2rem}
 .api-link-result{margin-top:.75rem;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:1rem;font-size:.84rem;overflow:auto;max-height:360px;white-space:pre-wrap;word-break:break-word}
-/* Image modal */
+/* Reference modal */
 .modal-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6);z-index:1000;display:flex;align-items:center;justify-content:center}
 .modal-content{background:#fff;border-radius:var(--radius);padding:1rem;max-width:90vw;max-height:90vh;overflow:auto;position:relative}
 .modal-content img{max-width:100%;max-height:80vh;display:block;margin:0 auto}
 .modal-close{position:absolute;top:.5rem;right:.5rem;background:var(--danger);color:#fff;border:none;border-radius:50%;width:28px;height:28px;cursor:pointer;font-size:1rem;line-height:1}
+.modal-content.modal-document{width:min(96vw,1200px);max-width:min(96vw,1200px);padding:1rem 1rem 1.25rem}
+.modal-title{font-size:1rem;font-weight:600;padding-right:2rem}
+.modal-body{margin-top:.85rem}
+.modal-body iframe{width:100%;height:78vh;border:1px solid var(--border);border-radius:var(--radius);background:#fff}
+.modal-body pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:.9rem;max-height:72vh;overflow:auto}
+.modal-toolbar{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin-bottom:.75rem}
+.modal-toolbar a{color:var(--primary);text-decoration:none;font-size:.84rem}
+.modal-toolbar a:hover{text-decoration:underline}
+.reference-html{background:#fff;border:1px solid var(--border);border-radius:var(--radius);padding:.9rem;max-height:72vh;overflow:auto}
+.reference-html table{margin-top:0}
+.reference-html img{max-width:100%;height:auto}
+.reference-score{font-size:.78rem;color:var(--muted)}
+.reference-empty{font-size:.84rem;color:var(--muted)}
 /* Auto-refresh toggle */
 .auto-refresh{display:flex;align-items:center;gap:.5rem;font-size:.85rem}
 .auto-refresh label{margin:0;font-weight:normal}
@@ -864,18 +877,196 @@ function toggleAutoRefresh(){
 }
 
 /* ------------------------------------------------------------------ */
-/* Image modal                                                         */
+/* Reference modal                                                     */
 /* ------------------------------------------------------------------ */
-function showImageModal(url){
+let _modalObjectUrls = [];
+function _trackModalObjectUrl(url){
+  if(url)_modalObjectUrls.push(url);
+  return url;
+}
+function _clearModalObjectUrls(){
+  while(_modalObjectUrls.length){
+    const url=_modalObjectUrls.pop();
+    try{URL.revokeObjectURL(url);}catch(_e){}
+  }
+}
+function _withBasePath(url){
+  if(!url)return '';
+  if(/^https?:\/\//i.test(url) || /^blob:/i.test(url) || /^data:/i.test(url))return url;
+  return url.charAt(0)==='/' ? BASE_PATH + url : url;
+}
+function _parseRefPayload(raw){
+  try{return JSON.parse(raw);}catch(_e){return null;}
+}
+function _normalizeReference(raw){
+  const ref=raw||{};
+  const doc=ref.document||{};
+  const location=ref.location||{};
+  const preview=ref.preview||{};
+  const links=ref.links||{};
+  const retrieval=ref.retrieval||{};
+  const highlight=location.highlight_box||{};
+  return {
+    raw: ref,
+    referenceType: String(ref.reference_type||'').trim(),
+    documentName: String(doc.document_name||'').trim(),
+    documentType: String(doc.document_type||'').trim(),
+    mediaFamily: String(doc.media_family||'').trim(),
+    pageNumber: location.page_number!=null ? location.page_number : null,
+    locationKind: String(location.kind||'').trim(),
+    locationLabel: String(location.label||'').trim(),
+    textExcerpt: String(preview.text_excerpt||'').trim(),
+    fullContent: String(preview.full_content||'').trim(),
+    htmlContent: String(preview.html_content||'').trim(),
+    tableHtml: String(preview.table_html||'').trim(),
+    contentFormat: String(preview.content_format||'none').trim(),
+    hasInlinePreview: !!preview.has_inline_preview,
+    documentUrl: links.document_url || null,
+    imageUrl: links.image_url || null,
+    sourceUrl: links.source_url || null,
+    score: typeof retrieval.score === 'number' ? retrieval.score : null,
+    vectorScore: typeof retrieval.vector_score === 'number' ? retrieval.vector_score : null,
+    termScore: typeof retrieval.term_score === 'number' ? retrieval.term_score : null,
+    highlightBox: (typeof highlight.left === 'number' && typeof highlight.right === 'number' && typeof highlight.top === 'number' && typeof highlight.bottom === 'number') ? highlight : null
+  };
+}
+function _sanitizeHtml(html){
+  const template=document.createElement('template');
+  template.innerHTML=html||'';
+  template.content.querySelectorAll('script,iframe,object,embed,link,meta,style').forEach(function(node){node.remove();});
+  template.content.querySelectorAll('*').forEach(function(node){
+    Array.from(node.attributes).forEach(function(attr){
+      const name=(attr.name||'').toLowerCase();
+      const value=attr.value||'';
+      if(name.startsWith('on')){node.removeAttribute(attr.name);return;}
+      if((name==='src' || name==='href') && /^\s*javascript:/i.test(value)){node.removeAttribute(attr.name);}
+    });
+  });
+  return template.innerHTML;
+}
+function _looksLikeHtmlContent(text){
+  return /<table[\s>]|<tr[\s>]|<td[\s>]|<th[\s>]|<img[\s>]|<p[\s>]|<div[\s>]|<span[\s>]/i.test(text||'');
+}
+function _openModal(title, bodyHtml, extraClass){
   const m=document.getElementById('img-modal');
   m.className='modal-overlay';
-  m.innerHTML='<div class="modal-content"><button class="modal-close" onclick="closeImageModal()">&times;</button><img src="'+escAttr(url)+'" alt="Reference image"/></div>';
+  m.innerHTML='<div class="modal-content '+(extraClass||'')+'"><button class="modal-close" onclick="closeImageModal()">&times;</button><div class="modal-title">'+escHtml(title||'Reference Preview')+'</div><div class="modal-body">'+bodyHtml+'</div></div>';
   m.onclick=function(e){if(e.target===m)closeImageModal();};
+}
+async function _fetchProtectedResource(url, init){
+  if(AUTH_MODE !== 'disabled'){
+    const sessionOk=await ensureActiveSession(true);
+    if(!sessionOk)throw new Error('Session expired. Please sign in again.');
+  }
+  const merged=Object.assign({}, init||{});
+  merged.headers=Object.assign({}, (init&&init.headers)||{}, headers());
+  return await fetch(_withBasePath(url), merged);
 }
 function closeImageModal(){
   const m=document.getElementById('img-modal');
+  _clearModalObjectUrls();
   m.className='hidden';
   m.innerHTML='';
+}
+async function showImageModal(url, title){
+  _openModal(title||'Reference image', '<p class="reference-empty">Loading image…</p>', 'modal-document');
+  try{
+    const response=await _fetchProtectedResource(url);
+    if(!response.ok){
+      const text=await response.text().catch(function(){return '';});
+      throw new Error(text || ('Image request failed ('+response.status+')'));
+    }
+    const blob=await response.blob();
+    const objectUrl=_trackModalObjectUrl(URL.createObjectURL(blob));
+    _openModal(title||'Reference image', '<img src="'+escAttr(objectUrl)+'" alt="Reference image"/>', 'modal-document');
+  }catch(e){
+    _openModal(title||'Reference image', '<p style="color:var(--danger)">'+escHtml(e.message||'Failed to load image.')+'</p>', 'modal-document');
+  }
+}
+function openReferenceImage(rawRef){
+  const parsed=_parseRefPayload(rawRef);
+  const ref=_normalizeReference(parsed);
+  if(!parsed || !ref.imageUrl){toast('Reference image is unavailable','err');return;}
+  void showImageModal(ref.imageUrl, ref.documentName || 'Reference image');
+}
+function _renderCsvTable(text){
+  const lines=(text||'').split(/\r?\n/).filter(Boolean);
+  if(!lines.length)return '<p class="reference-empty">No table rows available.</p>';
+  const rows=lines.map(function(line){return line.split(',');});
+  let html='<div class="reference-html"><table>';
+  rows.forEach(function(row,rowIdx){
+    html+='<tr>';
+    row.forEach(function(cell){
+      html+='<'+(rowIdx===0?'th':'td')+'>'+escHtml(cell.trim())+'</'+(rowIdx===0?'th':'td')+'>';
+    });
+    html+='</tr>';
+  });
+  html+='</table></div>';
+  return html;
+}
+async function openReferenceDocument(rawRef){
+  const parsed=_parseRefPayload(rawRef);
+  const ref=_normalizeReference(parsed);
+  if(!parsed || !ref.documentUrl){toast('Reference document is unavailable','err');return;}
+  _openModal(ref.documentName || 'Reference document', '<p class="reference-empty">Loading document…</p>', 'modal-document');
+  try{
+    const response=await _fetchProtectedResource(ref.documentUrl);
+    if(!response.ok){
+      const text=await response.text().catch(function(){return '';});
+      throw new Error(text || ('Document request failed ('+response.status+')'));
+    }
+    const blob=await response.blob();
+    const objectUrl=_trackModalObjectUrl(URL.createObjectURL(blob));
+    const contentType=(response.headers.get('content-type')||'').toLowerCase();
+    const downloadName=ref.documentName || 'reference';
+    let body='<div class="modal-toolbar"><a href="'+escAttr(objectUrl)+'" download="'+escAttr(downloadName)+'">Download</a></div>';
+    if(contentType.indexOf('pdf')>=0){
+      const pdfUrl=objectUrl + (ref.pageNumber!=null ? '#page='+encodeURIComponent(String(ref.pageNumber)) : '');
+      body+='<iframe src="'+escAttr(pdfUrl)+'" title="'+escAttr(downloadName)+'"></iframe>';
+    }else if(contentType.indexOf('image/')===0){
+      body+='<img src="'+escAttr(objectUrl)+'" alt="'+escAttr(downloadName)+'"/>';
+    }else{
+      const isTextLike=
+        contentType.indexOf('text/')===0 ||
+        contentType.indexOf('json')>=0 ||
+        contentType.indexOf('xml')>=0 ||
+        contentType.indexOf('csv')>=0 ||
+        contentType.indexOf('html')>=0;
+      const text=isTextLike ? await blob.text().catch(function(){return '';}) : '';
+      if(contentType.indexOf('text/csv')>=0 || (ref.documentType==='excel' && !ref.fullContent && text)){
+        body+=_renderCsvTable(text);
+      }else if(ref.tableHtml){
+        body+='<div class="reference-html">'+_sanitizeHtml(ref.tableHtml)+'</div>';
+      }else if(ref.htmlContent){
+        body+='<div class="reference-html">'+_sanitizeHtml(ref.htmlContent)+'</div>';
+      }else if(_looksLikeHtmlContent(ref.fullContent||text) || ref.referenceType==='table'){
+        body+='<div class="reference-html">'+_sanitizeHtml(ref.fullContent||text)+'</div>';
+      }else if(text){
+        body+='<pre>'+escHtml(text)+'</pre>';
+      }else if(ref.fullContent){
+        body+='<div class="reference-html">'+_sanitizeHtml(ref.fullContent)+'</div>';
+      }else{
+        body+='<p class="reference-empty">No inline preview is available for this file type. Use Download to open the original document.</p>';
+      }
+    }
+    _openModal(ref.documentName || 'Reference document', body, 'modal-document');
+  }catch(e){
+    _openModal(ref.documentName || 'Reference document', '<p style="color:var(--danger)">'+escHtml(e.message||'Failed to load document.')+'</p>', 'modal-document');
+  }
+}
+function openReferenceContent(rawRef){
+  const parsed=_parseRefPayload(rawRef);
+  const ref=_normalizeReference(parsed);
+  if(!parsed){toast('Reference preview is unavailable','err');return;}
+  const rawContent=String(ref.tableHtml||ref.htmlContent||ref.fullContent||ref.textExcerpt||'').trim();
+  if(!rawContent){toast('No inline reference content is available','err');return;}
+  let body='';
+  if(ref.tableHtml || ref.htmlContent || _looksLikeHtmlContent(rawContent) || ref.referenceType==='table'){
+    body='<div class="reference-html">'+_sanitizeHtml(rawContent)+'</div>';
+  }else{
+    body='<pre>'+escHtml(rawContent)+'</pre>';
+  }
+  _openModal(ref.documentName || 'Reference content', body, 'modal-document');
 }
 
 // ----- TASKS -----
@@ -1070,37 +1261,44 @@ async function loadResults(){
 }
 
 function buildRefCard(ref){
+  const view=_normalizeReference(ref);
   let html='<div class="ref-card">';
   html+='<div class="ref-card-header">';
-  if(ref.document_type){
-    const cls=ref.document_type.toLowerCase();
-    html+='<span class="ref-type-badge '+escAttr(cls)+'">'+escHtml(ref.document_type)+'</span>';
+  if(view.documentType){
+    const cls=view.documentType.toLowerCase();
+    html+='<span class="ref-type-badge '+escAttr(cls)+'">'+escHtml(view.documentType)+'</span>';
   }
-  html+='<strong>'+escHtml(ref.document_name||'Unknown document')+'</strong>';
+  html+='<strong>'+escHtml(view.documentName||'Unknown document')+'</strong>';
   // Meta info
   let meta=[];
-  if(ref.page_number!=null) meta.push('Page '+ref.page_number);
-  if(ref.chunk_index!=null) meta.push('Chunk '+ref.chunk_index);
-  if(ref.coordinates&&ref.coordinates.length===4) meta.push('Coords: ['+ref.coordinates.map(function(c){return c.toFixed(1)}).join(', ')+']');
+  if(view.referenceType) meta.push('Reference type: '+view.referenceType);
+  if(view.locationLabel) meta.push(view.locationLabel);
   if(meta.length) html+='<span class="ref-meta">'+escHtml(meta.join(' \u2022 '))+'</span>';
   html+='</div>';
+  const scores=[];
+  if(typeof view.score === 'number') scores.push('Similarity '+view.score.toFixed(3));
+  if(typeof view.vectorScore === 'number') scores.push('Vector '+view.vectorScore.toFixed(3));
+  if(typeof view.termScore === 'number') scores.push('Term '+view.termScore.toFixed(3));
+  if(scores.length){
+    html+='<div class="reference-score">'+escHtml(scores.join(' \u2022 '))+'</div>';
+  }
   // Snippet
-  if(ref.snippet){
-    html+='<div class="ref-snippet">'+escHtml(ref.snippet)+'</div>';
+  if(view.textExcerpt){
+    html+='<div class="ref-snippet">'+escHtml(view.textExcerpt)+'</div>';
   }
   // Links
   let links=[];
-  if(ref.document_url){
-    const fullUrl=BASE_PATH+ref.document_url;
-    links.push('<a href="'+escAttr(fullUrl)+'" target="_blank" title="Download document">&#128196; Document</a>');
+  const refPayload=escAttr(JSON.stringify(ref));
+  if(view.hasInlinePreview){
+    const contentLabel = view.referenceType === 'table' ? '&#128202; Table View' : '&#128196; Excerpt';
+    links.push('<a href="javascript:void(0)" data-ref="'+refPayload+'" onclick="openReferenceContent(this.dataset.ref)" title="Open excerpt in modal">'+contentLabel+'</a>');
   }
-  if(ref.image_url){
-    const fullImgUrl=BASE_PATH+ref.image_url;
-    links.push('<a href="javascript:void(0)" onclick="showImageModal(\''+escAttr(fullImgUrl)+'\')" title="View image">&#128444; Image</a>');
+  if(view.imageUrl){
+    links.push('<a href="javascript:void(0)" data-ref="'+refPayload+'" onclick="openReferenceImage(this.dataset.ref)" title="View image">&#128444; Image</a>');
   }
-  if(ref.page_number!=null && ref.document_url){
-    const pdfUrl=BASE_PATH+ref.document_url;
-    links.push('<a href="'+escAttr(pdfUrl)+'" target="_blank" title="Open at page">&#128279; Page '+ref.page_number+'</a>');
+  if(view.documentUrl){
+    const docLabel = view.pageNumber!=null ? '&#128214; Open Page '+view.pageNumber : '&#128196; Open Document';
+    links.push('<a href="javascript:void(0)" data-ref="'+refPayload+'" onclick="openReferenceDocument(this.dataset.ref)" title="Open document in modal">'+docLabel+'</a>');
   }
   if(links.length){
     html+='<div class="ref-links">'+links.join('')+'</div>';

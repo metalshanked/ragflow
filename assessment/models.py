@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 # Enums
 # ---------------------------------------------------------------------------
 
+
 class TaskState(str, enum.Enum):
     PENDING = "pending"
     AWAITING_DOCUMENTS = "awaiting_documents"  # session created, waiting for doc uploads
@@ -37,24 +38,76 @@ class PipelineStage(str, enum.Enum):
 # Reference / Result models
 # ---------------------------------------------------------------------------
 
+
 class DocumentStatus(BaseModel):
     """Per-document parsing status reported back in the task response."""
+
     document_id: str
     document_name: str = ""
     status: str = "pending"  # pending | running | success | failed | timeout | not_found
-    progress: float = 0.0  # 0.0 – 1.0
+    progress: float = 0.0  # 0.0 - 1.0
     message: str = ""  # human-readable status / error detail
 
 
-class Reference(BaseModel):
+class ReferenceDocument(BaseModel):
+    document_id: Optional[str] = None
+    dataset_id: Optional[str] = None
+    image_id: Optional[str] = None
     document_name: str = ""
-    document_type: str = ""  # e.g. "pdf", "excel", "docx", "ppt", "md", "txt", …
-    page_number: Optional[int] = None  # PDF page number or PPT/PPTX slide number
-    chunk_index: Optional[int] = None  # Excel / DOCX / other non-PDF/PPT (0-based chunk/row index)
-    coordinates: Optional[list[float]] = None  # PDF bounding-box [x1, x2, y1, y2]
-    snippet: str = ""
-    image_url: Optional[str] = None
+    document_type: str = ""
+    media_family: str = ""
+
+
+class ReferenceHighlightBox(BaseModel):
+    left: float
+    right: float
+    top: float
+    bottom: float
+
+
+class ReferenceLocation(BaseModel):
+    kind: str = ""  # page | slide | row | chunk
+    value: Optional[int] = None
+    label: str = ""
+    page_number: Optional[int] = None
+    highlight_box: Optional[ReferenceHighlightBox] = None
+
+
+class ReferencePreview(BaseModel):
+    text_excerpt: str = ""
+    full_content: str = ""
+    content_format: str = "none"  # none | text | html | table_html
+    html_content: str = ""
+    table_html: str = ""
+    has_inline_preview: bool = False
+
+
+class ReferenceLinks(BaseModel):
     document_url: Optional[str] = None
+    image_url: Optional[str] = None
+    source_url: Optional[str] = None
+
+
+class ReferenceRetrieval(BaseModel):
+    score: Optional[float] = None
+    vector_score: Optional[float] = None
+    term_score: Optional[float] = None
+
+
+class ReferenceSourceMetadata(BaseModel):
+    provider: str = "ragflow"
+    provider_reference_type: str = ""
+    extra_fields: dict[str, Any] = Field(default_factory=dict)
+
+
+class Reference(BaseModel):
+    reference_type: str = ""
+    document: ReferenceDocument = Field(default_factory=ReferenceDocument)
+    location: ReferenceLocation = Field(default_factory=ReferenceLocation)
+    preview: ReferencePreview = Field(default_factory=ReferencePreview)
+    links: ReferenceLinks = Field(default_factory=ReferenceLinks)
+    retrieval: ReferenceRetrieval = Field(default_factory=ReferenceRetrieval)
+    source_metadata: ReferenceSourceMetadata = Field(default_factory=ReferenceSourceMetadata)
 
 
 class QuestionResult(BaseModel):
@@ -70,6 +123,7 @@ class QuestionResult(BaseModel):
 # ---------------------------------------------------------------------------
 # Task models
 # ---------------------------------------------------------------------------
+
 
 class ActorInfo(BaseModel):
     username: str = ""
@@ -169,8 +223,10 @@ class AuditEvent(BaseModel):
 # Request models
 # ---------------------------------------------------------------------------
 
+
 class AssessmentRequest(BaseModel):
     """Body for the /assess endpoint (non-file fields)."""
+
     dataset_name: Optional[str] = None
     chat_name: Optional[str] = None
     question_id_column: Optional[str] = None
@@ -184,6 +240,7 @@ class AssessmentRequest(BaseModel):
 
 class SessionCreateResponse(BaseModel):
     """Response returned when a new assessment session is created (two-phase flow)."""
+
     task_id: str
     dataset_id: str
     state: TaskState = TaskState.AWAITING_DOCUMENTS
@@ -192,6 +249,7 @@ class SessionCreateResponse(BaseModel):
 
 class DocumentUploadResponse(BaseModel):
     """Response after uploading documents to an assessment session."""
+
     task_id: str
     dataset_id: str
     uploaded_document_ids: list[str] = Field(default_factory=list)
@@ -203,8 +261,10 @@ class DocumentUploadResponse(BaseModel):
 # RAGFlow-related internal models
 # ---------------------------------------------------------------------------
 
+
 class RagflowContext(BaseModel):
     """Tracks RAGFlow resource IDs created for one assessment task."""
+
     dataset_id: str = ""
     dataset_ids: list[str] = Field(default_factory=list)
     document_ids: list[str] = Field(default_factory=list)
@@ -216,6 +276,7 @@ class RagflowContext(BaseModel):
 
 class TaskRecord(BaseModel):
     """Full internal record kept in the in-memory store."""
+
     task_id: str
     status: TaskStatus
     ragflow: RagflowContext = Field(default_factory=RagflowContext)

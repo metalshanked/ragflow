@@ -35,6 +35,11 @@ def test_ui_page_includes_icon_links_and_header_logo():
     assert "assessment_access_token_expires_at" in response.text
     assert "ensureActiveSession(false);" in response.text
     assert "runApiLink('link-assessments')" in response.text
+    assert "openReferenceDocument(this.dataset.ref)" in response.text
+    assert "openReferenceImage(this.dataset.ref)" in response.text
+    assert "openReferenceContent(this.dataset.ref)" in response.text
+    assert "async function _fetchProtectedResource" in response.text
+    assert 'class="reference-html"' in response.text
     assert "AUTH_MODE = authType;" in response.text
     assert "initApiLinks();" in response.text
     assert "Refresh Token" not in response.text

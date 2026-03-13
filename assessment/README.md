@@ -685,25 +685,88 @@ GET /api/v1/assessments/{task_id}/results?page=1&page_size=50
       "details": "The evidence document contains a comprehensive data privacy policy...",
       "references": [
         {
-          "document_name": "privacy_policy.pdf",
-          "document_type": "pdf",
-          "page_number": 3,
-          "chunk_index": null,
-          "coordinates": [120.0, 540.0, 80.0, 400.0],
-          "snippet": "Section 2.1 defines the organization's approach to data privacy...",
-          "document_url": "/api/v1/proxy/document/doc123#page=3",
-          "image_url": "/api/v1/proxy/image/img456"
+          "reference_type": "text",
+          "document": {
+            "document_id": "doc123",
+            "dataset_id": "ds123",
+            "image_id": "img456",
+            "document_name": "privacy_policy.pdf",
+            "document_type": "pdf",
+            "media_family": "pdf"
+          },
+          "location": {
+            "kind": "page",
+            "value": 3,
+            "label": "Page 3",
+            "page_number": 3,
+            "highlight_box": null
+          },
+          "preview": {
+            "text_excerpt": "Section 2.1 defines the organization's approach to data privacy...",
+            "full_content": "Section 2.1 defines the organization's approach to data privacy...",
+            "content_format": "text",
+            "html_content": "",
+            "table_html": "",
+            "has_inline_preview": true
+          },
+          "links": {
+            "document_url": "/api/v1/proxy/document/doc123",
+            "image_url": "/api/v1/proxy/image/img456",
+            "source_url": null
+          },
+          "retrieval": {
+            "score": 0.82,
+            "vector_score": 0.77,
+            "term_score": 0.69
+          },
+          "source_metadata": {
+            "provider": "ragflow",
+            "provider_reference_type": "",
+            "extra_fields": {}
+          }
         },
         {
-          "document_name": "Evidence_List.xlsx",
-          "document_type": "excel",
-          "page_number": null,
-          "chunk_index": 36,
-          "coordinates": null,
-          "snippet": "P07: Physical – Access Controls ...",
-          "document_url": "/api/v1/proxy/document/doc789",
-          "image_url": null
+          "reference_type": "text",
+          "document": {
+            "document_id": "doc789",
+            "dataset_id": "ds123",
+            "image_id": null,
+            "document_name": "Evidence_List.xlsx",
+            "document_type": "excel",
+            "media_family": "spreadsheet"
+          },
+          "location": {
+            "kind": "row",
+            "value": 36,
+            "label": "Row 36",
+            "page_number": null,
+            "highlight_box": null
+          },
+          "preview": {
+            "text_excerpt": "P07: Physical - Access Controls ...",
+            "full_content": "P07: Physical - Access Controls ...",
+            "content_format": "text",
+            "html_content": "",
+            "table_html": "",
+            "has_inline_preview": true
+          },
+          "links": {
+            "document_url": "/api/v1/proxy/document/doc789",
+            "image_url": null,
+            "source_url": null
+          },
+          "retrieval": {
+            "score": 0.74,
+            "vector_score": 0.71,
+            "term_score": 0.63
+          },
+          "source_metadata": {
+            "provider": "ragflow",
+            "provider_reference_type": "",
+            "extra_fields": {}
+          }
         }
+      ]
       ]
     }
   ],
@@ -838,46 +901,77 @@ This can be controlled at three levels (highest priority first):
 
 ### Document-Type-Aware References
 
-The reference model adapts its fields based on the source document type. RAGFlow stores positional data differently depending on the file format:
+The reference model is a packaged wrapper over RAGFlow references. Each reference now includes nested `document`, `location`, `preview`, `links`, `retrieval`, and `source_metadata` sections.
 
-| Document type | `page_number` | `chunk_index` | `coordinates` | `image_url` |
-|---|---|---|---|---|
-| **PDF** | ✔ Real page number | `null` | ✔ Bounding box `[x1, x2, y1, y2]` | ✔ Chunk image preview |
-| **Excel** | `null` | ✔ Row/chunk index (0-based) | `null` | `null` |
-| **DOCX** | `null` | ✔ Chunk index (0-based) | `null` | `null` |
-| **PPT/PPTX** | ✔ Real slide number | `null` | `null` | `null` |
-| **Other** (md, txt, html…) | `null` | ✔ Chunk index (0-based) | `null` | `null` |
+Key packaging rules:
 
-**How it works internally:** RAGFlow’s `positions` field is a list of `[a, b, c, d, e]` arrays. For PDFs, this encodes `[page, x1, x2, y1, y2]` with real page numbers and bounding-box coordinates. For PPT/PPTX, RAGFlow stores `[slide, 0, 0, 0, 0]` with real slide numbers but zero coordinates. For Excel, DOCX, and other non-PDF/non-PPT documents, RAGFlow stores `[index, index, index, index, index]` where all five values are identical — representing a chunk or row counter, **not** a page number. The API detects the document type from the file extension and populates `page_number` + `coordinates` (PDF), `page_number` only (PPT), or `chunk_index` (everything else).
+- `reference_type` is normalized from upstream `doc_type`; empty upstream values become `text`
+- `location.label` exposes user-facing positions such as `Page 3`, `Slide 4`, `Row 36`, or `Chunk 10`
+- `preview` carries text, HTML, or table content in a typed way
+- `links` uses assessment proxy URLs instead of exposing raw RAGFlow URLs
+- upstream ID aliases like `doc_id` / `kb_id` / `img_id` are normalized into `document.document_id`, `document.dataset_id`, and `document.image_id`
+- `source_metadata.extra_fields` preserves unknown upstream fields for forward compatibility
 
-### Reference Response Example
+Current response shape:
 
 ```json
 {
-  "references": [
-    {
-      "document_name": "privacy_policy.pdf",
-      "document_type": "pdf",
-      "page_number": 3,
-      "chunk_index": null,
-      "coordinates": [120.0, 540.0, 80.0, 400.0],
-      "snippet": "Section 2.1 defines the organization's approach to data privacy...",
-      "document_url": "/api/v1/proxy/document/doc123#page=3",
-      "image_url": "/api/v1/proxy/image/img456"
-    },
-    {
-      "document_name": "Evidence_List.xlsx",
-      "document_type": "excel",
-      "page_number": null,
-      "chunk_index": 36,
-      "coordinates": null,
-      "snippet": "P07: Physical – Access Controls ...",
-      "document_url": "/api/v1/proxy/document/doc789",
-      "image_url": null
-    }
-  ]
+  "reference_type": "table",
+  "document": {
+    "document_id": "doc123",
+    "dataset_id": "ds123",
+    "image_id": "img456",
+    "document_name": "control-matrix.docx",
+    "document_type": "docx",
+    "media_family": "document"
+  },
+  "location": {
+    "kind": "chunk",
+    "value": 7,
+    "label": "Chunk 7",
+    "page_number": null,
+    "highlight_box": null
+  },
+  "preview": {
+    "text_excerpt": "Access Review | IAM",
+    "full_content": "<table><tr><th>Control</th><th>Owner</th></tr><tr><td>Access Review</td><td>IAM</td></tr></table>",
+    "content_format": "table_html",
+    "html_content": "<table><tr><th>Control</th><th>Owner</th></tr><tr><td>Access Review</td><td>IAM</td></tr></table>",
+    "table_html": "<table><tr><th>Control</th><th>Owner</th></tr><tr><td>Access Review</td><td>IAM</td></tr></table>",
+    "has_inline_preview": true
+  },
+  "links": {
+    "document_url": "/api/v1/proxy/document/doc123",
+    "image_url": null,
+    "source_url": null
+  },
+  "retrieval": {
+    "score": 0.42,
+    "vector_score": 0.61,
+    "term_score": 0.22
+  },
+  "source_metadata": {
+    "provider": "ragflow",
+    "provider_reference_type": "table",
+    "extra_fields": {}
+  }
 }
 ```
+
+| Document type | `document.media_family` | Location example | Preview behavior |
+|---|---|---|---|
+| **PDF** | `pdf` | `Page 3` plus optional `highlight_box` | text, html, or table HTML |
+| **Excel / CSV** | `spreadsheet` | `Row 36` | text or table HTML |
+| **DOCX** | `document` | `Chunk 10` | text or table HTML |
+| **PPT / PPTX** | `presentation` | `Slide 4` | text |
+| **Image files** | `image` | none | image link |
+| **Text / Markdown / HTML** | `text` | `Chunk N` when available | text or html |
+| **Other / future file types** | `other` or inferred family | generic location when available | text, html, table HTML, or image link depending on upstream data |
+
+`document.document_id`, `document.dataset_id`, and `document.image_id` are preserved from upstream because they can be useful for correlation, debugging, and proxy operations. The wrapper also accepts upstream aliases such as `doc_id`, `kb_id`, and `img_id`. Unknown future upstream fields are preserved in `source_metadata.extra_fields`.
+### Reference Response Example
+
+The nested example above is the current contract.
 
 > **Note on the UI:** The RAGFlow built-in web UI (`web/src/components/`) has its own reference rendering logic that is separate from this Assessment API. The Assessment API’s citation filtering (`only_cited_references`) applies only to the Assessment API endpoints and its built-in dashboard at `/ui`. The main RAGFlow chat UI renders references using its own component (`reference-document-list.tsx`) and is not affected by these assessment settings.
 

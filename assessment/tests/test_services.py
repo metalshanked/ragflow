@@ -19,6 +19,9 @@ from assessment.models import (
     QuestionResult,
     RagflowContext,
     Reference,
+    ReferenceDocument,
+    ReferenceLocation,
+    ReferencePreview,
     TaskRecord,
     TaskState,
     TaskStatus,
@@ -218,7 +221,11 @@ class TestBuildResultsExcel(unittest.TestCase):
                 ai_response="Yes",
                 details="All good",
                 references=[
-                    Reference(document_name="doc.pdf", page_number=5, snippet="hello"),
+                    Reference(
+                        document=ReferenceDocument(document_name="doc.pdf"),
+                        location=ReferenceLocation(kind="page", value=5, label="Page 5", page_number=5),
+                        preview=ReferencePreview(text_excerpt="hello"),
+                    ),
                 ],
             ),
         ]
@@ -252,8 +259,14 @@ class TestBuildResultsExcel(unittest.TestCase):
                 question="Test?",
                 ai_response="No",
                 references=[
-                    Reference(document_name="a.pdf", page_number=1),
-                    Reference(document_name="b.xlsx", chunk_index=3),
+                    Reference(
+                        document=ReferenceDocument(document_name="a.pdf"),
+                        location=ReferenceLocation(kind="page", value=1, label="Page 1", page_number=1),
+                    ),
+                    Reference(
+                        document=ReferenceDocument(document_name="b.xlsx"),
+                        preview=ReferencePreview(text_excerpt="worksheet row"),
+                    ),
                 ],
             ),
         ]
@@ -669,11 +682,12 @@ class TestOnlyCitedReferences(unittest.TestCase):
         refs = record.results[0].references
         # Only chunks 0 and 2 should be kept
         self.assertEqual(len(refs), 2)
-        self.assertEqual(refs[0].document_name, "a.pdf")
-        self.assertEqual(refs[1].document_name, "c.xlsx")
-        # c.xlsx should have chunk_index, not page_number
-        self.assertIsNone(refs[1].page_number)
-        self.assertIsNotNone(refs[1].chunk_index)
+        self.assertEqual(refs[0].document.document_name, "a.pdf")
+        self.assertEqual(refs[1].document.document_name, "c.xlsx")
+        # c.xlsx should no longer expose raw chunk positions
+        self.assertIsNone(refs[1].location.page_number)
+        self.assertEqual(refs[1].reference_type, "text")
+        self.assertEqual(refs[1].preview.text_excerpt, "chunk2")
 
     @patch.object(_services_mod, "RagflowClient")
     def test_all_refs_when_disabled(self, MockClient):

@@ -570,23 +570,67 @@ class TestExtractReferences(unittest.TestCase):
             "reference": {
                 "chunks": [
                     {
+                        "document_id": "doc-1",
+                        "dataset_id": "ds-1",
+                        "image_id": "img-1",
                         "document_name": "test.pdf",
                         "content": "some content",
                         "positions": [[1, 10, 20, 100, 200]],
+                        "doc_type": "table",
+                        "similarity": 0.3,
+                        "vector_similarity": 0.49,
+                        "term_similarity": 0.21,
                     }
                 ]
             }
         }
         refs = RagflowClient.extract_references(response)
         self.assertGreaterEqual(len(refs), 1)
-        self.assertEqual(refs[0]["document_name"], "test.pdf")
-        self.assertEqual(refs[0]["document_type"], "pdf")
-        self.assertEqual(refs[0]["page_number"], 1)
-        self.assertIsNone(refs[0]["chunk_index"])
-        self.assertEqual(refs[0]["coordinates"], [10.0, 20.0, 100.0, 200.0])
+        self.assertEqual(refs[0]["document"]["document_name"], "test.pdf")
+        self.assertEqual(refs[0]["document"]["document_type"], "pdf")
+        self.assertEqual(refs[0]["document"]["media_family"], "pdf")
+        self.assertEqual(refs[0]["reference_type"], "table")
+        self.assertEqual(refs[0]["location"]["page_number"], 1)
+        self.assertEqual(refs[0]["location"]["label"], "Page 1")
+        self.assertEqual(refs[0]["location"]["highlight_box"]["left"], 10.0)
+        self.assertEqual(refs[0]["document"]["document_id"], "doc-1")
+        self.assertEqual(refs[0]["document"]["dataset_id"], "ds-1")
+        self.assertEqual(refs[0]["document"]["image_id"], "img-1")
+        self.assertEqual(refs[0]["links"]["image_url"], "/api/v1/proxy/image/img-1")
+        self.assertEqual(refs[0]["links"]["document_url"], "/api/v1/proxy/document/doc-1")
+        self.assertEqual(refs[0]["preview"]["full_content"], "some content")
+        self.assertEqual(refs[0]["preview"]["text_excerpt"], "some content")
+        self.assertEqual(refs[0]["preview"]["content_format"], "table_html")
+        self.assertEqual(refs[0]["retrieval"]["score"], 0.3)
+        self.assertEqual(refs[0]["retrieval"]["vector_score"], 0.49)
+        self.assertEqual(refs[0]["retrieval"]["term_score"], 0.21)
 
-    def test_excel_gets_chunk_index_not_page(self):
-        """Excel positions like [[26, 25, 25, 25, 25]] must NOT be treated as PDF pages."""
+    def test_alias_upstream_ids_are_normalized(self):
+        response = {
+            "reference": {
+                "chunks": [
+                    {
+                        "doc_id": "doc-alias-1",
+                        "kb_id": "kb-alias-1",
+                        "img_id": "img-alias-1",
+                        "document_name": "diagram.png",
+                        "content": "",
+                        "doc_type_kwd": "image",
+                    }
+                ]
+            }
+        }
+        refs = RagflowClient.extract_references(response)
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0]["document"]["document_id"], "doc-alias-1")
+        self.assertEqual(refs[0]["document"]["dataset_id"], "kb-alias-1")
+        self.assertEqual(refs[0]["document"]["image_id"], "img-alias-1")
+        self.assertEqual(refs[0]["links"]["document_url"], "/api/v1/proxy/document/doc-alias-1")
+        self.assertEqual(refs[0]["links"]["image_url"], "/api/v1/proxy/image/img-alias-1")
+        self.assertEqual(refs[0]["reference_type"], "image")
+
+    def test_excel_does_not_expose_internal_positions(self):
+        """Excel positions are internal and must not leak into the wrapper response."""
         response = {
             "reference": {
                 "chunks": [
@@ -600,13 +644,16 @@ class TestExtractReferences(unittest.TestCase):
         }
         refs = RagflowClient.extract_references(response)
         self.assertEqual(len(refs), 1)
-        self.assertEqual(refs[0]["document_type"], "excel")
-        self.assertIsNone(refs[0]["page_number"])
-        self.assertEqual(refs[0]["chunk_index"], 26)
-        self.assertIsNone(refs[0]["coordinates"])
+        self.assertEqual(refs[0]["document"]["document_type"], "excel")
+        self.assertEqual(refs[0]["document"]["media_family"], "spreadsheet")
+        self.assertIsNone(refs[0]["location"]["page_number"])
+        self.assertEqual(refs[0]["location"]["kind"], "row")
+        self.assertEqual(refs[0]["location"]["value"], 26)
+        self.assertEqual(refs[0]["reference_type"], "text")
+        self.assertEqual(refs[0]["preview"]["full_content"], "excel content")
 
-    def test_excel_identical_positions(self):
-        """Excel with identical position values should also get chunk_index."""
+    def test_excel_identical_positions_still_produce_preview_fields(self):
+        """Excel references still produce clean preview fields."""
         response = {
             "reference": {
                 "chunks": [
@@ -619,11 +666,12 @@ class TestExtractReferences(unittest.TestCase):
             }
         }
         refs = RagflowClient.extract_references(response)
-        self.assertEqual(refs[0]["chunk_index"], 5)
-        self.assertIsNone(refs[0]["page_number"])
+        self.assertEqual(refs[0]["preview"]["full_content"], "some data")
+        self.assertEqual(refs[0]["preview"]["text_excerpt"], "some data")
+        self.assertIsNone(refs[0]["location"]["page_number"])
 
-    def test_docx_gets_chunk_index(self):
-        """DOCX should get chunk_index regardless of position values."""
+    def test_docx_normalizes_empty_type_to_text(self):
+        """DOCX references default to text when upstream type is empty."""
         response = {
             "reference": {
                 "chunks": [
@@ -636,12 +684,37 @@ class TestExtractReferences(unittest.TestCase):
             }
         }
         refs = RagflowClient.extract_references(response)
-        self.assertEqual(refs[0]["document_type"], "docx")
-        self.assertIsNone(refs[0]["page_number"])
-        self.assertEqual(refs[0]["chunk_index"], 10)
+        self.assertEqual(refs[0]["document"]["document_type"], "docx")
+        self.assertEqual(refs[0]["document"]["media_family"], "document")
+        self.assertEqual(refs[0]["reference_type"], "text")
+        self.assertIsNone(refs[0]["location"]["page_number"])
+        self.assertEqual(refs[0]["location"]["kind"], "chunk")
+        self.assertEqual(refs[0]["location"]["value"], 10)
+        self.assertEqual(refs[0]["preview"]["full_content"], "doc content")
 
-    def test_pptx_gets_page_number_no_coordinates(self):
-        """PPT/PPTX has real slide numbers but no bounding-box coordinates."""
+    def test_empty_upstream_doc_type_normalizes_to_text(self):
+        response = {
+            "reference": {
+                "chunks": [
+                    {
+                        "document_name": "notes.txt",
+                        "content": "plain text reference",
+                        "positions": [[4, 4, 4, 4, 4]],
+                        "doc_type": "",
+                    }
+                ]
+            }
+        }
+        refs = RagflowClient.extract_references(response)
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0]["document"]["document_type"], "txt")
+        self.assertEqual(refs[0]["document"]["media_family"], "text")
+        self.assertEqual(refs[0]["reference_type"], "text")
+        self.assertEqual(refs[0]["preview"]["text_excerpt"], "plain text reference")
+        self.assertEqual(refs[0]["source_metadata"]["provider_reference_type"], "")
+
+    def test_pptx_gets_page_number(self):
+        """PPT/PPTX exposes slide numbers as page_number."""
         response = {
             "reference": {
                 "chunks": [
@@ -655,10 +728,11 @@ class TestExtractReferences(unittest.TestCase):
         }
         refs = RagflowClient.extract_references(response)
         self.assertEqual(len(refs), 1)
-        self.assertEqual(refs[0]["document_type"], "ppt")
-        self.assertEqual(refs[0]["page_number"], 3)
-        self.assertIsNone(refs[0]["chunk_index"])
-        self.assertIsNone(refs[0]["coordinates"])
+        self.assertEqual(refs[0]["document"]["document_type"], "ppt")
+        self.assertEqual(refs[0]["document"]["media_family"], "presentation")
+        self.assertEqual(refs[0]["location"]["page_number"], 3)
+        self.assertEqual(refs[0]["location"]["kind"], "slide")
+        self.assertEqual(refs[0]["preview"]["full_content"], "slide content")
 
     def test_ppt_gets_page_number(self):
         """Old .ppt extension should also get real slide numbers."""
@@ -674,10 +748,9 @@ class TestExtractReferences(unittest.TestCase):
             }
         }
         refs = RagflowClient.extract_references(response)
-        self.assertEqual(refs[0]["document_type"], "ppt")
-        self.assertEqual(refs[0]["page_number"], 7)
-        self.assertIsNone(refs[0]["chunk_index"])
-        self.assertIsNone(refs[0]["coordinates"])
+        self.assertEqual(refs[0]["document"]["document_type"], "ppt")
+        self.assertEqual(refs[0]["location"]["page_number"], 7)
+        self.assertEqual(refs[0]["preview"]["text_excerpt"], "old slide")
 
     def test_no_reference_key(self):
         refs = RagflowClient.extract_references({"answer": "hello"})
