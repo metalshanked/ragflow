@@ -8,6 +8,7 @@ is configured) that provides a browser-based interface to all API features.
 from __future__ import annotations
 
 import base64
+from urllib.parse import quote
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, Response
@@ -32,6 +33,7 @@ APP_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" 
 APP_ICON_DATA_URI = "data:image/svg+xml;base64," + base64.b64encode(
     APP_ICON_SVG.encode("utf-8")
 ).decode("ascii")
+APP_BROWSER_ICON_DATA_URI = "data:image/svg+xml," + quote(APP_ICON_SVG, safe="")
 
 APP_FAVICON_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAACBElEQVR42sWWa0tUURSG9y+a+/0+0y8xEiOSQhRFFEMSRZQikiKURJQiFEW832acNLOLpd2vVpqjWf6Ft3Xmg1DOWnNm3HBeWJ+fZ5+z91pLnak4QursH6TO/Uay8hDJql9Inj9A4sI+EhdzSFTvIX7pJ+KXdxGv2UWsdgexuh+I1X9HtOEboo3biDZ9RaT5CyItnxG58gnhVqqrHxFu+4BQ+3uEOt4h1PkWwa43CHa/RvDaKwSubyFwYwvKSnjg5iYJWAj397yEshLuv/WCBCyE+29vkIAA15HtHFi4785zKOnkOuB5AQbu631GAsJn1wHPCzBwX99TEhD+uQ64URzce/cJlHThdMDzAgzc279OAsJt/z+2lanjKkmAgXsHHpOA8NQ4gVLDwT2DJCC980IC5YSDe4bWSEBoMlKMIWaUKQEG7rn3iASEDmdGwIwEB3ffX4WS2muxmJXg4O4HKyQg9HYzMSPBwd3DD0lAGCxmU0yCg7tGslDSVCslkgQHd40uk4AwUksNJ8HBneNpKGmZKDcnBBi4c8IQEDaZ0+QfAQbunFwiAWGN0hUO7phehJJ2OG0CDNwxs0ACwgKpTYCBO+bmSUDYXnWFg9sX5qDMrM7SPJeajHRyA25fnCUBC+H29AwJWAi3ZaahrITbslMkYCHcWPH+AiMzXFUS3KaoAAAAAElFTkSuQmCC"
@@ -50,7 +52,7 @@ async def ui_page(request: Request):
     """Serve the single-page assessment UI."""
     return HTMLResponse(
         content=_build_html(
-            favicon_href=_ui_asset_href(request, "favicon.ico"),
+            favicon_href=APP_BROWSER_ICON_DATA_URI,
             app_icon_href=APP_ICON_DATA_URI,
         ),
         status_code=200,
@@ -93,7 +95,7 @@ def _build_html(*, favicon_href: str, app_icon_href: str) -> str:
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<link rel="icon" href="__FAVICON_HREF__" sizes="any" type="image/x-icon"/>
+<link rel="icon" type="image/svg+xml" href="__FAVICON_HREF__"/>
 <title>AI Assessments</title>
 <style>
 :root{--bg:#f5f7fa;--card:#fff;--primary:#4361ee;--primary-hover:#3a56d4;--danger:#ef476f;--success:#06d6a0;--warn:#ffd166;--text:#212529;--muted:#6c757d;--border:#dee2e6;--radius:8px;--disabled:#a0aec0}
@@ -253,7 +255,7 @@ button.link-card{width:100%;text-align:left;font:inherit}
       <h3>Assessment Tasks</h3>
       <div style="display:flex;align-items:center;gap:.8rem;flex-wrap:wrap">
         <div class="auto-refresh">
-          <label><input type="checkbox" id="auto-refresh-cb" onchange="toggleAutoRefresh()"/> Auto-refresh</label>
+          <label><input type="checkbox" id="auto-refresh-cb" checked onchange="toggleAutoRefresh()"/> Auto-refresh</label>
           <select id="auto-refresh-interval" onchange="toggleAutoRefresh()" style="width:auto;padding:2px 4px;font-size:.82rem">
             <option value="5">5s</option>
             <option value="10" selected>10s</option>
@@ -261,8 +263,8 @@ button.link-card{width:100%;text-align:left;font:inherit}
             <option value="60">60s</option>
           </select>
         </div>
-        <button class="btn btn-primary btn-sm" id="btn-refresh-tasks" onclick="loadTasks()">&#128260; Refresh</button>
-        <button class="btn btn-danger btn-sm" id="btn-delete-all-tasks" onclick="openDeleteAllModal()">Delete All</button>
+        <button class="btn btn-primary btn-sm" id="btn-refresh-tasks" onclick="loadTasks()" style="min-width:104px">Refresh</button>
+        <button class="btn btn-danger btn-sm" id="btn-delete-all-tasks" onclick="openDeleteAllModal()" style="min-width:104px">Delete All</button>
       </div>
     </div>
     <div id="tasks-body"><p class="empty">Click Refresh to load tasks</p></div>
@@ -1061,6 +1063,12 @@ function _canInlineDocument(contentType, ref){
 function _supportsServerRenderedDocument(ref){
   return ['docx','excel','ppt'].indexOf(ref.documentType)>=0;
 }
+function _documentDownloadHref(ref, fallbackUrl){
+  if(AUTH_MODE === 'disabled' && ref && ref.documentUrl){
+    return _withBasePath(ref.documentUrl);
+  }
+  return fallbackUrl;
+}
 async function openReferenceDocument(rawRef){
   const parsed=_parseRefPayload(rawRef);
   const ref=_normalizeReference(parsed);
@@ -1076,7 +1084,8 @@ async function openReferenceDocument(rawRef){
     const objectUrl=_trackModalObjectUrl(URL.createObjectURL(blob));
     const contentType=(response.headers.get('content-type')||'').toLowerCase();
     const downloadName=ref.documentName || 'reference';
-    const toolbar='<div class="modal-toolbar"><a href="'+escAttr(objectUrl)+'" download="'+escAttr(downloadName)+'">Download</a><a href="'+escAttr(objectUrl)+'" target="_blank" rel="noopener">Open Raw File</a></div>';
+    const downloadHref=_documentDownloadHref(ref, objectUrl);
+    const toolbar='<div class="modal-toolbar"><a href="'+escAttr(downloadHref)+'" download="'+escAttr(downloadName)+'">Download</a></div>';
     const renderUrl = (_supportsServerRenderedDocument(ref) && ref.renderedDocumentUrl) ? ref.renderedDocumentUrl : null;
     if(renderUrl){
       const renderResponse = await _fetchProtectedResource(renderUrl);
@@ -1097,7 +1106,7 @@ async function openReferenceDocument(rawRef){
       const isTextLike=_isTextLikeContentType(contentType);
       const text=isTextLike ? await blob.text().catch(function(){return '';}) : '';
       if(!_canInlineDocument(contentType, ref)){
-        body+='<p class="reference-empty">This file type is available through the packaged proxy link, but browsers do not render it inline reliably. Use Download or Open Raw File to view the original document.</p>';
+        body+='<p class="reference-empty">This file type is available through the packaged proxy link, but browsers do not render it inline reliably. Use Download to access the original document.</p>';
       }else if(contentType.indexOf('text/csv')>=0 || (ref.documentType==='excel' && text)){
         body+=_renderCsvTable(text);
       }else if(_looksLikeHtmlContent(text)){
@@ -1711,6 +1720,7 @@ function escAttr(s){return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').
 // Auto-check health on load
 initApiLinks();
 checkHealth();
+toggleAutoRefresh();
 document.addEventListener('visibilitychange', function(){
   if(document.visibilityState === 'visible'){
     void ensureActiveSession(false);

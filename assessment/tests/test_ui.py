@@ -19,7 +19,7 @@ def test_ui_page_includes_icon_links_and_header_logo():
         response = client.get("/ui")
 
     assert response.status_code == 200
-    assert 'rel="icon" href="favicon.ico"' in response.text
+    assert 'rel="icon" type="image/svg+xml" href="data:image/svg+xml,' in response.text
     assert 'rel="shortcut icon"' not in response.text
     assert 'rel="apple-touch-icon"' not in response.text
     assert '<img src="data:image/svg+xml;base64,' in response.text
@@ -36,6 +36,7 @@ def test_ui_page_includes_icon_links_and_header_logo():
     assert 'id="confirm-modal"' in response.text
     assert 'id="btn-delete-detail-task"' in response.text
     assert "detail-auto-refresh" not in response.text
+    assert 'id="auto-refresh-cb" checked' in response.text
     assert "assessment_access_token_expires_at" in response.text
     assert "ensureActiveSession(false);" in response.text
     assert "runApiLink('link-assessments')" in response.text
@@ -47,11 +48,13 @@ def test_ui_page_includes_icon_links_and_header_logo():
     assert "async function deleteTask(taskId)" in response.text
     assert "async function _fetchProtectedResource" in response.text
     assert "function _supportsServerRenderedDocument" in response.text
-    assert 'Download</a><a href="' in response.text
+    assert 'Download</a></div>' in response.text
     assert "renderedDocumentUrl: links.rendered_document_url || null" in response.text
+    assert "function _documentDownloadHref" in response.text
     assert 'class="reference-html"' in response.text
     assert "AUTH_MODE = authType;" in response.text
     assert "initApiLinks();" in response.text
+    assert "toggleAutoRefresh();" in response.text
     assert "Refresh Token" not in response.text
     assert ">Verify<" not in response.text
 
@@ -63,7 +66,7 @@ def test_ui_page_uses_relative_favicon_links():
         response = client.get("/ui")
 
     assert response.status_code == 200
-    assert 'rel="icon" href="favicon.ico"' in response.text
+    assert 'rel="icon" type="image/svg+xml" href="data:image/svg+xml,' in response.text
     assert 'rel="shortcut icon"' not in response.text
     assert '<img src="data:image/svg+xml;base64,' in response.text
 
