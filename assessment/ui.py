@@ -296,6 +296,7 @@ button.link-card{width:100%;text-align:left;font:inherit}
       <div><label>Vendor Comm. Column (optional)</label><input type="text" id="single-v-com-col" placeholder="D" oninput="onSingleFieldChange()" style="width:80px"/></div>
     </div>
     <label style="display:flex;align-items:center;gap:.5rem;margin-top:.5rem"><input type="checkbox" id="single-v-process" onchange="onSingleFieldChange()"/> Process vendor response &amp; comments</label>
+    <label style="display:flex;align-items:center;gap:.5rem;margin-top:.5rem"><input type="checkbox" id="single-strict-parse" onchange="onSingleFieldChange()"/> Stop if any intended document fails to parse</label>
     <div class="btn-bar"><button class="btn btn-primary" id="btn-single" onclick="submitSingle()">&#128640; Start Assessment</button></div>
     <div id="single-result" class="hidden" style="margin-top:1rem"></div>
   </div>
@@ -371,6 +372,7 @@ button.link-card{width:100%;text-align:left;font:inherit}
         <div><label>Chat Options (JSON, optional)</label><textarea id="sess-start-chat-opts" placeholder='{"prompt": {"system": "..."}}' oninput="onSessStartFieldChange(); validateJsonInput(this)" rows="2"></textarea></div>
       </div>
       <label style="display:flex;align-items:center;gap:.5rem;margin-top:.5rem"><input type="checkbox" id="sess-v-process" onchange="onSessStartFieldChange()"/> Process vendor response &amp; comments</label>
+      <label style="display:flex;align-items:center;gap:.5rem;margin-top:.5rem"><input type="checkbox" id="sess-strict-parse" onchange="onSessStartFieldChange()"/> Stop if any intended document fails to parse</label>
       <div class="btn-bar"><button class="btn btn-primary" id="btn-sess-start" onclick="startSession()">&#128640; Start Assessment</button></div>
     </fieldset>
     <div id="sess-result" class="hidden" style="margin-top:1rem"></div>
@@ -1533,6 +1535,7 @@ async function submitSingle(){
   if(vResCol)fd.append('vendor_response_column',vResCol);
   if(vComCol)fd.append('vendor_comment_column',vComCol);
   fd.append('process_vendor_response',document.getElementById('single-v-process').checked?'true':'false');
+  fd.append('fail_on_document_parse_issue',document.getElementById('single-strict-parse').checked?'true':'false');
   const ok=await postForm(API+'/assessments',fd,'single-result','btn-single');
   if(ok) btnDone('btn-single'); else btnError('btn-single');
 }
@@ -1618,6 +1621,7 @@ async function startSession(){
   if(dso)fd.append('dataset_options',dso);
   if(cno)fd.append('chat_options',cno);
   fd.append('process_vendor_response',document.getElementById('sess-v-process').checked?'true':'false');
+  fd.append('fail_on_document_parse_issue',document.getElementById('sess-strict-parse').checked?'true':'false');
   const ok=await postForm(API+'/assessments/sessions/'+tid+'/start',fd,'sess-result','btn-sess-start');
   if(ok) btnDone('btn-sess-start'); else btnError('btn-sess-start');
 }

@@ -55,6 +55,9 @@ def test_ui_page_includes_icon_links_and_header_logo():
     assert "AUTH_MODE = authType;" in response.text
     assert "initApiLinks();" in response.text
     assert "toggleAutoRefresh();" in response.text
+    assert 'id="single-strict-parse"' in response.text
+    assert 'id="sess-strict-parse"' in response.text
+    assert "fail_on_document_parse_issue" in response.text
     assert "Refresh Token" not in response.text
     assert ">Verify<" not in response.text
 
