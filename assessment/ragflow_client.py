@@ -173,15 +173,6 @@ class RagflowClient:
                 return body
 
     # ------------------------------------------------------------------
-    # Tenant
-    # ------------------------------------------------------------------
-
-    async def get_tenant_info(self) -> dict[str, Any]:
-        """Fetch tenant info."""
-        body = await self._request("GET", "/v1/user/tenant_info")
-        return body.get("data", {}) if isinstance(body, dict) else {}
-
-    # ------------------------------------------------------------------
     # Dataset
     # ------------------------------------------------------------------
 
@@ -227,63 +218,76 @@ class RagflowClient:
             }
         return {"items": [], "total": 0}
 
+    @staticmethod
+    def _validate_dataset_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        """Reject non-REST dataset fields so callers use the public dataset contract."""
+        normalized = dict(payload)
+        legacy_keys = {"parser_id", "embd_id", "kb_id"}
+        present_legacy = sorted(key for key in legacy_keys if key in normalized)
+        if present_legacy:
+            raise RuntimeError(
+                "Unsupported legacy dataset option(s): "
+                f"{', '.join(present_legacy)}. "
+                "Use the REST dataset fields instead: chunk_method, embedding_model, and id-free payloads."
+            )
+        normalized.pop("id", None)
+        return normalized
+
     async def create_dataset(self, name: str, **kwargs) -> str:
-        """Create a dataset through UI KB API and return its ID."""
-        payload = {"name": name}
-        payload.update(kwargs)
-        if "embd_id" not in payload:
-            tenant_info = await self.get_tenant_info()
-            if tenant_info and "embd_id" in tenant_info:
-                payload["embd_id"] = tenant_info["embd_id"]
-        body = await self._request("POST", "/v1/kb/create", json=payload)
+        """Create a dataset through the public REST dataset API and return its ID."""
+        payload = self._validate_dataset_payload({"name": name, **kwargs})
+        body = await self._request("POST", "/api/v1/datasets", json=payload)
         data = body.get("data", {}) if isinstance(body, dict) else {}
-        dataset_id = (
-            data.get("kb_id")
-            if isinstance(data, dict)
-            else None
-        ) or (
-            data.get("id")
-            if isinstance(data, dict)
-            else None
-        )
+        dataset_id = data.get("id") if isinstance(data, dict) else None
         if not dataset_id:
             raise RuntimeError(f"Create dataset succeeded but no dataset id returned: {body}")
         return str(dataset_id)
 
     async def get_dataset_detail(self, dataset_id: str) -> dict[str, Any]:
-        """Fetch dataset details from UI KB API."""
-        body = await self._request("GET", "/v1/kb/detail", params={"kb_id": dataset_id})
-        data = body.get("data", {}) if isinstance(body, dict) else {}
-        if not isinstance(data, dict) or not data:
-            raise RuntimeError(f"Dataset detail not found for id={dataset_id}")
-        return data
+        """Fetch dataset details from the public REST dataset API."""
+        body = await self._request(
+            "GET",
+            "/api/v1/datasets",
+            params={"id": dataset_id, "page": 1, "page_size": 1},
+        )
+        data = body.get("data", []) if isinstance(body, dict) else []
+        items: list[dict[str, Any]]
+        if isinstance(data, list):
+            items = [item for item in data if isinstance(item, dict)]
+        elif isinstance(data, dict):
+            raw_items = data.get("data", [])
+            items = [item for item in raw_items if isinstance(item, dict)] if isinstance(raw_items, list) else []
+        else:
+            items = []
+
+        for item in items:
+            if str(item.get("id", "")).strip() == dataset_id:
+                return item
+        raise RuntimeError(f"Dataset detail not found for id={dataset_id}")
 
     async def update_dataset(self, dataset_id: str, **kwargs) -> dict[str, Any]:
-        """Update a dataset through UI KB API, preserving required fields."""
+        """Update a dataset through the public REST dataset API."""
         detail = await self.get_dataset_detail(dataset_id)
-        payload: dict[str, Any] = {
-            "kb_id": dataset_id,
-            "name": detail.get("name", ""),
-            "description": detail.get("description") or "",
-            "parser_id": detail.get("parser_id") or "naive",
-        }
+        payload: dict[str, Any] = {}
 
         updates = dict(kwargs)
+        updates = self._validate_dataset_payload(updates)
+
         parser_updates = updates.get("parser_config")
         if isinstance(parser_updates, dict) and isinstance(detail.get("parser_config"), dict):
             updates["parser_config"] = self._deep_merge_dicts(detail["parser_config"], parser_updates)
+
         payload.update(updates)
 
-        # UI update endpoint requires these to be present and non-empty.
-        payload["kb_id"] = dataset_id
-        payload["name"] = str(payload.get("name") or detail.get("name") or "").strip()
+        # Preserve name when callers only provide partial update fields.
+        if "name" not in payload:
+            payload["name"] = str(detail.get("name") or "").strip()
         if not payload["name"]:
             raise RuntimeError(f"Cannot update dataset {dataset_id}: dataset name is empty")
-        if payload.get("description") is None:
+        if "description" in payload and payload["description"] is None:
             payload["description"] = ""
-        payload["parser_id"] = payload.get("parser_id") or detail.get("parser_id") or "naive"
 
-        body = await self._request("POST", "/v1/kb/update", json=payload)
+        body = await self._request("PUT", f"/api/v1/datasets/{dataset_id}", json=payload)
         data = body.get("data", {}) if isinstance(body, dict) else {}
         return data if isinstance(data, dict) else {}
 

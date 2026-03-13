@@ -57,7 +57,7 @@ When you provide `dataset_name`, requests now support a `reuse_exisiting_dataset
 - `reuse_exisiting_dataset=true`: reuse the existing dataset by name, apply dataset option updates in-place, and upsert incoming files by hash.
   - If a matching hash already exists in that dataset and is parsed successfully, upload is skipped.
   - If a matching hash is failed/not usable, the document is re-uploaded.
-- `reuse_exisiting_dataset=false`: legacy behavior, delete same-name dataset and recreate it.
+- `reuse_exisiting_dataset=false`: delete any same-name dataset and recreate it from scratch.
 
 This field is available in:
 - `POST /api/v1/assessments`
@@ -223,6 +223,21 @@ Default dataset options example:
 
 ```bash
 export ASSESSMENT_DEFAULT_DATASET_OPTIONS='{"permission":"team","parser_config":{"enable_metadata":true,"auto_keywords":3,"auto_questions":2}}'
+```
+
+Forward dataset API contract:
+
+- `dataset_options` and `ASSESSMENT_DEFAULT_DATASET_OPTIONS` are sent to RAGFlow's public `POST /api/v1/datasets` and `PUT /api/v1/datasets/{id}` endpoints.
+- Use REST dataset fields such as `name`, `description`, `permission`, `chunk_method`, `embedding_model`, and `parser_config`.
+- Old internal KB field names are intentionally not supported and are rejected by the assessment app:
+  - `parser_id`
+  - `embd_id`
+  - `kb_id`
+
+Example with forward REST dataset fields:
+
+```bash
+export ASSESSMENT_DEFAULT_DATASET_OPTIONS='{"permission":"team","chunk_method":"naive","parser_config":{"enable_metadata":true,"auto_keywords":3,"auto_questions":2}}'
 ```
 
 Merge precedence:

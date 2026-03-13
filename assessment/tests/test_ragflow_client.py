@@ -404,8 +404,8 @@ class TestEnsureDataset(unittest.TestCase):
         client.create_dataset.assert_awaited_once_with("my-ds")
 
 
-class TestDatasetUiApis(unittest.TestCase):
-    """Dataset create/update should use UI KB APIs."""
+class TestDatasetRestApis(unittest.TestCase):
+    """Dataset create/update should use the public REST dataset APIs."""
 
     def _make_client(self):
         with patch.object(RagflowClient, "__init__", lambda self, **kw: None):
@@ -415,54 +415,67 @@ class TestDatasetUiApis(unittest.TestCase):
             c._client = None
             return c
 
-    def test_create_dataset_uses_kb_create(self):
+    def test_create_dataset_uses_rest_datasets(self):
         client = self._make_client()
-        client.get_tenant_info = AsyncMock(return_value={"embd_id": "tenant-embd-123"})
-        client._request = AsyncMock(return_value={"code": 0, "data": {"kb_id": "kb-123"}})
+        client._request = AsyncMock(return_value={"code": 0, "data": {"id": "ds-123"}})
 
         result = _run(
             client.create_dataset(
                 "my-ds",
                 permission="team",
+                chunk_method="naive",
                 parser_config={"enable_metadata": True},
+                embedding_model="bge-m3",
             )
         )
 
-        self.assertEqual(result, "kb-123")
+        self.assertEqual(result, "ds-123")
         client._request.assert_called_once_with(
             "POST",
-            "/v1/kb/create",
+            "/api/v1/datasets",
             json={
                 "name": "my-ds",
                 "permission": "team",
+                "chunk_method": "naive",
                 "parser_config": {"enable_metadata": True},
-                "embd_id": "tenant-embd-123",
+                "embedding_model": "bge-m3",
             },
         )
 
-    def test_update_dataset_merges_parser_config_and_required_fields(self):
+    def test_create_dataset_rejects_legacy_kb_fields(self):
+        client = self._make_client()
+        client._request = AsyncMock()
+
+        with self.assertRaisesRegex(RuntimeError, "Unsupported legacy dataset option"):
+            _run(client.create_dataset("my-ds", parser_id="naive"))
+
+        client._request.assert_not_called()
+
+    def test_update_dataset_merges_parser_config_and_uses_rest_update(self):
         client = self._make_client()
         client._request = AsyncMock(side_effect=[
             {
                 "code": 0,
-                "data": {
-                    "id": "kb-123",
-                    "name": "my-ds",
-                    "description": "desc",
-                    "parser_id": "naive",
-                    "parser_config": {
-                        "enable_metadata": False,
-                        "auto_keywords": 1,
-                        "raptor": {"use_raptor": False, "max_token": 128},
-                    },
-                },
+                "data": [
+                    {
+                        "id": "ds-123",
+                        "name": "my-ds",
+                        "description": "desc",
+                        "chunk_method": "naive",
+                        "parser_config": {
+                            "enable_metadata": False,
+                            "auto_keywords": 1,
+                            "raptor": {"use_raptor": False, "max_token": 128},
+                        },
+                    }
+                ],
             },
-            {"code": 0, "data": {"id": "kb-123"}},
+            {"code": 0, "data": {"id": "ds-123"}},
         ])
 
         _run(
             client.update_dataset(
-                "kb-123",
+                "ds-123",
                 permission="team",
                 parser_config={
                     "enable_metadata": True,
@@ -476,21 +489,48 @@ class TestDatasetUiApis(unittest.TestCase):
         second = client._request.await_args_list[1]
 
         self.assertEqual(first.args[0], "GET")
-        self.assertEqual(first.args[1], "/v1/kb/detail")
-        self.assertEqual(first.kwargs["params"], {"kb_id": "kb-123"})
+        self.assertEqual(first.args[1], "/api/v1/datasets")
+        self.assertEqual(first.kwargs["params"], {"id": "ds-123", "page": 1, "page_size": 1})
 
-        self.assertEqual(second.args[0], "POST")
-        self.assertEqual(second.args[1], "/v1/kb/update")
+        self.assertEqual(second.args[0], "PUT")
+        self.assertEqual(second.args[1], "/api/v1/datasets/ds-123")
         payload = second.kwargs["json"]
-        self.assertEqual(payload["kb_id"], "kb-123")
         self.assertEqual(payload["name"], "my-ds")
-        self.assertEqual(payload["description"], "desc")
-        self.assertEqual(payload["parser_id"], "naive")
         self.assertEqual(payload["permission"], "team")
         self.assertTrue(payload["parser_config"]["enable_metadata"])
         self.assertEqual(payload["parser_config"]["auto_keywords"], 1)
         self.assertFalse(payload["parser_config"]["raptor"]["use_raptor"])
         self.assertEqual(payload["parser_config"]["raptor"]["max_token"], 512)
+
+    def test_update_dataset_rejects_legacy_kb_fields(self):
+        client = self._make_client()
+        client._request = AsyncMock(return_value={"code": 0, "data": [{"id": "ds-123", "name": "my-ds"}]})
+
+        with self.assertRaisesRegex(RuntimeError, "Unsupported legacy dataset option"):
+            _run(client.update_dataset("ds-123", embd_id="bge-m3"))
+
+        self.assertEqual(client._request.await_count, 1)
+
+    def test_get_dataset_detail_supports_wrapped_rest_list_response(self):
+        client = self._make_client()
+        client._request = AsyncMock(return_value={
+            "code": 0,
+            "data": {
+                "data": [
+                    {"id": "ds-123", "name": "my-ds"},
+                ],
+                "total": 1,
+            },
+        })
+
+        result = _run(client.get_dataset_detail("ds-123"))
+
+        self.assertEqual(result["id"], "ds-123")
+        client._request.assert_awaited_once_with(
+            "GET",
+            "/api/v1/datasets",
+            params={"id": "ds-123", "page": 1, "page_size": 1},
+        )
 
 
 class TestEnsureChat(unittest.TestCase):

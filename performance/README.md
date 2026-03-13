@@ -73,16 +73,15 @@ What it does:
 - benchmarks official OpenAI-compatible chat completions when chat is enabled
 - records app-controlled execution stage timings for provisioning, upload, parsing, prompt generation, retrieval, assistant setup, chat, summary, and cleanup
 - stores each run as JSON under `performance/data/runs/`
-- can export each run as a Word report with summaries, tables, and visualizations
+- can export a batch Word report from the batch overview with overall summaries, per-run sections, tables, and visualizations
 
 Config model:
 
-- `Dataset Options JSON` is applied through the UI KB flow: create (`/v1/kb/create`) and then detail/update (`/v1/kb/detail`, `/v1/kb/update`)
+- `Dataset Options JSON` is applied through the official dataset SDK APIs: create (`/api/v1/datasets`) and update (`/api/v1/datasets/{dataset_id}`)
   - default example includes `parser_config.layout_recognize: "DeepDOC"`
   - layout values used by the main UI include `DeepDOC`, `Plain Text`, `Docling`, and `TCADP Parser`
-  - compatibility remapping is applied so `chunk_method` becomes `parser_id` and `embedding_model` becomes `embd_id`
-  - if `embd_id` is omitted, the app fetches the tenant default from `/v1/user/tenant_info`
-- `Parsing Config JSON` controls parse request options plus local stage controls like `poll_interval_sec`, `chunk_sample_size`, and `collect_pipeline_logs`
+  - if `embedding_model` is omitted, the official dataset API uses the tenant default embedding model
+- `Parsing Config JSON` controls parse request options plus local stage controls like `poll_interval_sec`, `chunk_sample_size`, and `collect_document_details`
 - `Retrieval Config JSON` controls retrieval request options plus local stage controls like `concurrency`
 - `Chat Config JSON` controls chat creation under `create`, chat completion under `completion`, and local stage controls like `concurrency`
   - default example includes `create.llm.model_name: null`
@@ -99,7 +98,7 @@ Notes on stage behavior:
 Auth:
 
 - provide a RAGFlow API key
-- the app uses that key for both `/api/v1/...` official APIs and `/v1/...` UI endpoints
+- the app uses that key for `/api/v1/...` official APIs and a small number of non-dataset `/v1/...` endpoints such as tenant/model lookup
 
 Notes:
 

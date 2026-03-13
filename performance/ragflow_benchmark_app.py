@@ -153,16 +153,9 @@ def parse_json_object(raw_value: str | None, label: str, default: dict[str, Any]
     return parsed
 
 
-def normalize_dataset_options_for_kb_ui(options: dict[str, Any] | None) -> dict[str, Any]:
+def normalize_dataset_options_for_dataset_api(options: dict[str, Any] | None) -> dict[str, Any]:
     payload = deepcopy(options or {})
-    if "chunk_method" in payload and "parser_id" not in payload:
-        payload["parser_id"] = payload.pop("chunk_method")
-    else:
-        payload.pop("chunk_method", None)
-    if "embedding_model" in payload and "embd_id" not in payload:
-        payload["embd_id"] = payload.pop("embedding_model")
-    else:
-        payload.pop("embedding_model", None)
+    payload.pop("kb_id", None)
     return payload
 
 
@@ -521,24 +514,16 @@ class RAGFlowClient:
         return payload
 
     def create_dataset(self, name: str, options: dict[str, Any] | None = None) -> dict[str, Any]:
-        normalized = normalize_dataset_options_for_kb_ui(options)
-        if not normalized.get("embd_id"):
-            tenant_info = self.get_tenant_info()
-            embd_id = tenant_info.get("embd_id")
-            if not embd_id:
-                raise RAGFlowError("Tenant info did not include a default embd_id for KB create.")
-            normalized["embd_id"] = embd_id
-        payload = {"name": name}
-        payload = merge_dicts(payload, normalized)
-        response = self._request("POST", self._web_url("/kb/create"), json=payload)
-        kb_id = response.get("data", {}).get("kb_id")
-        if not kb_id:
-            raise RAGFlowError("KB create response did not include kb_id")
-        self.update_dataset(kb_id, **normalized)
-        return {"id": kb_id, "name": name}
+        normalized = normalize_dataset_options_for_dataset_api(options)
+        payload = merge_dicts({"name": name}, normalized)
+        response = self._request("POST", self._api_url("/datasets"), json=payload)
+        data = response.get("data", {})
+        if not isinstance(data, dict) or not data.get("id"):
+            raise RAGFlowError("Dataset create response did not include a dataset id.")
+        return data
 
     def delete_dataset(self, dataset_id: str) -> None:
-        self._request("POST", self._web_url("/kb/rm"), json={"kb_id": dataset_id})
+        self._request("DELETE", self._api_url("/datasets"), json={"ids": [dataset_id]})
 
     def get_tenant_info(self) -> dict[str, Any]:
         response = self._request("GET", self._web_url("/user/tenant_info"))
@@ -612,43 +597,6 @@ class RAGFlowClient:
         if default_model and model_names_equivalent(raw_model_name, default_model):
             return default_model
         return None
-
-    def get_dataset_detail(self, dataset_id: str) -> dict[str, Any]:
-        response = self._request("GET", self._web_url("/kb/detail"), params={"kb_id": dataset_id})
-        data = response.get("data", {})
-        if not isinstance(data, dict) or not data:
-            raise RAGFlowError(f"Dataset detail not found for id={dataset_id}")
-        return data
-
-    def update_dataset(self, dataset_id: str, **kwargs: Any) -> dict[str, Any]:
-        detail = self.get_dataset_detail(dataset_id)
-        payload: dict[str, Any] = {
-            "kb_id": dataset_id,
-            "name": detail.get("name", ""),
-            "description": detail.get("description") or "",
-            "parser_id": detail.get("parser_id") or "naive",
-        }
-        for key in ("embd_id", "permission", "language", "avatar", "pagerank", "pipeline_id"):
-            if detail.get(key) is not None:
-                payload[key] = detail.get(key)
-
-        updates = deepcopy(kwargs)
-        parser_updates = updates.get("parser_config")
-        if isinstance(parser_updates, dict) and isinstance(detail.get("parser_config"), dict):
-            updates["parser_config"] = merge_dicts(detail["parser_config"], parser_updates)
-
-        payload = merge_dicts(payload, updates)
-        payload["kb_id"] = dataset_id
-        payload["name"] = str(payload.get("name") or detail.get("name") or "").strip()
-        if not payload["name"]:
-            raise RAGFlowError(f"Cannot update dataset {dataset_id}: dataset name is empty")
-        if payload.get("description") is None:
-            payload["description"] = ""
-        payload["parser_id"] = payload.get("parser_id") or detail.get("parser_id") or "naive"
-
-        response = self._request("POST", self._web_url("/kb/update"), json=payload)
-        data = response.get("data", {})
-        return data if isinstance(data, dict) else {}
 
     def upload_documents(self, dataset_id: str, files: list[Path]) -> list[dict[str, Any]]:
         multipart = []
@@ -756,15 +704,6 @@ class RAGFlowClient:
         payload["messages"] = [{"role": "user", "content": prompt}]
         return self._request("POST", self._api_url(f"/chats_openai/{chat_id}/chat/completions"), json=payload, timeout=max(self.timeout, 300))
 
-    def list_pipeline_logs(self, dataset_id: str) -> list[dict[str, Any]]:
-        response = self._request("POST", self._web_url("/kb/list_pipeline_logs"), params={"kb_id": dataset_id, "page": 1, "page_size": 500}, json={})
-        return response["data"].get("logs", [])
-
-    def list_pipeline_dataset_logs(self, dataset_id: str) -> list[dict[str, Any]]:
-        response = self._request("POST", self._web_url("/kb/list_pipeline_dataset_logs"), params={"kb_id": dataset_id, "page": 1, "page_size": 500}, json={})
-        return response["data"].get("logs", [])
-
-
 def persist_run_snapshot(run_id: str) -> None:
     with RUNS_LOCK:
         snapshot = json_clone(RUNS[run_id])
@@ -846,7 +785,7 @@ def set_batch_fields(batch_id: str, **fields: Any) -> None:
         persist_run_snapshot(run_id)
 
 
-def summarize_documents(documents: list[dict[str, Any]], pipeline_logs: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize_documents(documents: list[dict[str, Any]], detail_rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     durations = [safe_float(doc.get("process_duration")) for doc in documents if safe_float(doc.get("process_duration")) > 0]
     chunks = [safe_int(doc.get("chunk_count")) for doc in documents]
     tokens = [safe_int(doc.get("token_count")) for doc in documents]
@@ -856,6 +795,7 @@ def summarize_documents(documents: list[dict[str, Any]], pipeline_logs: list[dic
     pipeline_step_durations: list[float] = []
     pipeline_log_durations: list[float] = []
     seen_document_ids: set[str] = set()
+    log_rows = detail_rows if isinstance(detail_rows, list) else documents
 
     def build_progress_steps(progress_msg: str, duration_sec: float) -> list[dict[str, Any]]:
         steps = parse_pipeline_progress(progress_msg or "")
@@ -869,7 +809,7 @@ def summarize_documents(documents: list[dict[str, Any]], pipeline_logs: list[dic
             return [{"message": first_line, "timestamp": "", "duration_sec": duration_sec, "is_slow": False}]
         return steps
 
-    for log in pipeline_logs:
+    for log in log_rows:
         document_id = str(log.get("document_id") or "")
         matched_document = documents_by_id.get(document_id, {})
         dsl = log.get("dsl") or {}
@@ -886,8 +826,7 @@ def summarize_documents(documents: list[dict[str, Any]], pipeline_logs: list[dic
         if not pipeline_path:
             fallback_parts = [
                 str(log.get("pipeline_title") or "").strip(),
-                str(log.get("parser_id") or "").strip(),
-                str(matched_document.get("parser_id") or "").strip(),
+                str(matched_document.get("chunk_method") or "").strip(),
             ]
             pipeline_path = [part for part in fallback_parts if part]
         pipeline_by_document.append(
@@ -898,9 +837,10 @@ def summarize_documents(documents: list[dict[str, Any]], pipeline_logs: list[dic
                 "status": log.get("operation_status") or matched_document.get("run"),
                 "progress": safe_float(log.get("progress")),
                 "progress_msg": progress_msg,
-                "task_type": log.get("task_type") or matched_document.get("parser_id") or "",
+                "task_type": log.get("task_type") or matched_document.get("chunk_method") or "",
                 "pipeline_path": pipeline_path,
                 "progress_steps": progress_steps,
+                "source": "dataset_api",
             }
         )
         if document_id:
@@ -929,9 +869,10 @@ def summarize_documents(documents: list[dict[str, Any]], pipeline_logs: list[dic
                 "status": document.get("run"),
                 "progress": safe_float(document.get("progress")),
                 "progress_msg": progress_msg,
-                "task_type": document.get("parser_id") or "parse",
-                "pipeline_path": [str(document.get("parser_id") or "parse")],
+                "task_type": document.get("chunk_method") or "parse",
+                "pipeline_path": [str(document.get("chunk_method") or "parse")],
                 "progress_steps": progress_steps,
+                "source": "dataset_api",
             }
         )
     total_duration = round(sum(durations), 3)
@@ -1938,13 +1879,10 @@ def execute_run(run_id: str) -> None:
                 time.sleep(parse_stage["poll_interval_sec"])
 
             parse_wall_time = round(time.perf_counter() - parse_started, 3)
-            file_logs = client.list_pipeline_logs(dataset_id) if parse_stage["collect_pipeline_logs"] else []
-            dataset_logs = client.list_pipeline_dataset_logs(dataset_id) if parse_stage["collect_pipeline_logs"] else []
-            parse_summary = summarize_documents(last_snapshot, file_logs)
+            parse_summary = summarize_documents(last_snapshot)
             parse_summary["wall_time_sec"] = parse_wall_time
-            parse_summary["dataset_logs"] = dataset_logs
             set_run_fields(run_id, parse=parse_summary, progress=50)
-            append_run_event(run_id, "Parsing completed and pipeline logs collected.")
+            append_run_event(run_id, "Parsing completed and dataset document details collected.")
             finish_stage()
         else:
             last_snapshot = client.list_all_documents(dataset_id)
@@ -2260,7 +2198,7 @@ INDEX_HTML = """<!doctype html>
 <body>
   <div class=\"page\">
     <aside class=\"sidebar\">
-      <section class=\"brand\"><h1>RAGFlow Performance Lab</h1><p>Uploads files, creates a dataset, measures parsing, benchmarks retrieval and chat, and reuses the same KB pipeline logs surfaced in the current RAGFlow UI.</p></section>
+      <section class=\"brand\"><h1>RAGFlow Performance Lab</h1><p>Uploads files, creates a dataset, measures parsing, benchmarks retrieval and chat, and records parse details from the official dataset and document APIs.</p></section>
       <section class=\"panel\">
         <h2>New Run</h2>
         <form id=\"run-form\" class=\"form-grid\">
@@ -2290,7 +2228,7 @@ INDEX_HTML = """<!doctype html>
             <textarea name=\"parsing_options\">{
   \"poll_interval_sec\": 2,
   \"chunk_sample_size\": 3,
-  \"collect_pipeline_logs\": true
+  \"collect_document_details\": true
 }</textarea>
           </label>
           <label class=\"check\"><input name=\"enable_retrieval\" type=\"checkbox\" checked />Enable retrieval benchmark</label>
@@ -2558,7 +2496,7 @@ async def start_run() -> Any:
                 "parser_config": {"layout_recognize": "DeepDOC"},
             },
         )
-        parsing_options_raw = parse_json_object(form.get("parsing_options"), "Parsing config", {"poll_interval_sec": 2, "chunk_sample_size": 3, "collect_pipeline_logs": True})
+        parsing_options_raw = parse_json_object(form.get("parsing_options"), "Parsing config", {"poll_interval_sec": 2, "chunk_sample_size": 3, "collect_document_details": True})
         retrieval_options_raw = parse_json_object(form.get("retrieval_options"), "Retrieval config", {"concurrency": 4, "top_k": 8, "similarity_threshold": 0.2, "vector_similarity_weight": 0.7, "highlight": True})
         chat_options_raw = parse_json_object(
             form.get("chat_options"),
@@ -2578,7 +2516,7 @@ async def start_run() -> Any:
     parsing_request_options = deepcopy(parsing_options_raw)
     parsing_poll_interval = max(1, safe_int(parsing_request_options.pop("poll_interval_sec"), 2))
     chunk_sample_size = max(3, safe_int(parsing_request_options.pop("chunk_sample_size"), 3))
-    collect_pipeline_logs = parsing_request_options.pop("collect_pipeline_logs", True)
+    collect_document_details = parsing_request_options.pop("collect_document_details", True)
 
     retrieval_options = deepcopy(retrieval_options_raw)
     retrieval_concurrency = max(1, safe_int(retrieval_options.pop("concurrency"), 4))
@@ -2633,7 +2571,7 @@ async def start_run() -> Any:
                     "enabled": enable_parsing,
                     "poll_interval_sec": parsing_poll_interval,
                     "chunk_sample_size": chunk_sample_size,
-                    "collect_pipeline_logs": bool(collect_pipeline_logs),
+                    "collect_document_details": bool(collect_document_details),
                     "request_options": parsing_request_options,
                     "raw": parsing_options_raw,
                 },
