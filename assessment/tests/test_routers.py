@@ -341,6 +341,44 @@ def test_task_events_endpoint_returns_paginated_history():
             mock_list_events.assert_awaited_once_with("task-1", 1, 50)
 
 
+def test_delete_task_endpoint_returns_deleted_payload():
+    app = make_app()
+    with TestClient(app) as client:
+        with override_settings(jwt_secret_key=""):
+            mock_delete = AsyncMock(
+                return_value={
+                    "task_id": "task-1",
+                    "deleted": True,
+                    "deleted_chat_id": "chat-1",
+                    "deleted_dataset_ids": ["ds-1"],
+                }
+            )
+            with patch("assessment.routers.delete_task_and_resources", mock_delete):
+                resp = client.request("DELETE", "/api/v1/assessments/task-1")
+
+            assert resp.status_code == 200
+            assert resp.json() == {
+                "message": "Task deleted",
+                "task_id": "task-1",
+                "deleted": True,
+                "deleted_chat_id": "chat-1",
+                "deleted_dataset_ids": ["ds-1"],
+            }
+            mock_delete.assert_awaited_once()
+
+
+def test_delete_task_endpoint_maps_conflict_state():
+    app = make_app()
+    with TestClient(app) as client:
+        with override_settings(jwt_secret_key=""):
+            mock_delete = AsyncMock(side_effect=ValueError("Cannot delete task in state 'processing'. Wait until the task finishes or fails."))
+            with patch("assessment.routers.delete_task_and_resources", mock_delete):
+                resp = client.request("DELETE", "/api/v1/assessments/task-1")
+
+            assert resp.status_code == 409
+            assert "Cannot delete task in state" in resp.json()["detail"]
+
+
 def test_start_assessment_defaults_reuse_existing_dataset_true():
     app = make_app()
     with TestClient(app) as client:

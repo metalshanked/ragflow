@@ -177,7 +177,7 @@ button.link-card{width:100%;text-align:left;font:inherit}
 .modal-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6);z-index:1000;display:flex;align-items:center;justify-content:center}
 .modal-content{background:#fff;border-radius:var(--radius);padding:1rem;max-width:90vw;max-height:90vh;overflow:auto;position:relative}
 .modal-content img{max-width:100%;max-height:80vh;display:block;margin:0 auto}
-.modal-close{position:absolute;top:.5rem;right:.5rem;background:var(--danger);color:#fff;border:none;border-radius:50%;width:28px;height:28px;cursor:pointer;font-size:1rem;line-height:1}
+.modal-close{position:absolute;top:.5rem;right:.5rem;background:var(--danger);color:#fff;border:none;border-radius:999px;width:32px;height:32px;padding:0;cursor:pointer;font-size:1.15rem;line-height:1;display:flex;align-items:center;justify-content:center}
 .modal-content.modal-document{width:min(96vw,1200px);max-width:min(96vw,1200px);padding:1rem 1rem 1.25rem}
 .modal-title{font-size:1rem;font-weight:600;padding-right:2rem}
 .modal-body{margin-top:.85rem}
@@ -257,6 +257,7 @@ button.link-card{width:100%;text-align:left;font:inherit}
           </select>
         </div>
         <button class="btn btn-primary btn-sm" id="btn-refresh-tasks" onclick="loadTasks()">&#128260; Refresh</button>
+        <button class="btn btn-danger btn-sm" id="btn-delete-all-tasks" onclick="deleteAllTasks()">Delete All Tasks</button>
       </div>
     </div>
     <div id="tasks-body"><p class="empty">Click Refresh to load tasks</p></div>
@@ -464,9 +465,19 @@ button.link-card{width:100%;text-align:left;font:inherit}
   <div id="task-detail" class="hidden" style="margin-top:1rem">
     <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem;margin-bottom:.5rem">
       <h3 id="detail-title">Task Details</h3>
-      <div>
+      <div style="display:flex;align-items:center;gap:.6rem;flex-wrap:wrap">
+        <div class="auto-refresh">
+          <label><input type="checkbox" id="detail-auto-refresh-cb" onchange="toggleDetailAutoRefresh()"/> Auto-refresh</label>
+          <select id="detail-auto-refresh-interval" onchange="toggleDetailAutoRefresh()" style="width:auto;padding:2px 4px;font-size:.82rem">
+            <option value="5">5s</option>
+            <option value="10" selected>10s</option>
+            <option value="30">30s</option>
+            <option value="60">60s</option>
+          </select>
+        </div>
         <button class="btn btn-outline btn-sm" onclick="closeDetail()">&#10005; Close</button>
         <button class="btn btn-primary btn-sm" onclick="refreshDetail()">&#128260; Refresh</button>
+        <button class="btn btn-danger btn-sm" id="btn-delete-detail-task" onclick="deleteCurrentTask()">Delete Task</button>
         <button class="btn btn-outline btn-sm" onclick="downloadExcel()">&#128229; Excel</button>
       </div>
     </div>
@@ -875,6 +886,19 @@ function toggleAutoRefresh(){
     _autoRefreshTimer=setInterval(loadTasks, secs*1000);
   }
 }
+let _detailAutoRefreshTimer = null;
+function toggleDetailAutoRefresh(){
+  if(_detailAutoRefreshTimer){clearInterval(_detailAutoRefreshTimer);_detailAutoRefreshTimer=null;}
+  const cb=document.getElementById('detail-auto-refresh-cb');
+  const detail=document.getElementById('task-detail');
+  if(cb && cb.checked && _detailTaskId && detail && !detail.classList.contains('hidden')){
+    const secs=parseInt(document.getElementById('detail-auto-refresh-interval').value)||10;
+    refreshDetail();
+    _detailAutoRefreshTimer=setInterval(function(){
+      if(_detailTaskId && !detail.classList.contains('hidden'))refreshDetail();
+    }, secs*1000);
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /* Reference modal                                                     */
@@ -1030,16 +1054,6 @@ async function openReferenceDocument(rawRef){
   if(!parsed || !ref.documentUrl){toast('Reference document is unavailable','err');return;}
   _openModal(ref.documentName || 'Reference document', '<p class="reference-empty">Loading document…</p>', 'modal-document');
   try{
-    const renderUrl = (_supportsServerRenderedDocument(ref) && ref.renderedDocumentUrl) ? ref.renderedDocumentUrl : null;
-    if(renderUrl){
-      const renderResponse = await _fetchProtectedResource(renderUrl);
-      if(renderResponse.ok && (renderResponse.headers.get('content-type')||'').toLowerCase().indexOf('text/html') >= 0){
-        const renderedHtml = await renderResponse.text();
-        const body='<div class="reference-html">'+renderedHtml+'</div>';
-        _openModal(ref.documentName || 'Reference document', body, 'modal-document');
-        return;
-      }
-    }
     const response=await _fetchProtectedResource(ref.documentUrl);
     if(!response.ok){
       const text=await response.text().catch(function(){return '';});
@@ -1049,7 +1063,18 @@ async function openReferenceDocument(rawRef){
     const objectUrl=_trackModalObjectUrl(URL.createObjectURL(blob));
     const contentType=(response.headers.get('content-type')||'').toLowerCase();
     const downloadName=ref.documentName || 'reference';
-    let body='<div class="modal-toolbar"><a href="'+escAttr(objectUrl)+'" download="'+escAttr(downloadName)+'">Download</a><a href="'+escAttr(objectUrl)+'" target="_blank" rel="noopener">Open Raw File</a></div>';
+    const toolbar='<div class="modal-toolbar"><a href="'+escAttr(objectUrl)+'" download="'+escAttr(downloadName)+'">Download</a><a href="'+escAttr(objectUrl)+'" target="_blank" rel="noopener">Open Raw File</a></div>';
+    const renderUrl = (_supportsServerRenderedDocument(ref) && ref.renderedDocumentUrl) ? ref.renderedDocumentUrl : null;
+    if(renderUrl){
+      const renderResponse = await _fetchProtectedResource(renderUrl);
+      if(renderResponse.ok && (renderResponse.headers.get('content-type')||'').toLowerCase().indexOf('text/html') >= 0){
+        const renderedHtml = await renderResponse.text();
+        const body=toolbar+'<div class="reference-html">'+renderedHtml+'</div>';
+        _openModal(ref.documentName || 'Reference document', body, 'modal-document');
+        return;
+      }
+    }
+    let body=toolbar;
     if(contentType.indexOf('pdf')>=0){
       const pdfUrl=objectUrl + (ref.pageNumber!=null ? '#page='+encodeURIComponent(String(ref.pageNumber)) : '');
       body+='<iframe src="'+escAttr(pdfUrl)+'" title="'+escAttr(downloadName)+'"></iframe>';
@@ -1094,6 +1119,101 @@ function openReferenceContent(rawRef){
 let _taskPage=1;
 let _taskPageSize=10;
 
+async function _deleteTaskRequest(taskId){
+  const response=await fetch(API+'/assessments/'+encodeURIComponent(taskId),{
+    method:'DELETE',
+    headers:headers()
+  });
+  const text=await response.text();
+  let payload={};
+  if(text){
+    try{payload=JSON.parse(text);}catch(_e){payload={detail:text};}
+  }
+  if(!response.ok){
+    throw new Error(payload.detail || ('Delete failed ('+response.status+')'));
+  }
+  return payload;
+}
+
+async function deleteTask(taskId){
+  if(!taskId)return;
+  if(!confirm('Delete task '+taskId.substring(0,12)+'… and all of its results, datasets, and chat resources?'))return;
+  try{
+    const sessionOk=await ensureActiveSession(true);
+    if(!sessionOk)return;
+    await _deleteTaskRequest(taskId);
+    if(_detailTaskId===taskId){
+      closeDetail();
+      _detailTaskId='';
+    }
+    toast('Task deleted','ok');
+    await loadTasks();
+  }catch(e){
+    toast(e.message||'Delete failed','err');
+  }
+}
+
+async function deleteCurrentTask(){
+  if(!_detailTaskId)return;
+  await deleteTask(_detailTaskId);
+}
+
+async function deleteAllTasks(){
+  if(!confirm('Delete all tasks shown by the assessment API and remove each task\\'s datasets, chat, and results?'))return;
+  const button=document.getElementById('btn-delete-all-tasks');
+  const original=button.innerHTML;
+  button.disabled=true;
+  button.innerHTML='Deleting…<span class="spinner"></span>';
+  try{
+    const sessionOk=await ensureActiveSession(true);
+    if(!sessionOk)return;
+    const ids=[];
+    let page=1;
+    let totalPages=1;
+    while(page<=totalPages){
+      const response=await fetch(API+'/assessments?page='+page+'&page_size=100',{headers:headers()});
+      if(!response.ok){
+        const text=await response.text().catch(function(){return '';});
+        throw new Error(text || ('Failed to list tasks ('+response.status+')'));
+      }
+      const payload=await response.json();
+      const tasks=payload.tasks || [];
+      totalPages=payload.total_pages || 1;
+      tasks.forEach(function(task){if(task && task.task_id)ids.push(task.task_id);});
+      page+=1;
+    }
+    if(!ids.length){
+      toast('No tasks to delete','ok');
+      await loadTasks();
+      return;
+    }
+    const failures=[];
+    for(const taskId of ids){
+      try{
+        await _deleteTaskRequest(taskId);
+      }catch(e){
+        failures.push(taskId.substring(0,12)+'…: '+(e.message||'Delete failed'));
+      }
+    }
+    if(_detailTaskId && ids.indexOf(_detailTaskId)>=0){
+      closeDetail();
+      _detailTaskId='';
+    }
+    await loadTasks();
+    if(failures.length){
+      toast('Deleted '+(ids.length-failures.length)+' task(s); '+failures.length+' failed','err');
+      console.error('Delete-all failures:', failures);
+    }else{
+      toast('Deleted '+ids.length+' task(s)','ok');
+    }
+  }catch(e){
+    toast(e.message||'Delete all failed','err');
+  }finally{
+    button.disabled=false;
+    button.innerHTML=original;
+  }
+}
+
 async function loadTasks(){
   const btn=document.getElementById('btn-refresh-tasks');
   btn.disabled=true;
@@ -1114,16 +1234,20 @@ async function loadTasks(){
     
     let html='<table><tr><th>Task ID</th><th>State</th><th>Stage</th><th>Progress</th><th>Dataset</th><th>Chat</th><th>Created</th><th>Actions</th></tr>';
     tasks.forEach(t=>{
-      const dsId=t.dataset_id||'\u2014';
+      const dsIds=Array.isArray(t.dataset_ids)?t.dataset_ids:[];
+      const dsId=dsIds.length?dsIds[0]:'\u2014';
+      const dsLabel=dsIds.length>1?(dsId.length>12?dsId.substring(0,12)+'\u2026':dsId)+' +'+(dsIds.length-1):(dsId.length>12?dsId.substring(0,12)+'\u2026':dsId);
       const chId=t.chat_id||'\u2014';
+      const taskIdEsc=escAttr(t.task_id);
+      const progressLabel=t.questions_processed+'/'+t.total_questions+' ('+(t.questions_succeeded||0)+' ok, '+(t.questions_failed||0)+' failed)';
       html+='<tr><td style="font-family:monospace;font-size:.82rem">'+t.task_id.substring(0,12)+'\u2026</td>'
         +'<td><span class="'+badgeClass(t.state)+'">'+t.state+'</span></td>'
         +'<td>'+t.pipeline_stage+'</td>'
-        +'<td>'+t.questions_processed+'/'+t.total_questions+'</td>'
-        +'<td style="font-family:monospace;font-size:.78rem">'+(dsId.length>12?dsId.substring(0,12)+'\u2026':dsId)+'</td>'
+        +'<td>'+progressLabel+'</td>'
+        +'<td style="font-family:monospace;font-size:.78rem">'+dsLabel+'</td>'
         +'<td style="font-family:monospace;font-size:.78rem">'+(chId.length>12?chId.substring(0,12)+'\u2026':chId)+'</td>'
         +'<td style="font-size:.82rem">'+new Date(t.created_at).toLocaleString()+'</td>'
-        +'<td><button class="btn btn-outline btn-sm" onclick="viewTask(\''+t.task_id+'\')">View</button></td></tr>';
+        +'<td><div style="display:flex;gap:.4rem;flex-wrap:wrap"><button class="btn btn-outline btn-sm" onclick="viewTask(\''+taskIdEsc+'\')">View</button><button class="btn btn-danger btn-sm" onclick="deleteTask(\''+taskIdEsc+'\')">Delete</button></div></td></tr>';
     });
     html+='</table>';
     
@@ -1160,8 +1284,14 @@ async function viewTask(tid){
   document.getElementById('task-detail').classList.remove('hidden');
   document.getElementById('detail-title').textContent='Task '+tid.substring(0,12)+'\u2026';
   await refreshDetail();
+  if(document.getElementById('detail-auto-refresh-cb').checked)toggleDetailAutoRefresh();
 }
-function closeDetail(){document.getElementById('task-detail').classList.add('hidden');}
+function closeDetail(){
+  if(_detailAutoRefreshTimer){clearInterval(_detailAutoRefreshTimer);_detailAutoRefreshTimer=null;}
+  const cb=document.getElementById('detail-auto-refresh-cb');
+  if(cb)cb.checked=false;
+  document.getElementById('task-detail').classList.add('hidden');
+}
 
 async function refreshDetail(){
   if(!_detailTaskId)return;
@@ -1174,17 +1304,18 @@ async function refreshDetail(){
     }
     if(!r.ok){const txt=await r.text();throw new Error('Server error ('+r.status+'): '+(txt.substring(0,300)||r.statusText));}
     const s=await r.json();
+    const dsIds=Array.isArray(s.dataset_ids)?s.dataset_ids:[];
     let html='<dl class="detail-grid">';
     html+='<dt>Task ID</dt><dd style="font-family:monospace">'+s.task_id+'</dd>';
     html+='<dt>State</dt><dd><span class="'+badgeClass(s.state)+'">'+s.state+'</span></dd>';
     html+='<dt>Stage</dt><dd>'+s.pipeline_stage+'</dd>';
-    html+='<dt>Progress</dt><dd>'+s.questions_processed+'/'+s.total_questions+'</dd>';
+    html+='<dt>Progress</dt><dd>'+s.questions_processed+'/'+s.total_questions+' ('+(s.questions_succeeded||0)+' succeeded, '+(s.questions_failed||0)+' failed)</dd>';
     html+='<dt>Message</dt><dd>'+(s.progress_message||'\u2014')+'</dd>';
     if(s.error)html+='<dt>Error</dt><dd style="color:var(--danger)">'+escHtml(s.error)+'</dd>';
     html+='<dt>Created</dt><dd>'+new Date(s.created_at).toLocaleString()+'</dd>';
     html+='<dt>Updated</dt><dd>'+new Date(s.updated_at).toLocaleString()+'</dd>';
     // RAGFlow resource IDs
-    if(s.dataset_id)html+='<dt>Dataset ID</dt><dd style="font-family:monospace;font-size:.85rem">'+escHtml(s.dataset_id)+'</dd>';
+    if(dsIds.length)html+='<dt>Dataset IDs</dt><dd style="font-family:monospace;font-size:.85rem">'+dsIds.map(escHtml).join(', ')+'</dd>';
     if(s.chat_id)html+='<dt>Chat ID</dt><dd style="font-family:monospace;font-size:.85rem">'+escHtml(s.chat_id)+'</dd>';
     if(s.session_id)html+='<dt>Session ID</dt><dd style="font-family:monospace;font-size:.85rem">'+escHtml(s.session_id)+'</dd>';
     if(s.document_ids&&s.document_ids.length)html+='<dt>Document IDs</dt><dd style="font-family:monospace;font-size:.85rem">'+s.document_ids.map(escHtml).join(', ')+'</dd>';
@@ -1210,7 +1341,7 @@ async function refreshDetail(){
       html+='</table>';
     }
     // Retry panel for failed or awaiting_documents sessions that have a dataset
-    if((s.state==='failed'||s.state==='awaiting_documents')&&s.dataset_id){
+    if((s.state==='failed'||s.state==='awaiting_documents')&&dsIds.length){
       html+='<div style="margin-top:1rem;padding:1rem;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg)">';
       html+='<h4 style="margin-bottom:.5rem">&#128260; Retry / Upload More Documents</h4>';
       if(s.state==='failed')html+='<p style="font-size:.88rem;color:var(--muted);margin-bottom:.5rem">This session failed. You can upload additional or replacement documents and re-start the assessment without losing the existing dataset.</p>';
@@ -1243,10 +1374,22 @@ async function loadResults(){
     const d=await r.json();
     if(!d.results||!d.results.length){c.innerHTML='<p class="empty">No results yet</p>';p.innerHTML='';return;}
     let html='';
+    if(d.failed_questions&&d.failed_questions.length){
+      html+='<div class="result-card"><h4>Failed Questions ('+d.failed_questions.length+')</h4><ul style="margin:.4rem 0 0 1.1rem">';
+      d.failed_questions.forEach(function(fq){
+        html+='<li><strong>'+escHtml(String(fq.question_serial_no))+':</strong> '+escHtml(fq.question)+'<br/><span style="color:var(--danger)">'+escHtml(fq.reason||'Question processing failed')+'</span></li>';
+      });
+      html+='</ul></div>';
+    }
     d.results.forEach(q=>{
       html+='<div class="result-card"><h4>Q'+escHtml(String(q.question_serial_no))+': '+escHtml(q.question)+'</h4>';
-      html+='<div><strong>Answer:</strong> <span class="badge '+(q.ai_response==='Yes'?'badge-completed':q.ai_response==='No'?'badge-failed':'badge-pending')+'">'+escHtml(q.ai_response)+'</span></div>';
-      if(q.details)html+='<div style="margin-top:.3rem"><strong>Details:</strong> '+escHtml(q.details).substring(0,500)+'</div>';
+      if(q.status==='failed'){
+        html+='<div><strong>Status:</strong> <span class="badge badge-failed">failed</span></div>';
+        html+='<div style="margin-top:.3rem;color:var(--danger)"><strong>Failure reason:</strong> '+escHtml(q.failure_reason||'Question processing failed')+'</div>';
+      }else{
+        html+='<div><strong>Answer:</strong> <span class="badge '+(q.ai_response==='Yes'?'badge-completed':q.ai_response==='No'?'badge-failed':'badge-pending')+'">'+escHtml(q.ai_response)+'</span></div>';
+        if(q.details)html+='<div style="margin-top:.3rem"><strong>Details:</strong> '+escHtml(q.details).substring(0,500)+'</div>';
+      }
       if(q.references&&q.references.length){
         html+='<div class="ref-list"><strong>References ('+q.references.length+'):</strong>';
         q.references.forEach(function(ref){

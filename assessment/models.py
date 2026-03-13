@@ -116,6 +116,8 @@ class QuestionResult(BaseModel):
     question: str
     vendor_response: str = ""
     vendor_comment: str = ""
+    status: str = "completed"  # completed | failed
+    failure_reason: Optional[str] = None
     ai_response: str = ""  # Yes / No / N/A
     details: str = ""
     references: list[Reference] = Field(default_factory=list)
@@ -139,13 +141,14 @@ class TaskStatus(BaseModel):
     progress_message: str = ""
     total_questions: int = 0
     questions_processed: int = 0
+    questions_succeeded: int = 0
+    questions_failed: int = 0
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     error: Optional[str] = None
     created_by: Optional[ActorInfo] = None
 
     # RAGFlow resource IDs (populated as the pipeline progresses)
-    dataset_id: Optional[str] = None
     dataset_ids: list[str] = Field(default_factory=list)
     chat_id: Optional[str] = None
     session_id: Optional[str] = None
@@ -168,13 +171,15 @@ class TaskResultResponse(BaseModel):
     state: TaskState
     total_questions: int = 0
     questions_processed: int = 0
+    questions_succeeded: int = 0
+    questions_failed: int = 0
+    failed_questions: list["FailedQuestion"] = Field(default_factory=list)
     results: list[QuestionResult] = Field(default_factory=list)
     page: int = 1
     page_size: int = 50
     total_pages: int = 1
 
     # RAGFlow resource IDs
-    dataset_id: Optional[str] = None
     dataset_ids: list[str] = Field(default_factory=list)
     chat_id: Optional[str] = None
     session_id: Optional[str] = None
@@ -218,6 +223,12 @@ class AuditEvent(BaseModel):
     status_code: Optional[int] = None
     payload: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class FailedQuestion(BaseModel):
+    question_serial_no: int | str
+    question: str
+    reason: str = ""
 
 
 # ---------------------------------------------------------------------------

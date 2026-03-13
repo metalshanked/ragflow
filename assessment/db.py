@@ -332,12 +332,13 @@ def _task_record_from_row(row: TaskRow) -> TaskRecord:
     results = [QuestionResult(**r) for r in json.loads(row.results_json)]
     doc_statuses = [DocumentStatus(**ds) for ds in json.loads(row.document_statuses_json or "[]")]
     # Sync RAGFlow resource IDs into the status so API responses include them
-    status.dataset_id = ragflow.dataset_id or None
     status.dataset_ids = ragflow.dataset_ids or ([ragflow.dataset_id] if ragflow.dataset_id else [])
     status.chat_id = ragflow.chat_id or None
     status.session_id = ragflow.session_id or None
     status.document_ids = ragflow.document_ids or []
     status.document_statuses = doc_statuses
+    status.questions_succeeded = sum(1 for result in results if str(result.status) != "failed")
+    status.questions_failed = sum(1 for result in results if str(result.status) == "failed")
     return TaskRecord(
         task_id=row.task_id,
         status=status,
@@ -393,6 +394,28 @@ async def db_get_task(task_id: str) -> TaskRecord | None:
         if row is None:
             return None
         return _task_record_from_row(row)
+
+
+async def db_delete_task(task_id: str) -> bool:
+    """Delete a task and its local event/audit rows.
+
+    Returns ``True`` when the task existed and was deleted.
+    """
+    from sqlalchemy import delete
+
+    async with async_session_factory() as session:
+        async with session.begin():
+            await session.execute(
+                delete(TaskEventRow).where(TaskEventRow.task_id == task_id)
+            )
+            await session.execute(
+                delete(AuditEventRow).where(AuditEventRow.task_id == task_id)
+            )
+            result = await session.execute(
+                delete(TaskRow).where(TaskRow.task_id == task_id)
+            )
+            deleted = int(result.rowcount or 0)
+    return deleted > 0
 
 
 async def db_list_tasks(page: int = 1, page_size: int = 50) -> tuple[list[TaskStatus], int]:

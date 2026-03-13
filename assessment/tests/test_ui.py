@@ -32,14 +32,20 @@ def test_ui_page_includes_icon_links_and_header_logo():
     assert 'id="panel-api"' in response.text
     assert 'id="link-docs"' in response.text
     assert 'id="api-link-result"' in response.text
+    assert 'id="btn-delete-all-tasks"' in response.text
+    assert 'id="detail-auto-refresh-interval"' in response.text
+    assert 'id="btn-delete-detail-task"' in response.text
     assert "assessment_access_token_expires_at" in response.text
     assert "ensureActiveSession(false);" in response.text
     assert "runApiLink('link-assessments')" in response.text
     assert "openReferenceDocument(this.dataset.ref)" in response.text
     assert "openReferenceImage(this.dataset.ref)" in response.text
     assert "openReferenceContent(this.dataset.ref)" in response.text
+    assert "async function deleteAllTasks" in response.text
+    assert "async function deleteTask(taskId)" in response.text
     assert "async function _fetchProtectedResource" in response.text
     assert "function _supportsServerRenderedDocument" in response.text
+    assert 'Download</a><a href="' in response.text
     assert "renderedDocumentUrl: links.rendered_document_url || null" in response.text
     assert 'class="reference-html"' in response.text
     assert "AUTH_MODE = authType;" in response.text

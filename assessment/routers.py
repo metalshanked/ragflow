@@ -27,6 +27,7 @@ Proxy (RAGFlow resource passthrough):
 Common:
   GET    /api/v1/assessments                              - List all tasks
   GET    /api/v1/assessments/{task_id}                    - Get task status
+  DELETE /api/v1/assessments/{task_id}                    - Delete a task and its upstream resources
   GET    /api/v1/assessments/{task_id}/results             - Get results (JSON, paginated)
   GET    /api/v1/assessments/{task_id}/results/excel       - Download results as Excel
 """
@@ -79,6 +80,7 @@ from .services import (
     claim_session_start,
     create_session,
     create_task,
+    delete_task_and_resources,
     get_paginated_results,
     get_task,
     list_task_events,
@@ -902,6 +904,35 @@ async def get_task_status(task_id: str):
 
 
 # ---------------------------------------------------------------------------
+# DELETE /assessments/{task_id}  –  Delete task and upstream resources
+# ---------------------------------------------------------------------------
+
+@router.delete("/assessments/{task_id}")
+async def delete_task(request: Request, task_id: str):
+    """Delete a task and its associated RAGFlow datasets/chat."""
+    try:
+        result = await delete_task_and_resources(task_id, actor_from_request(request))
+    except ValueError as exc:
+        detail = str(exc)
+        if "not found" in detail.lower():
+            raise HTTPException(status_code=404, detail=detail)
+        raise HTTPException(status_code=409, detail=detail)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    await _audit(
+        "task.delete",
+        request,
+        status_code=200,
+        payload=result,
+    )
+    return {
+        "message": "Task deleted",
+        **result,
+    }
+
+
+# ---------------------------------------------------------------------------
 # GET /assessments/{task_id}/events  –  Task events
 # ---------------------------------------------------------------------------
 
@@ -1263,6 +1294,7 @@ async def delete_documents(request: Request, dataset_id: str, req: DeleteDocumen
     "/native/{ragflow_path:path}",
     methods=_PASSTHROUGH_METHODS,
     tags=["native-passthrough"],
+    include_in_schema=False,
 )
 async def ragflow_official_passthrough(ragflow_path: str, request: Request):
     """

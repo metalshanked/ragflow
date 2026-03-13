@@ -321,12 +321,12 @@ def create_client(verify_setting: bool | str) -> httpx.Client:
 
 
 def update_artifact_ids(metrics: RunMetrics, payload: dict[str, Any]) -> None:
-    metrics.dataset_id = str(payload.get("dataset_id") or "").strip()
     metrics.dataset_ids = [
         str(value).strip()
         for value in (payload.get("dataset_ids") or [])
         if str(value).strip()
     ]
+    metrics.dataset_id = metrics.dataset_ids[0] if metrics.dataset_ids else ""
     metrics.chat_id = str(payload.get("chat_id") or "").strip()
     metrics.session_id = str(payload.get("session_id") or "").strip()
     metrics.document_ids = [

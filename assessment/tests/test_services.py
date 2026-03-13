@@ -32,6 +32,7 @@ from assessment.services import (
     build_results_excel,
     create_session,
     create_task,
+    delete_task_and_resources,
     get_paginated_results,
     parse_questions_excel,
     run_assessment_for_session,
@@ -41,6 +42,7 @@ _mock_db_save = AsyncMock()
 _mock_db_get = AsyncMock(return_value=None)
 _mock_db_list = AsyncMock(return_value=([], 0))
 _mock_db_add_event = AsyncMock()
+_mock_db_delete = AsyncMock(return_value=True)
 _mock_db_list_events = AsyncMock(return_value=([], 0))
 _TEST_SETTINGS = {
     "ragflow_base_url": "http://test:9380",
@@ -65,6 +67,7 @@ _ORIGINAL_DB_FUNCS = (
     _services_mod.db_get_task,
     _services_mod.db_list_tasks,
     _services_mod.db_add_task_event,
+    _services_mod.db_delete_task,
     _services_mod.db_list_task_events,
 )
 _ORIGINAL_SETTINGS = {k: getattr(_services_mod.settings, k) for k in _TEST_SETTINGS}
@@ -75,6 +78,7 @@ def setUpModule():
     _services_mod.db_get_task = _mock_db_get
     _services_mod.db_list_tasks = _mock_db_list
     _services_mod.db_add_task_event = _mock_db_add_event
+    _services_mod.db_delete_task = _mock_db_delete
     _services_mod.db_list_task_events = _mock_db_list_events
     for key, value in _TEST_SETTINGS.items():
         setattr(_services_mod.settings, key, value)
@@ -86,6 +90,7 @@ def tearDownModule():
         _services_mod.db_get_task,
         _services_mod.db_list_tasks,
         _services_mod.db_add_task_event,
+        _services_mod.db_delete_task,
         _services_mod.db_list_task_events,
     ) = _ORIGINAL_DB_FUNCS
     for key, value in _ORIGINAL_SETTINGS.items():
@@ -306,6 +311,62 @@ class TestCreateTask(unittest.TestCase):
         _mock_db_add_event.assert_called_once()
 
 
+class TestDeleteTaskAndResources(unittest.TestCase):
+    def setUp(self):
+        _mock_db_get.reset_mock()
+        _mock_db_delete.reset_mock()
+        _mock_db_delete.return_value = True
+
+    @patch.object(_services_mod, "RagflowClient")
+    def test_deletes_chat_datasets_and_local_task(self, MockClient):
+        mock_client = AsyncMock()
+        mock_client.delete_chat = AsyncMock()
+        mock_client.delete_dataset = AsyncMock()
+        mock_client.close = AsyncMock()
+        MockClient.return_value = mock_client
+
+        _mock_db_get.return_value = TaskRecord(
+            task_id="task-delete-1",
+            status=TaskStatus(
+                task_id="task-delete-1",
+                state=TaskState.COMPLETED,
+            ),
+            ragflow=RagflowContext(
+                dataset_id="ds-1",
+                dataset_ids=["ds-1", "ds-2"],
+                chat_id="chat-1",
+            ),
+        )
+
+        result = _run(delete_task_and_resources("task-delete-1"))
+
+        self.assertTrue(result["deleted"])
+        self.assertEqual(result["deleted_chat_id"], "chat-1")
+        self.assertEqual(result["deleted_dataset_ids"], ["ds-1", "ds-2"])
+        mock_client.delete_chat.assert_awaited_once_with("chat-1")
+        self.assertEqual(mock_client.delete_dataset.await_count, 2)
+        _mock_db_delete.assert_awaited_once_with("task-delete-1")
+
+    @patch.object(_services_mod, "RagflowClient")
+    def test_rejects_active_task_deletion(self, MockClient):
+        mock_client = AsyncMock()
+        mock_client.close = AsyncMock()
+        MockClient.return_value = mock_client
+        _mock_db_get.return_value = TaskRecord(
+            task_id="task-delete-2",
+            status=TaskStatus(
+                task_id="task-delete-2",
+                state=TaskState.PROCESSING,
+            ),
+        )
+
+        with self.assertRaises(ValueError):
+            _run(delete_task_and_resources("task-delete-2"))
+
+        _mock_db_delete.assert_not_awaited()
+        mock_client.delete_chat.assert_not_called()
+
+
 class TestCreateSessionReuse(unittest.TestCase):
     """create_session should pass dataset reuse intent to RagflowClient."""
 
@@ -388,7 +449,7 @@ class TestGetPaginatedResults(unittest.TestCase):
             document_ids=["doc-a", "doc-b"],
         )
         result = get_paginated_results(record, page=1, page_size=50)
-        self.assertEqual(result["dataset_id"], "ds-123")
+        self.assertEqual(result["dataset_ids"], ["ds-123"])
         self.assertEqual(result["chat_id"], "ch-456")
         self.assertEqual(result["session_id"], "sess-789")
         self.assertEqual(result["document_ids"], ["doc-a", "doc-b"])
@@ -397,10 +458,20 @@ class TestGetPaginatedResults(unittest.TestCase):
         """When no ragflow context is set, IDs should be None/empty."""
         record = self._make_record(1)
         result = get_paginated_results(record, page=1, page_size=50)
-        self.assertIsNone(result["dataset_id"])
+        self.assertEqual(result["dataset_ids"], [])
         self.assertIsNone(result["chat_id"])
         self.assertIsNone(result["session_id"])
         self.assertEqual(result["document_ids"], [])
+
+    def test_failed_question_summary_is_included(self):
+        record = self._make_record(2)
+        record.results[1].status = "failed"
+        record.results[1].failure_reason = "Model timeout"
+        result = get_paginated_results(record, page=1, page_size=50)
+        self.assertEqual(result["questions_succeeded"], 1)
+        self.assertEqual(result["questions_failed"], 1)
+        self.assertEqual(result["failed_questions"][0]["question_serial_no"], 2)
+        self.assertEqual(result["failed_questions"][0]["reason"], "Model timeout")
 
     def test_document_statuses_included(self):
         """Paginated results should include per-document parsing statuses."""
@@ -688,6 +759,45 @@ class TestOnlyCitedReferences(unittest.TestCase):
         self.assertIsNone(refs[1].location.page_number)
         self.assertEqual(refs[1].reference_type, "text")
         self.assertEqual(refs[1].preview.text_excerpt, "chunk2")
+
+    @patch.object(_services_mod, "RagflowClient")
+    def test_failed_questions_are_materialized_in_results(self, MockClient):
+        from assessment.ragflow_client import RagflowClient as _RealClient
+
+        questions = [
+            {"serial_no": 1, "question": "Q1"},
+            {"serial_no": 2, "question": "Q2"},
+        ]
+        record = self._make_record(questions)
+        _mock_db_save.reset_mock()
+
+        mock_client = AsyncMock()
+
+        async def _ask(_chat_id, _session_id, question_text, stream=False):
+            if question_text == "Q2":
+                raise RuntimeError("Upstream timeout")
+            return {"answer": "Answer: Yes\nDetails: OK", "reference": {}}
+
+        mock_client.ask = AsyncMock(side_effect=_ask)
+        MockClient.return_value = mock_client
+        MockClient.parse_yes_no = _RealClient.parse_yes_no
+        MockClient.extract_references = _RealClient.extract_references
+        MockClient.get_cited_indices = _RealClient.get_cited_indices
+
+        failed = _run(_process_questions(
+            record=record,
+            questions=questions,
+            client=mock_client,
+            chat_id="chat1",
+            session_id="sess1",
+        ))
+
+        self.assertEqual(failed, 1)
+        self.assertEqual(record.status.questions_processed, 2)
+        self.assertEqual(len(record.results), 2)
+        self.assertEqual(record.results[0].status, "completed")
+        self.assertEqual(record.results[1].status, "failed")
+        self.assertEqual(record.results[1].failure_reason, "Upstream timeout")
 
     @patch.object(_services_mod, "RagflowClient")
     def test_all_refs_when_disabled(self, MockClient):

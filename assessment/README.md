@@ -410,8 +410,8 @@ The UI is a single-page app served directly from FastAPI — no extra dependenci
 
 | Feature | Description |
 |---|---|
-| **Tasks list** | View all assessment tasks with state, stage, progress, and creation time; auto-refresh with configurable interval |
-| **Task detail** | Drill into any task to see full status, RAGFlow resource IDs, per-document parsing status table, results with pagination, and download Excel |
+| **Tasks list** | View all assessment tasks with state, stage, progress, and creation time; auto-refresh with configurable interval; delete one task or bulk-delete all tasks from the UI |
+| **Task detail** | Drill into any task to see full status, RAGFlow resource IDs, per-document parsing status table, results with pagination, download Excel, and delete the task |
 | **Single-call assessment** | Upload questions Excel + evidence documents in one step |
 | **From existing dataset** | Run assessment against already-uploaded RAGFlow datasets |
 | **Two-phase workflow** | Create session → upload docs incrementally → start assessment |
@@ -691,9 +691,34 @@ GET /api/v1/assessments/{task_id}/events?page=1&page_size=100
 
 Use this endpoint to troubleshoot pipeline transitions (`task_created`, `status_update`, errors, etc.).
 
+#### Delete Task
+
+Delete a task and its local results, task events, and associated upstream RAGFlow resources created for that task.
+
+```
+DELETE /api/v1/assessments/{task_id}
+```
+
+**Response:**
+```json
+{
+  "message": "Task deleted",
+  "task_id": "abc123...",
+  "deleted": true,
+  "deleted_chat_id": "chat_123",
+  "deleted_dataset_ids": ["ds_123"]
+}
+```
+
+Notes:
+- The built-in UI bulk delete uses this endpoint repeatedly; there is no separate delete-all API.
+- Tasks in active states such as `uploading`, `parsing`, or `processing` are rejected with `409` because the current pipeline does not support cancellation safely.
+
 #### Get Results (JSON, Paginated)
 
 Retrieve assessment results in JSON format.
+
+For task-level resource IDs, the API now uses `dataset_ids` only. Single-dataset tasks still return a one-item list.
 
 **Query Parameters:**
 - `page` (int, default 1): Page number.
@@ -710,10 +735,26 @@ GET /api/v1/assessments/{task_id}/results?page=1&page_size=50
   "state": "completed",
   "total_questions": 25,
   "questions_processed": 25,
+  "questions_succeeded": 23,
+  "questions_failed": 2,
+  "failed_questions": [
+    {
+      "question_serial_no": 4,
+      "question": "Does the document define a retention schedule?",
+      "reason": "Upstream timeout"
+    },
+    {
+      "question_serial_no": 19,
+      "question": "Is customer data encrypted at rest?",
+      "reason": "RAGFlow returned non-JSON response for POST /api/v1/chats/..."
+    }
+  ],
   "results": [
     {
       "question_serial_no": 1,
       "question": "Does the organization have a data privacy policy?",
+      "status": "completed",
+      "failure_reason": null,
       "ai_response": "Yes",
       "details": "The evidence document contains a comprehensive data privacy policy...",
       "references": [
@@ -802,12 +843,21 @@ GET /api/v1/assessments/{task_id}/results?page=1&page_size=50
           }
         }
       ]
-      ]
+    },
+    {
+      "question_serial_no": 4,
+      "question": "Does the document define a retention schedule?",
+      "status": "failed",
+      "failure_reason": "Upstream timeout",
+      "ai_response": "Error",
+      "details": "",
+      "references": []
     }
   ],
   "page": 1,
   "page_size": 50,
-  "total_pages": 1
+  "total_pages": 1,
+  "dataset_ids": ["ds123"]
 }
 ```
 
@@ -870,10 +920,12 @@ GET /api/v1/assessments?page=1&page_size=50
       "task_id": "abc123...",
       "state": "completed",
       "pipeline_stage": "finalizing",
-      "progress_message": "Assessment completed",
+      "progress_message": "Assessment completed: 23 succeeded, 2 failed",
       "total_questions": 25,
       "questions_processed": 25,
-      "dataset_id": "ds-xyz",
+      "questions_succeeded": 23,
+      "questions_failed": 2,
+      "dataset_ids": ["ds-xyz"],
       "chat_id": "ch-123",
       "created_at": "2024-03-20T10:00:00",
       "updated_at": "2024-03-20T10:05:00"
@@ -1091,6 +1143,7 @@ When a user clicks `Open Document` in the built-in assessment UI:
 - Images render inline in the browser modal.
 - `docx`, `xlsx` / `xlsm`, and `pptx` documents are converted server-side into HTML for in-app viewing.
 - Legacy binary Office formats such as `doc`, `xls`, and `ppt` are not converted by the built-in renderer and fall back to raw download/open behavior.
+- The modal always includes a download link for the original proxied document.
 
 This keeps the UI usable for the most common modern Office formats without claiming richer location semantics than upstream RAGFlow actually provides.
 

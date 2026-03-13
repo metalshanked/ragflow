@@ -33,6 +33,7 @@ from .models import (
 )
 from .db import (
     db_add_task_event,
+    db_delete_task,
     db_get_task,
     db_list_task_events,
     db_list_tasks,
@@ -54,8 +55,9 @@ logger = logging.getLogger(__name__)
 
 
 def _sync_ragflow_ids(record: TaskRecord) -> None:
-    """Copy RAGFlow resource IDs and document statuses from the record into the status object."""
-    record.status.dataset_id = record.ragflow.dataset_id or None
+    """Copy resource IDs and derived task counters into the status object."""
+    succeeded = sum(1 for result in record.results if str(result.status) != "failed")
+    failed = sum(1 for result in record.results if str(result.status) == "failed")
     record.status.dataset_ids = (
         record.ragflow.dataset_ids
         or ([record.ragflow.dataset_id] if record.ragflow.dataset_id else [])
@@ -64,6 +66,8 @@ def _sync_ragflow_ids(record: TaskRecord) -> None:
     record.status.session_id = record.ragflow.session_id or None
     record.status.document_ids = record.ragflow.document_ids or []
     record.status.document_statuses = record.document_statuses
+    record.status.questions_succeeded = succeeded
+    record.status.questions_failed = failed
 
 
 def _deep_merge_dicts(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
@@ -188,6 +192,101 @@ async def find_tasks_by_dataset_id(dataset_id: str) -> list[TaskStatus]:
 async def find_document_by_hash(file_hash: str) -> list[dict[str, Any]]:
     """Return occurrences of a document content hash across tasks."""
     return await db_find_document_by_hash(file_hash)
+
+
+def _is_missing_upstream_resource_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "http 404" in message
+        or "not found" in message
+        or "does not exist" in message
+        or "doesn't exist" in message
+        or "not exist" in message
+    )
+
+
+def _task_is_deletable(record: TaskRecord) -> bool:
+    return record.status.state not in {
+        TaskState.UPLOADING,
+        TaskState.PARSING,
+        TaskState.PROCESSING,
+    }
+
+
+async def delete_task_and_resources(
+    task_id: str,
+    actor: ActorInfo | None = None,
+) -> dict[str, Any]:
+    """Delete a task plus any associated RAGFlow chat and datasets.
+
+    Active tasks are rejected because the current pipeline does not support
+    cancellation and background workers could recreate deleted task rows.
+    """
+    with actor_context(actor, request_method="DELETE", request_path=f"/api/v1/assessments/{task_id}"):
+        async with db_task_lock(task_id):
+            record = await get_task(task_id)
+            if record is None:
+                raise ValueError(f"Task {task_id} not found")
+            if not _task_is_deletable(record):
+                raise ValueError(
+                    f"Cannot delete task in state '{record.status.state.value}'. "
+                    "Wait until the task finishes or fails."
+                )
+
+            dataset_ids = _ordered_unique(
+                [
+                    *(record.ragflow.dataset_ids or []),
+                    record.ragflow.dataset_id,
+                ]
+            )
+            deleted_dataset_ids: list[str] = []
+            deleted_chat_id = ""
+
+            client = RagflowClient()
+            try:
+                chat_id = str(record.ragflow.chat_id or "").strip()
+                if chat_id:
+                    try:
+                        await client.delete_chat(chat_id)
+                        deleted_chat_id = chat_id
+                    except Exception as exc:
+                        if _is_missing_upstream_resource_error(exc):
+                            logger.info(
+                                "Task %s chat %s was already absent upstream during delete",
+                                task_id,
+                                chat_id,
+                            )
+                        else:
+                            raise
+
+                if dataset_ids:
+                    for dataset_id in dataset_ids:
+                        try:
+                            await client.delete_dataset(dataset_id)
+                            deleted_dataset_ids.append(dataset_id)
+                        except Exception as exc:
+                            if _is_missing_upstream_resource_error(exc):
+                                logger.info(
+                                    "Task %s dataset %s was already absent upstream during delete",
+                                    task_id,
+                                    dataset_id,
+                                )
+                                deleted_dataset_ids.append(dataset_id)
+                            else:
+                                raise
+            finally:
+                await client.close()
+
+            deleted = await db_delete_task(task_id)
+            if not deleted:
+                raise ValueError(f"Task {task_id} not found")
+
+            return {
+                "task_id": task_id,
+                "deleted": True,
+                "deleted_chat_id": deleted_chat_id or None,
+                "deleted_dataset_ids": deleted_dataset_ids,
+            }
 
 
 async def _update_status(
@@ -411,12 +510,15 @@ async def _process_questions(
     ):
         await _update_status(record, message="Processing questions...")
         semaphore = asyncio.Semaphore(settings.max_concurrent_questions)
+        progress_lock = asyncio.Lock()
         total = len(questions)
+        ordered_results: list[QuestionResult | None] = [None] * total
+        settled_count = 0
 
         do_process_vendor = process_vendor_response if process_vendor_response is not None else settings.process_vendor_response
         do_only_cited = only_cited_references if only_cited_references is not None else settings.only_cited_references
 
-        async def _process_one(q: dict[str, Any]) -> QuestionResult:
+        async def _process_one(idx: int, q: dict[str, Any]) -> QuestionResult:
             async with semaphore:
                 with start_span(
                     "assessment.process_question",
@@ -430,71 +532,100 @@ async def _process_questions(
                     q_text = q["question"]
                     v_res = q.get("vendor_response", "")
                     v_com = q.get("vendor_comment", "")
+                    answer_text = ""
 
-                    if do_process_vendor and (v_res or v_com):
-                        q_text = (
-                            f"The vendor responded '{v_res}' with comments: '{v_com}'. "
-                            f"Please verify if this is correct based on the documents. "
-                            f"Question: {q_text}"
+                    try:
+                        if do_process_vendor and (v_res or v_com):
+                            q_text = (
+                                f"The vendor responded '{v_res}' with comments: '{v_com}'. "
+                                f"Please verify if this is correct based on the documents. "
+                                f"Question: {q_text}"
+                            )
+
+                        response = await client.ask(
+                            chat_id, session_id, q_text, stream=False
+                        )
+                        answer_text = response.get("answer", "")
+                        verdict, details = RagflowClient.parse_yes_no(answer_text)
+                        raw_refs = RagflowClient.extract_references(response)
+
+                        if do_only_cited and raw_refs:
+                            cited = RagflowClient.get_cited_indices(answer_text)
+                            if cited:
+                                raw_refs = [
+                                    r for i, r in enumerate(raw_refs) if i in cited
+                                ]
+
+                        refs = [Reference(**r) for r in raw_refs]
+                        result = QuestionResult(
+                            question_serial_no=q["serial_no"],
+                            question=q["question"],
+                            vendor_response=v_res,
+                            vendor_comment=v_com,
+                            status="completed",
+                            ai_response=verdict,
+                            details=details,
+                            references=refs,
+                        )
+                        set_span_attributes(
+                            q_span,
+                            {
+                                "output.value": answer_text,
+                                "assessment.verdict": verdict,
+                                "assessment.references.count": len(refs),
+                            },
+                        )
+                    except Exception as exc:
+                        reason = str(exc) or exc.__class__.__name__
+                        logger.error(
+                            "Question serial=%s failed: %s",
+                            q.get("serial_no", idx + 1),
+                            reason,
+                        )
+                        set_span_attributes(
+                            q_span,
+                            {
+                                "output.value": answer_text,
+                                "assessment.verdict": "failed",
+                                "error.message": reason,
+                            },
+                        )
+                        result = QuestionResult(
+                            question_serial_no=q["serial_no"],
+                            question=q["question"],
+                            vendor_response=v_res,
+                            vendor_comment=v_com,
+                            status="failed",
+                            failure_reason=reason,
+                            ai_response="Error",
+                            details="",
+                            references=[],
                         )
 
-                    response = await client.ask(
-                        chat_id, session_id, q_text, stream=False
-                    )
-                    answer_text = response.get("answer", "")
-                    verdict, details = RagflowClient.parse_yes_no(answer_text)
-                    raw_refs = RagflowClient.extract_references(response)
-
-                    # Filter to only cited references when configured
-                    if do_only_cited and raw_refs:
-                        cited = RagflowClient.get_cited_indices(answer_text)
-                        if cited:
-                            raw_refs = [
-                                r for i, r in enumerate(raw_refs) if i in cited
-                            ]
-
-                    refs = [Reference(**r) for r in raw_refs]
-
-                    result = QuestionResult(
-                        question_serial_no=q["serial_no"],
-                        question=q["question"],
-                        vendor_response=v_res,
-                        vendor_comment=v_com,
-                        ai_response=verdict,
-                        details=details,
-                        references=refs,
-                    )
-                    set_span_attributes(
-                        q_span,
-                        {
-                            "output.value": answer_text,
-                            "assessment.verdict": verdict,
-                            "assessment.references.count": len(refs),
-                        },
-                    )
-
-                    record.results.append(result)
-                    processed = len(record.results)
-                    # Batch DB writes: persist every N questions and on the last one.
-                    if processed % _PROGRESS_BATCH_SIZE == 0 or processed == total:
-                        await _update_status(
-                            record,
-                            questions_processed=processed,
-                            message=f"Processed {processed}/{total} questions",
-                        )
+                    nonlocal settled_count
+                    async with progress_lock:
+                        ordered_results[idx] = result
+                        record.results = [r for r in ordered_results if r is not None]
+                        settled_count += 1
+                        if settled_count % _PROGRESS_BATCH_SIZE == 0 or settled_count == total:
+                            await _update_status(
+                                record,
+                                questions_processed=settled_count,
+                                message=f"Processed {settled_count}/{total} questions",
+                            )
                     return result
 
-        tasks = [_process_one(q) for q in questions]
-        gathered = await asyncio.gather(*tasks, return_exceptions=True)
-
-        failed_count = 0
-        for i, res in enumerate(gathered):
-            if isinstance(res, BaseException):
-                failed_count += 1
-                logger.error("Question %d failed: %s", i, res)
+        tasks = [_process_one(idx, q) for idx, q in enumerate(questions)]
+        gathered = await asyncio.gather(*tasks)
+        failed_count = sum(1 for result in gathered if result.status == "failed")
         if failed_count:
             logger.warning("%d out of %d questions failed", failed_count, total)
-
+        record.results = [result for result in gathered]
+        await _update_status(
+            record,
+            questions_processed=total,
+            message=f"Processed {total}/{total} questions",
+        )
         return failed_count
 
 
@@ -759,9 +890,8 @@ async def run_assessment(
                         only_cited_references=only_cited_references,
                     )
 
-                    final_msg = "Assessment completed"
-                    if failed_count:
-                        final_msg = f"Assessment completed with {failed_count} question failure(s)"
+                    succeeded_count = len(questions) - failed_count
+                    final_msg = f"Assessment completed: {succeeded_count} succeeded, {failed_count} failed"
                     await _update_status(
                         record,
                         state=TaskState.COMPLETED,
@@ -1193,9 +1323,8 @@ async def run_assessment_for_session(
                         only_cited_references=only_cited_references,
                     )
 
-                    final_msg = "Assessment completed"
-                    if failed_count:
-                        final_msg = f"Assessment completed with {failed_count} question failure(s)"
+                    succeeded_count = len(questions) - failed_count
+                    final_msg = f"Assessment completed: {succeeded_count} succeeded, {failed_count} failed"
                     await _update_status(
                         record,
                         state=TaskState.COMPLETED,
@@ -1296,9 +1425,8 @@ async def run_assessment_from_dataset(
                         only_cited_references=only_cited_references,
                     )
 
-                    final_msg = "Assessment completed"
-                    if failed_count:
-                        final_msg = f"Assessment completed with {failed_count} question failure(s)"
+                    succeeded_count = len(questions) - failed_count
+                    final_msg = f"Assessment completed: {succeeded_count} succeeded, {failed_count} failed"
                     await _update_status(
                         record,
                         state=TaskState.COMPLETED,
@@ -1329,19 +1457,32 @@ def get_paginated_results(
     page = max(1, min(page, total_pages))
     start = (page - 1) * page_size
     end = start + page_size
+    dataset_ids = record.ragflow.dataset_ids or (
+        [record.ragflow.dataset_id] if record.ragflow.dataset_id else []
+    )
+    failed_questions = [
+        {
+            "question_serial_no": result.question_serial_no,
+            "question": result.question,
+            "reason": result.failure_reason or "Question processing failed",
+        }
+        for result in record.results
+        if str(result.status) == "failed"
+    ]
+    succeeded_count = sum(1 for result in record.results if str(result.status) != "failed")
     return {
         "task_id": record.task_id,
         "state": record.status.state,
         "total_questions": record.status.total_questions,
         "questions_processed": record.status.questions_processed,
+        "questions_succeeded": succeeded_count,
+        "questions_failed": len(failed_questions),
+        "failed_questions": failed_questions,
         "results": record.results[start:end],
         "page": page,
         "page_size": page_size,
         "total_pages": total_pages,
-        "dataset_id": record.ragflow.dataset_id or None,
-        "dataset_ids": record.ragflow.dataset_ids or (
-            [record.ragflow.dataset_id] if record.ragflow.dataset_id else []
-        ),
+        "dataset_ids": dataset_ids,
         "chat_id": record.ragflow.chat_id or None,
         "session_id": record.ragflow.session_id or None,
         "document_ids": record.ragflow.document_ids or [],
