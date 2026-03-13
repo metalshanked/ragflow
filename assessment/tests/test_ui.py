@@ -19,10 +19,15 @@ def test_ui_page_includes_icon_links_and_header_logo():
         response = client.get("/ui")
 
     assert response.status_code == 200
-    assert 'rel="icon" href="/favicon.ico?v=2"' in response.text
-    assert 'rel="shortcut icon" href="/favicon.ico?v=2"' in response.text
-    assert '<img src="/icon.svg" alt=""/>' in response.text
-    assert "authBar.style.display = authType === 'ldap' ? 'flex' : 'none';" in response.text
+    assert 'rel="icon" href="/favicon.ico"' in response.text
+    assert 'rel="shortcut icon" href="/favicon.ico"' in response.text
+    assert 'rel="apple-touch-icon" href="/favicon.ico"' in response.text
+    assert '<img src="/favicon.ico" alt=""/>' in response.text
+    assert 'id="login-screen"' in response.text
+    assert 'id="btn-logout"' in response.text
+    assert "AUTH_MODE = authType;" in response.text
+    assert "Refresh Token" not in response.text
+    assert ">Verify<" not in response.text
 
 
 def test_icon_routes_serve_svg_and_png_assets():

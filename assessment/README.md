@@ -131,6 +131,13 @@ export ASSESSMENT_LDAP_SERVER_URI=ldap://dc1.example.local:389
 export ASSESSMENT_LDAP_USER_BASE_DN="OU=Users,DC=example,DC=local"
 export ASSESSMENT_LDAP_GROUP_ROLE_MAPPING_JSON='{"viewer":["RGF-Readers"],"operator":["RGF-Operators"],"admin":["RGF-Admins"]}'
 
+# Optional: LDAP search-bind mode (leave USER_DN_TEMPLATE empty)
+export ASSESSMENT_LDAP_USER_DN_TEMPLATE=
+export ASSESSMENT_LDAP_BIND_DN='CN=svc-ragflow,OU=Service Accounts,DC=example,DC=local'
+export ASSESSMENT_LDAP_BIND_PASSWORD='replace-with-service-account-password'
+export ASSESSMENT_LDAP_USER_BASE_DN='DC=example,DC=local'
+export ASSESSMENT_LDAP_USER_FILTER='(&(objectClass=user)(sAMAccountName={username}))'
+
 # Optional: SSL / TLS settings for RAGFlow connection
 export ASSESSMENT_VERIFY_SSL=false                   # disable SSL verification (e.g. self-signed certs)
 export ASSESSMENT_SSL_CA_CERT=/path/to/ca-bundle.pem  # or point to a custom CA / self-signed cert
@@ -1171,6 +1178,42 @@ The assessment app's `RagflowClient` has been updated to handle these cases by:
 If you continue to see permission errors, please verify:
 1. Your `ASSESSMENT_RAGFLOW_API_KEY` is valid and hasn't expired.
 2. The user associated with the API key has the necessary quota and permissions in RAGFlow to create datasets and chat assistants.
+
+### LDAP / Active Directory Authentication
+
+If LDAP login returns `401 Invalid username or password`, check the following first:
+
+1. `ASSESSMENT_LDAP_USER_FILTER` must use Python-style placeholders such as `{username}`.
+2. Do not use `%s` in LDAP filters. The app does not substitute `%s`, so a filter like `(&(objectClass=user)(sAMAccountName=%s))` will search for the literal string `%s`.
+3. In search-bind mode, leave `ASSESSMENT_LDAP_USER_DN_TEMPLATE` empty or unset.
+4. In direct-bind mode, make sure `ASSESSMENT_LDAP_USER_DN_TEMPLATE` matches the format your AD expects, such as `{username}@example.com`.
+
+Correct example:
+
+```bash
+export ASSESSMENT_LDAP_USER_FILTER='(&(objectClass=user)(sAMAccountName={username}))'
+```
+
+Incorrect example:
+
+```bash
+export ASSESSMENT_LDAP_USER_FILTER='(&(objectClass=user)(sAMAccountName=%s))'
+```
+
+If Active Directory logs or LDAP bind errors show `AcceptSecurityContext ... data 52e`, that usually means AD rejected the bind credentials or bind identity format. Common causes are:
+
+- The password is wrong.
+- The username being entered is not the real `sAMAccountName`.
+- The direct-bind template is wrong for your domain.
+- The app is in direct-bind mode when you intended to use search-bind mode.
+
+Useful debug settings while diagnosing LDAP:
+
+```bash
+export ASSESSMENT_LOG_LEVEL=DEBUG
+export ASSESSMENT_LOG_JSON=false
+export ASSESSMENT_LOG_TO_CONSOLE=true
+```
 
 ## Project Structure
 

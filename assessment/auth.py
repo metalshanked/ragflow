@@ -398,6 +398,7 @@ def _ldap_authenticate_sync(username: str, password: str) -> tuple[list[str], li
         if settings.ldap_user_dn_template.strip():
             logger.debug("LDAP auth using direct bind template for user=%s", username)
             user_dn = settings.ldap_user_dn_template.format(username=username)
+            logger.debug("LDAP direct bind resolved user_dn=%s", user_dn)
             user_conn = Connection(
                 server,
                 user=user_dn,

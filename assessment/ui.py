@@ -45,13 +45,8 @@ def _base_path(request: Request) -> str:
     return root_path.rstrip("/")
 
 
-def _icon_href(base_path: str) -> str:
-    return f"{base_path}/icon.svg" if base_path else "/icon.svg"
-
-
 def _favicon_href(base_path: str) -> str:
-    prefix = f"{base_path}/favicon.ico" if base_path else "/favicon.ico"
-    return f"{prefix}?v=2"
+    return f"{base_path}/favicon.ico" if base_path else "/favicon.ico"
 
 
 @router.get("/ui", response_class=HTMLResponse, include_in_schema=False)
@@ -60,7 +55,6 @@ async def ui_page(request: Request):
     base_path = _base_path(request)
     return HTMLResponse(
         content=_build_html(
-            icon_href=_icon_href(base_path),
             favicon_href=_favicon_href(base_path),
         ),
         status_code=200,
@@ -97,7 +91,7 @@ async def favicon() -> Response:
     )
 
 
-def _build_html(*, icon_href: str, favicon_href: str) -> str:
+def _build_html(*, favicon_href: str) -> str:
     return r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -105,15 +99,18 @@ def _build_html(*, icon_href: str, favicon_href: str) -> str:
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <link rel="icon" href="__FAVICON_HREF__" sizes="any" type="image/x-icon"/>
 <link rel="shortcut icon" href="__FAVICON_HREF__" type="image/x-icon"/>
+<link rel="apple-touch-icon" href="__FAVICON_HREF__"/>
 <title>Assessment API – Dashboard</title>
 <style>
 :root{--bg:#f5f7fa;--card:#fff;--primary:#4361ee;--primary-hover:#3a56d4;--danger:#ef476f;--success:#06d6a0;--warn:#ffd166;--text:#212529;--muted:#6c757d;--border:#dee2e6;--radius:8px;--disabled:#a0aec0}
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);line-height:1.6;padding:0}
-header{background:var(--primary);color:#fff;padding:1rem 2rem;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.5rem}
+header{background:var(--primary);color:#fff;padding:1rem 2rem;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:.75rem}
 header h1{font-size:1.3rem;font-weight:600;display:flex;align-items:center;gap:.65rem}
 header h1 img{width:28px;height:28px;display:block;flex:0 0 auto}
 header .info{font-size:.85rem;opacity:.85}
+.header-actions{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;justify-content:flex-end}
+.session-pill{display:inline-flex;align-items:center;padding:.35rem .7rem;border-radius:999px;background:rgba(255,255,255,.18);font-size:.82rem}
 .container{max-width:1200px;margin:1.5rem auto;padding:0 1rem}
 .tabs{display:flex;gap:4px;margin-bottom:1rem;flex-wrap:wrap}
 .tab{padding:.5rem 1rem;border:none;background:var(--card);cursor:pointer;border-radius:var(--radius) var(--radius) 0 0;font-size:.9rem;color:var(--muted);border-bottom:2px solid transparent}
@@ -144,10 +141,14 @@ th{background:var(--bg);font-weight:600;position:sticky;top:0}
 .toast{position:fixed;bottom:1.5rem;right:1.5rem;padding:.8rem 1.2rem;border-radius:var(--radius);color:#fff;font-size:.9rem;z-index:999;opacity:0;transition:opacity .3s}
 .toast.show{opacity:1}
 .toast-ok{background:var(--success)}.toast-err{background:var(--danger)}
-#auth-bar{display:flex;gap:1rem;align-items:flex-end;margin-bottom:1rem;flex-wrap:wrap;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:.8rem}
-#auth-bar .field{display:flex;flex-direction:column;gap:.25rem;min-width:180px}
-#auth-bar .field input{max-width:320px}
-#auth-status{font-size:.82rem;color:var(--muted);margin-left:auto}
+.login-screen{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:1.5rem;background:linear-gradient(180deg,#eef4ff 0%,#f5f7fa 48%,#dfe9ff 100%);z-index:1100}
+.login-card{width:min(460px,100%);background:rgba(255,255,255,.96);border:1px solid rgba(67,97,238,.12);border-radius:20px;box-shadow:0 24px 60px rgba(36,55,99,.16);padding:2rem}
+.login-card h2{font-size:1.4rem;margin-bottom:.35rem}
+.login-card p{color:var(--muted);margin-bottom:1rem}
+.login-mark{display:flex;align-items:center;gap:.9rem;margin-bottom:1.25rem}
+.login-mark img{width:52px;height:52px;display:block}
+.login-field{display:flex;flex-direction:column;gap:.3rem;margin-bottom:.85rem}
+.login-status{font-size:.84rem;color:var(--muted);margin-top:.85rem;min-height:1.2rem}
 .detail-grid{display:grid;grid-template-columns:160px 1fr;gap:.3rem .8rem;font-size:.9rem;margin:.8rem 0}
 .detail-grid dt{font-weight:600;color:var(--muted)}
 .detail-grid dd{word-break:break-all}
@@ -181,35 +182,41 @@ th{background:var(--bg);font-weight:600;position:sticky;top:0}
 .auto-refresh{display:flex;align-items:center;gap:.5rem;font-size:.85rem}
 .auto-refresh label{margin:0;font-weight:normal}
 .json-error{border-color:var(--danger) !important;background-color:#ffebee !important}
-@media(max-width:600px){.row{flex-direction:column}.tabs{gap:2px}}
+@media(max-width:600px){.row{flex-direction:column}.tabs{gap:2px}.header-actions{justify-content:flex-start}}
 </style>
 </head>
 <body>
+<div class="login-screen hidden" id="login-screen">
+  <div class="login-card">
+    <div class="login-mark">
+      <img src="__FAVICON_HREF__" alt=""/>
+      <div>
+        <h2>Assessment Dashboard</h2>
+        <p>Sign in with your LDAP account to access the app.</p>
+      </div>
+    </div>
+    <div class="login-field">
+      <label style="margin:0">Username</label>
+      <input type="text" id="auth-username" placeholder="username" onkeydown="if(event.key==='Enter'){loginLdap();}"/>
+    </div>
+    <div class="login-field">
+      <label style="margin:0">Password</label>
+      <input type="password" id="auth-password" placeholder="password" onkeydown="if(event.key==='Enter'){loginLdap();}"/>
+    </div>
+    <button class="btn btn-primary" id="btn-login" onclick="loginLdap()">Sign In</button>
+    <div class="login-status" id="login-status"></div>
+  </div>
+</div>
 <header>
-  <h1><img src="__ICON_HREF__" alt=""/>Assessment API Dashboard</h1>
-  <span class="info" id="hdr-info"></span>
+  <h1><img src="__FAVICON_HREF__" alt=""/>Assessment API Dashboard</h1>
+  <div class="header-actions">
+    <span class="info" id="hdr-info"></span>
+    <span class="session-pill hidden" id="session-summary"></span>
+    <button class="btn btn-outline btn-sm hidden" id="btn-logout" onclick="logout()">Logout</button>
+  </div>
 </header>
 
-<div class="container">
-  <!-- Auth Bar -->
-  <div id="auth-bar">
-    <div class="field">
-      <label style="margin:0">LDAP Username</label>
-      <input type="text" id="auth-username" placeholder="username"/>
-    </div>
-    <div class="field">
-      <label style="margin:0">LDAP Password</label>
-      <input type="password" id="auth-password" placeholder="password"/>
-    </div>
-    <div style="display:flex;gap:.5rem;flex-wrap:wrap">
-      <button class="btn btn-primary btn-sm" id="btn-login" onclick="loginLdap()">Login</button>
-      <button class="btn btn-outline btn-sm" id="btn-refresh-token" onclick="refreshSessionToken()">Refresh Token</button>
-      <button class="btn btn-outline btn-sm" onclick="verifySessionToken()">Verify</button>
-      <button class="btn btn-danger btn-sm" onclick="logout()">Logout</button>
-    </div>
-    <span id="auth-status"></span>
-  </div>
-
+<div class="container" id="app-shell">
   <!-- Tabs -->
   <div class="tabs">
     <button class="tab active" data-tab="tasks" onclick="switchTab(this)">&#128203; Tasks</button>
@@ -460,9 +467,10 @@ let ACCESS_TOKEN = localStorage.getItem('assessment_access_token') || '';
 let REFRESH_TOKEN = localStorage.getItem('assessment_refresh_token') || '';
 let AUTH_USERNAME = localStorage.getItem('assessment_auth_username') || '';
 let AUTH_ROLES = (localStorage.getItem('assessment_auth_roles') || '').split(',').filter(Boolean);
+let AUTH_MODE = 'disabled';
 
 document.getElementById('auth-username').value = AUTH_USERNAME;
-updateAuthStatus();
+updateAuthUi();
 
 function headers(){const h={};if(ACCESS_TOKEN)h['Authorization']='Bearer '+ACCESS_TOKEN;return h;}
 
@@ -475,17 +483,43 @@ function _storeSession(data){
   if(REFRESH_TOKEN){localStorage.setItem('assessment_refresh_token', REFRESH_TOKEN);}else{localStorage.removeItem('assessment_refresh_token');}
   if(AUTH_USERNAME){localStorage.setItem('assessment_auth_username', AUTH_USERNAME);}else{localStorage.removeItem('assessment_auth_username');}
   localStorage.setItem('assessment_auth_roles', AUTH_ROLES.join(','));
-  updateAuthStatus();
+  updateAuthUi();
 }
 
-function updateAuthStatus(){
-  const statusEl=document.getElementById('auth-status');
-  if(!statusEl)return;
-  if(ACCESS_TOKEN){
-    const roleText = AUTH_ROLES.length ? ' ['+AUTH_ROLES.join(', ')+']' : '';
-    statusEl.textContent='Authenticated as '+(AUTH_USERNAME||'user')+roleText;
-  }else{
-    statusEl.textContent='Not authenticated';
+function updateAuthUi(){
+  const loginScreen=document.getElementById('login-screen');
+  const loginStatus=document.getElementById('login-status');
+  const appShell=document.getElementById('app-shell');
+  const sessionSummary=document.getElementById('session-summary');
+  const logoutBtn=document.getElementById('btn-logout');
+  const requiresLogin = AUTH_MODE === 'ldap';
+  const signedIn = !!ACCESS_TOKEN;
+
+  if(sessionSummary){
+    if(signedIn){
+      const roleText = AUTH_ROLES.length ? ' ['+AUTH_ROLES.join(', ')+']' : '';
+      sessionSummary.textContent=(AUTH_USERNAME||'user')+roleText;
+      sessionSummary.classList.remove('hidden');
+    }else{
+      sessionSummary.textContent='';
+      sessionSummary.classList.add('hidden');
+    }
+  }
+  if(logoutBtn){
+    logoutBtn.classList.toggle('hidden', !signedIn);
+  }
+  if(loginScreen){
+    loginScreen.classList.toggle('hidden', !(requiresLogin && !signedIn));
+  }
+  if(appShell){
+    appShell.classList.toggle('hidden', requiresLogin && !signedIn);
+  }
+  if(loginStatus){
+    if(requiresLogin && !signedIn){
+      loginStatus.textContent='Sign in with LDAP to continue.';
+    }else{
+      loginStatus.textContent='';
+    }
   }
 }
 
@@ -504,8 +538,12 @@ async function loginLdap(){
     if(!r.ok)throw new Error(data.detail||('Login failed ('+r.status+')'));
     _storeSession(data);
     document.getElementById('auth-password').value='';
+    const loginStatus=document.getElementById('login-status');
+    if(loginStatus)loginStatus.textContent='';
     toast('Login successful','ok');
   }catch(e){
+    const loginStatus=document.getElementById('login-status');
+    if(loginStatus)loginStatus.textContent=e.message;
     toast(e.message,'err');
   }finally{
     btnReset('btn-login');
@@ -532,7 +570,7 @@ async function refreshSessionToken(){
   }
 }
 
-async function verifySessionToken(){
+async function verifySessionToken(showFeedback=true){
   try{
     const r=await fetch(API+'/auth/verify',{headers:headers()});
     const data=await r.json().catch(()=>({detail:'Invalid server response'}));
@@ -542,13 +580,22 @@ async function verifySessionToken(){
       AUTH_ROLES = Array.isArray(data.roles) ? data.roles : AUTH_ROLES;
       localStorage.setItem('assessment_auth_username', AUTH_USERNAME || '');
       localStorage.setItem('assessment_auth_roles', AUTH_ROLES.join(','));
-      updateAuthStatus();
-      toast('Token is valid','ok');
+      updateAuthUi();
+      if(showFeedback)toast('Token is valid','ok');
     }else{
-      toast('Token is invalid','err');
+      if(showFeedback)toast('Token is invalid','err');
     }
   }catch(e){
-    toast(e.message,'err');
+    ACCESS_TOKEN='';
+    REFRESH_TOKEN='';
+    AUTH_USERNAME='';
+    AUTH_ROLES=[];
+    localStorage.removeItem('assessment_access_token');
+    localStorage.removeItem('assessment_refresh_token');
+    localStorage.removeItem('assessment_auth_username');
+    localStorage.removeItem('assessment_auth_roles');
+    updateAuthUi();
+    if(showFeedback)toast(e.message,'err');
   }
 }
 
@@ -561,7 +608,7 @@ function logout(){
   localStorage.removeItem('assessment_refresh_token');
   localStorage.removeItem('assessment_auth_username');
   localStorage.removeItem('assessment_auth_roles');
-  updateAuthStatus();
+  updateAuthUi();
   toast('Logged out','ok');
 }
 
@@ -1043,15 +1090,11 @@ async function checkHealth(){
     const d=await r.json();
     el.textContent=JSON.stringify(d,null,2);
     const authType=(d.auth_type|| (d.auth_enabled ? 'jwt' : 'disabled'));
+    AUTH_MODE = authType;
     document.getElementById('hdr-info').textContent='RAGFlow: '+d.ragflow_url+' | Auth: '+authType;
-    const authBar=document.getElementById('auth-bar');
-    if(authBar){
-      authBar.style.display = authType === 'ldap' ? 'flex' : 'none';
-      if(authType === 'disabled'){
-        document.getElementById('auth-status').textContent='Authentication disabled';
-      }else if(authType === 'jwt'){
-        document.getElementById('auth-status').textContent='JWT auth is enabled; LDAP login is unavailable in this mode.';
-      }
+    updateAuthUi();
+    if(authType === 'ldap' && ACCESS_TOKEN){
+      await verifySessionToken(false);
     }
   }catch(e){el.textContent='Error: '+e.message;}
   finally{btn.disabled=false;}
@@ -1107,9 +1150,6 @@ function escAttr(s){return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').
 
 // Auto-check health on load
 checkHealth();
-if(ACCESS_TOKEN){
-  verifySessionToken();
-}
 /* ------------------------------------------------------------------ */
 /* Manage Data                                                         */
 /* ------------------------------------------------------------------ */
@@ -1284,4 +1324,4 @@ function toggleAll(source, className) {
 
 </script>
 </body>
-</html>""".replace("__ICON_HREF__", icon_href).replace("__FAVICON_HREF__", favicon_href)
+</html>""".replace("__FAVICON_HREF__", favicon_href)
