@@ -1,634 +1,1182 @@
 {
-	"info": {
-		"_postman_id": "ragflow-assessment-api",
-		"name": "RAGFlow Assessment API",
-		"description": "Postman collection for the RAGFlow Assessment API.\n\nThis API wraps RAGFlow's HTTP APIs to verify assessment questions (from an Excel file) against evidence documents. It supports three workflows:\n\n1. **Single-call** – Upload everything at once\n2. **From existing dataset(s)** – Use already-parsed RAGFlow datasets\n3. **Two-phase** – Create session → upload docs incrementally → start\n\n## Setup\n\n1. Set the `base_url` variable to your Assessment API address (e.g. `http://localhost:8000`)\n2. If using a subpath, set `base_path` (e.g. `/assessment`)\n3. If JWT auth is enabled, set `jwt_token` to a valid token\n4. Update `task_id`, `dataset_id`, etc. as you use the API",
-		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
-	},
-	"variable": [
-		{
-			"key": "base_url",
-			"value": "http://localhost:8000",
-			"description": "Assessment API base URL (host + port)"
-		},
-		{
-			"key": "base_path",
-			"value": "",
-			"description": "Optional subpath prefix (e.g. /assessment). Leave empty if not configured."
-		},
-		{
-			"key": "jwt_token",
-			"value": "",
-			"description": "JWT bearer token for authentication. Leave empty if auth is disabled."
-		},
-		{
-			"key": "task_id",
-			"value": "",
-			"description": "Assessment task ID (populated after creating an assessment)"
-		},
-		{
-			"key": "dataset_id",
-			"value": "",
-			"description": "RAGFlow dataset ID (populated after creating a session or for from-dataset workflow)"
-		},
-		{
-			"key": "dataset_ids",
-			"value": "",
-			"description": "Comma-separated RAGFlow dataset IDs for multi-dataset assessments"
-		},
-		{
-			"key": "image_id",
-			"value": "",
-			"description": "RAGFlow chunk image ID (from reference results)"
-		},
-		{
-			"key": "document_id",
-			"value": "",
-			"description": "RAGFlow document ID (from reference results)"
-		}
-	],
-	"auth": {
-		"type": "bearer",
-		"bearer": [
-			{
-				"key": "token",
-				"value": "{{jwt_token}}",
-				"type": "string"
-			}
-		]
-	},
-	"item": [
-		{
-			"name": "Health",
-			"item": [
-				{
-					"name": "Health Check",
-					"request": {
-						"auth": {
-							"type": "noauth"
-						},
-						"method": "GET",
-						"header": [],
-						"url": {
-							"raw": "{{base_url}}{{base_path}}/health",
-							"host": ["{{base_url}}{{base_path}}"],
-							"path": ["health"]
-						},
-						"description": "Health check endpoint. Not behind authentication.\n\nReturns server status, RAGFlow URL, base path, and whether auth is enabled."
-					},
-					"response": [
-						{
-							"name": "Healthy",
-							"originalRequest": {
-								"method": "GET",
-								"url": {
-									"raw": "{{base_url}}{{base_path}}/health",
-									"host": ["{{base_url}}{{base_path}}"],
-									"path": ["health"]
-								}
-							},
-							"status": "OK",
-							"code": 200,
-							"body": "{\n  \"status\": \"ok\",\n  \"ragflow_url\": \"http://localhost:9380\",\n  \"base_path\": \"/\",\n  \"auth_enabled\": false\n}"
-						}
-					]
-				}
-			]
-		},
-		{
-			"name": "Option A: Single-call Workflow",
-			"description": "Upload questions Excel and all evidence documents in one request. Best for small assessments where all docs are ready.",
-			"item": [
-				{
-					"name": "Start Assessment (all docs at once)",
-					"event": [
-						{
-							"listen": "test",
-							"script": {
-								"type": "text/javascript",
-								"exec": [
-									"if (pm.response.code === 202) {",
-									"    var jsonData = pm.response.json();",
-									"    pm.collectionVariables.set('task_id', jsonData.task_id);",
-									"    console.log('task_id saved:', jsonData.task_id);",
-									"}"
-								]
-							}
-						}
-					],
-					"request": {
-						"method": "POST",
-						"header": [],
-						"body": {
-							"mode": "formdata",
-							"formdata": [
-								{
-									"key": "questions_file",
-									"description": "Excel file with columns A = Question_Serial_No, B = Question",
-									"type": "file",
-									"src": ""
-								},
-								{
-									"key": "evidence_files",
-									"description": "Evidence documents (PDF, PPTX, XLSX, DOCX, etc.). Add multiple entries for multiple files.",
-									"type": "file",
-									"src": ""
-								},
-								{
-									"key": "dataset_name",
-									"value": "",
-									"description": "(Optional) Custom RAGFlow dataset name",
-									"type": "text",
-									"disabled": true
-								},
-								{
-									"key": "chat_name",
-									"value": "",
-									"description": "(Optional) Custom chat assistant name",
-									"type": "text",
-									"disabled": true
-								}
-							]
-						},
-						"url": {
-							"raw": "{{base_url}}{{base_path}}/api/v1/assessments",
-							"host": ["{{base_url}}{{base_path}}"],
-							"path": ["api", "v1", "assessments"]
-						},
-						"description": "Upload a questions Excel file and all evidence documents in one request.\n\nReturns immediately with a `task_id` (202 Accepted). Poll `GET /assessments/{task_id}` for progress.\n\nThe `task_id` is automatically saved to collection variables."
-					},
-					"response": [
-						{
-							"name": "Assessment Started",
-							"originalRequest": {
-								"method": "POST",
-								"url": {
-									"raw": "{{base_url}}{{base_path}}/api/v1/assessments",
-									"host": ["{{base_url}}{{base_path}}"],
-									"path": ["api", "v1", "assessments"]
-								}
-							},
-							"status": "Accepted",
-							"code": 202,
-							"body": "{\n  \"task_id\": \"abc123def456\",\n  \"state\": \"pending\",\n  \"pipeline_stage\": \"idle\",\n  \"total_questions\": 25,\n  \"questions_processed\": 0\n}"
-						}
-					]
-				}
-			]
-		},
-		{
-			"name": "Option B: From Existing Dataset(s)",
-			"description": "Run assessment against dataset(s) already uploaded and parsed in RAGFlow. Skips dataset creation, document upload, and parsing entirely — significantly faster.",
-			"item": [
-				{
-					"name": "Start Assessment from Dataset(s)",
-					"event": [
-						{
-							"listen": "test",
-							"script": {
-								"type": "text/javascript",
-								"exec": [
-									"if (pm.response.code === 202) {",
-									"    var jsonData = pm.response.json();",
-									"    pm.collectionVariables.set('task_id', jsonData.task_id);",
-									"    console.log('task_id saved:', jsonData.task_id);",
-									"}"
-								]
-							}
-						}
-					],
-					"request": {
-						"method": "POST",
-						"header": [],
-						"body": {
-							"mode": "formdata",
-							"formdata": [
-								{
-									"key": "questions_file",
-									"description": "Excel file with columns A = Question_Serial_No, B = Question",
-									"type": "file",
-									"src": ""
-								},
-								{
-									"key": "dataset_ids",
-									"value": "{{dataset_ids}}",
-									"description": "One or more existing RAGFlow dataset IDs (comma-separated, e.g. id1,id2,id3). Documents must already be uploaded & parsed.",
-									"type": "text"
-								},
-								{
-									"key": "chat_name",
-									"value": "",
-									"description": "(Optional) Custom chat assistant name",
-									"type": "text",
-									"disabled": true
-								}
-							]
-						},
-						"url": {
-							"raw": "{{base_url}}{{base_path}}/api/v1/assessments/from-dataset",
-							"host": ["{{base_url}}{{base_path}}"],
-							"path": ["api", "v1", "assessments", "from-dataset"]
-						},
-						"description": "Run an assessment against one or more existing RAGFlow datasets.\n\nSkips dataset creation, document upload, and parsing entirely. The datasets must already contain uploaded and parsed evidence documents.\n\nPass multiple dataset IDs as a comma-separated string (e.g. `id1,id2,id3`).\n\nThe `task_id` is automatically saved to collection variables."
-					},
-					"response": [
-						{
-							"name": "Assessment Started",
-							"originalRequest": {
-								"method": "POST",
-								"url": {
-									"raw": "{{base_url}}{{base_path}}/api/v1/assessments/from-dataset",
-									"host": ["{{base_url}}{{base_path}}"],
-									"path": ["api", "v1", "assessments", "from-dataset"]
-								}
-							},
-							"status": "Accepted",
-							"code": 202,
-							"body": "{\n  \"task_id\": \"abc123def456\",\n  \"state\": \"pending\",\n  \"pipeline_stage\": \"idle\",\n  \"total_questions\": 25,\n  \"questions_processed\": 0\n}"
-						}
-					]
-				}
-			]
-		},
-		{
-			"name": "Option C: Two-phase Workflow",
-			"description": "Create a session, upload evidence documents incrementally (repeat as needed), then start the assessment. Best for large/incremental uploads or unreliable networks.",
-			"item": [
-				{
-					"name": "Phase 1: Create Session",
-					"event": [
-						{
-							"listen": "test",
-							"script": {
-								"type": "text/javascript",
-								"exec": [
-									"if (pm.response.code === 201) {",
-									"    var jsonData = pm.response.json();",
-									"    pm.collectionVariables.set('task_id', jsonData.task_id);",
-									"    pm.collectionVariables.set('dataset_id', jsonData.dataset_id);",
-									"    console.log('task_id saved:', jsonData.task_id);",
-									"    console.log('dataset_id saved:', jsonData.dataset_id);",
-									"}"
-								]
-							}
-						}
-					],
-					"request": {
-						"method": "POST",
-						"header": [],
-						"body": {
-							"mode": "formdata",
-							"formdata": [
-								{
-									"key": "questions_file",
-									"description": "Excel file with columns A = Question_Serial_No, B = Question",
-									"type": "file",
-									"src": ""
-								},
-								{
-									"key": "dataset_name",
-									"value": "",
-									"description": "(Optional) Custom RAGFlow dataset name",
-									"type": "text",
-									"disabled": true
-								}
-							]
-						},
-						"url": {
-							"raw": "{{base_url}}{{base_path}}/api/v1/assessments/sessions",
-							"host": ["{{base_url}}{{base_path}}"],
-							"path": ["api", "v1", "assessments", "sessions"]
-						},
-						"description": "Phase 1 – Create an assessment session.\n\nUploads the questions Excel and creates a RAGFlow dataset. Returns a `task_id` and `dataset_id`.\n\nEvidence documents can then be uploaded incrementally via Phase 2.\n\nBoth `task_id` and `dataset_id` are automatically saved to collection variables."
-					},
-					"response": [
-						{
-							"name": "Session Created",
-							"originalRequest": {
-								"method": "POST",
-								"url": {
-									"raw": "{{base_url}}{{base_path}}/api/v1/assessments/sessions",
-									"host": ["{{base_url}}{{base_path}}"],
-									"path": ["api", "v1", "assessments", "sessions"]
-								}
-							},
-							"status": "Created",
-							"code": 201,
-							"body": "{\n  \"task_id\": \"abc123def456\",\n  \"dataset_id\": \"ds_789\",\n  \"state\": \"awaiting_documents\",\n  \"message\": \"Session created. Upload evidence documents then start the assessment.\"\n}"
-						}
-					]
-				},
-				{
-					"name": "Phase 2: Upload Documents (repeatable)",
-					"request": {
-						"method": "POST",
-						"header": [],
-						"body": {
-							"mode": "formdata",
-							"formdata": [
-								{
-									"key": "files",
-									"description": "Evidence documents to add (PDF, PPTX, XLSX, DOCX, etc.). Add multiple entries for multiple files.",
-									"type": "file",
-									"src": ""
-								}
-							]
-						},
-						"url": {
-							"raw": "{{base_url}}{{base_path}}/api/v1/assessments/sessions/{{task_id}}/documents",
-							"host": ["{{base_url}}{{base_path}}"],
-							"path": ["api", "v1", "assessments", "sessions", "{{task_id}}", "documents"]
-						},
-						"description": "Phase 2 (repeatable) – Upload one or more evidence documents to the session's dataset.\n\nCan be called **multiple times** before starting the assessment. Each call adds documents to the same dataset."
-					},
-					"response": [
-						{
-							"name": "Documents Uploaded",
-							"originalRequest": {
-								"method": "POST",
-								"url": {
-									"raw": "{{base_url}}{{base_path}}/api/v1/assessments/sessions/{{task_id}}/documents",
-									"host": ["{{base_url}}{{base_path}}"],
-									"path": ["api", "v1", "assessments", "sessions", "{{task_id}}", "documents"]
-								}
-							},
-							"status": "OK",
-							"code": 200,
-							"body": "{\n  \"task_id\": \"abc123def456\",\n  \"dataset_id\": \"ds_789\",\n  \"uploaded_document_ids\": [\"doc_1\", \"doc_2\"],\n  \"total_documents\": 5,\n  \"message\": \"Uploaded 2 document(s). Total: 5.\"\n}"
-						}
-					]
-				},
-				{
-					"name": "Phase 3: Start Assessment",
-					"request": {
-						"method": "POST",
-						"header": [],
-						"body": {
-							"mode": "formdata",
-							"formdata": [
-								{
-									"key": "chat_name",
-									"value": "",
-									"description": "(Optional) Custom chat assistant name",
-									"type": "text",
-									"disabled": true
-								}
-							]
-						},
-						"url": {
-							"raw": "{{base_url}}{{base_path}}/api/v1/assessments/sessions/{{task_id}}/start",
-							"host": ["{{base_url}}{{base_path}}"],
-							"path": ["api", "v1", "assessments", "sessions", "{{task_id}}", "start"]
-						},
-						"description": "Phase 3 – Trigger the assessment pipeline.\n\nAll evidence documents must already be uploaded. The pipeline will parse documents, create a chat assistant, and process every question.\n\nReturns immediately (202 Accepted). Poll `GET /assessments/{task_id}` for progress."
-					},
-					"response": [
-						{
-							"name": "Assessment Started",
-							"originalRequest": {
-								"method": "POST",
-								"url": {
-									"raw": "{{base_url}}{{base_path}}/api/v1/assessments/sessions/{{task_id}}/start",
-									"host": ["{{base_url}}{{base_path}}"],
-									"path": ["api", "v1", "assessments", "sessions", "{{task_id}}", "start"]
-								}
-							},
-							"status": "Accepted",
-							"code": 202,
-							"body": "{\n  \"task_id\": \"abc123def456\",\n  \"state\": \"awaiting_documents\",\n  \"pipeline_stage\": \"idle\",\n  \"total_questions\": 25,\n  \"questions_processed\": 0\n}"
-						}
-					]
-				}
-			]
-		},
-		{
-			"name": "Task Status & Results",
-			"description": "Monitor task progress and retrieve results (JSON or Excel).",
-			"item": [
-				{
-					"name": "List All Tasks",
-					"request": {
-						"method": "GET",
-						"header": [],
-						"url": {
-							"raw": "{{base_url}}{{base_path}}/api/v1/assessments",
-							"host": ["{{base_url}}{{base_path}}"],
-							"path": ["api", "v1", "assessments"]
-						},
-						"description": "Return status of all assessment tasks."
-					},
-					"response": [
-						{
-							"name": "Task List",
-							"originalRequest": {
-								"method": "GET",
-								"url": {
-									"raw": "{{base_url}}{{base_path}}/api/v1/assessments",
-									"host": ["{{base_url}}{{base_path}}"],
-									"path": ["api", "v1", "assessments"]
-								}
-							},
-							"status": "OK",
-							"code": 200,
-							"body": "[\n  {\n    \"task_id\": \"abc123def456\",\n    \"state\": \"completed\",\n    \"pipeline_stage\": \"finalizing\",\n    \"progress_message\": \"Assessment completed\",\n    \"total_questions\": 25,\n    \"questions_processed\": 25\n  }\n]"
-						}
-					]
-				},
-				{
-					"name": "Get Task Status",
-					"request": {
-						"method": "GET",
-						"header": [],
-						"url": {
-							"raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}",
-							"host": ["{{base_url}}{{base_path}}"],
-							"path": ["api", "v1", "assessments", "{{task_id}}"]
-						},
-						"description": "Return current status and progress of a specific assessment task.\n\n**Pipeline stages:** idle → document_upload → document_parsing → chat_processing → finalizing\n\n**Task states:** pending → uploading → parsing → processing → completed (or failed)"
-					},
-					"response": [
-						{
-							"name": "Task In Progress",
-							"originalRequest": {
-								"method": "GET",
-								"url": {
-									"raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}",
-									"host": ["{{base_url}}{{base_path}}"],
-									"path": ["api", "v1", "assessments", "{{task_id}}"]
-								}
-							},
-							"status": "OK",
-							"code": 200,
-							"body": "{\n  \"task_id\": \"abc123def456\",\n  \"state\": \"processing\",\n  \"pipeline_stage\": \"chat_processing\",\n  \"progress_message\": \"Processed 10/25 questions\",\n  \"total_questions\": 25,\n  \"questions_processed\": 10,\n  \"created_at\": \"2026-02-13T11:00:00.000000\",\n  \"updated_at\": \"2026-02-13T11:05:00.000000\",\n  \"error\": null\n}"
-						},
-						{
-							"name": "Task Completed",
-							"originalRequest": {
-								"method": "GET",
-								"url": {
-									"raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}",
-									"host": ["{{base_url}}{{base_path}}"],
-									"path": ["api", "v1", "assessments", "{{task_id}}"]
-								}
-							},
-							"status": "OK",
-							"code": 200,
-							"body": "{\n  \"task_id\": \"abc123def456\",\n  \"state\": \"completed\",\n  \"pipeline_stage\": \"finalizing\",\n  \"progress_message\": \"Assessment completed\",\n  \"total_questions\": 25,\n  \"questions_processed\": 25,\n  \"created_at\": \"2026-02-13T11:00:00.000000\",\n  \"updated_at\": \"2026-02-13T11:10:00.000000\",\n  \"error\": null\n}"
-						}
-					]
-				},
-				{
-					"name": "Get Results (JSON, Paginated)",
-					"request": {
-						"method": "GET",
-						"header": [],
-						"url": {
-							"raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}/results?page=1&page_size=50",
-							"host": ["{{base_url}}{{base_path}}"],
-							"path": ["api", "v1", "assessments", "{{task_id}}", "results"],
-							"query": [
-								{
-									"key": "page",
-									"value": "1",
-									"description": "Page number (default: 1)"
-								},
-								{
-									"key": "page_size",
-									"value": "50",
-									"description": "Results per page (default: 50, max: 500)"
-								}
-							]
-						},
-						"description": "Retrieve assessment results in JSON with pagination.\n\nAvailable even while the task is still processing (returns partial results)."
-					},
-					"response": [
-						{
-							"name": "Results Page",
-							"originalRequest": {
-								"method": "GET",
-								"url": {
-									"raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}/results?page=1&page_size=50",
-									"host": ["{{base_url}}{{base_path}}"],
-									"path": ["api", "v1", "assessments", "{{task_id}}", "results"],
-									"query": [
-										{ "key": "page", "value": "1" },
-										{ "key": "page_size", "value": "50" }
-									]
-								}
-							},
-							"status": "OK",
-							"code": 200,
-       "body": "{\n  \"task_id\": \"abc123def456\",\n  \"state\": \"completed\",\n  \"total_questions\": 25,\n  \"questions_processed\": 25,\n  \"results\": [\n    {\n      \"question_serial_no\": 1,\n      \"question\": \"Does the organization have a data privacy policy?\",\n      \"ai_response\": \"Yes\",\n      \"details\": \"The evidence document contains a comprehensive data privacy policy covering data collection, storage, and processing practices.\",\n      \"references\": [\n        {\n          \"document_name\": \"privacy_policy.pdf\",\n          \"document_type\": \"pdf\",\n          \"page_number\": 3,\n          \"chunk_index\": null,\n          \"coordinates\": [120.5, 450.2, 80.0, 620.8],\n          \"snippet\": \"Section 2.1 defines the organization's approach to data privacy...\",\n          \"document_url\": \"/api/v1/proxy/document/doc123#page=3\",\n          \"image_url\": \"/api/v1/proxy/image/img456\"\n        },\n        {\n          \"document_name\": \"Evidence_List.xlsx\",\n          \"document_type\": \"excel\",\n          \"page_number\": null,\n          \"chunk_index\": 36,\n          \"coordinates\": null,\n          \"snippet\": \"P07: Physical \\u2013 Access Controls ...\",\n          \"document_url\": \"/api/v1/proxy/document/doc789\",\n          \"image_url\": null\n        }\n      ]\n    }\n  ],\n  \"page\": 1,\n  \"page_size\": 50,\n  \"total_pages\": 1\n}"
-						}
-					]
-				},
-				{
-					"name": "Download Results as Excel",
-					"request": {
-						"method": "GET",
-						"header": [],
-						"url": {
-							"raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}/results/excel",
-							"host": ["{{base_url}}{{base_path}}"],
-							"path": ["api", "v1", "assessments", "{{task_id}}", "results", "excel"]
-						},
-						"description": "Download the assessment results as an Excel (.xlsx) file.\n\nColumns: Question_Serial_No, Question, AI_Response, Details, References.\n\nOnly available when the task state is `completed` or `processing`."
-					},
-					"response": []
-				}
-			]
-		},
-		{
-			"name": "Proxy (RAGFlow Resources)",
-			"description": "Proxy endpoints that forward requests to RAGFlow so clients never see raw RAGFlow URLs. Reference results include these proxy URLs automatically.",
-			"item": [
-				{
-					"name": "Proxy: Get Image",
-					"request": {
-						"method": "GET",
-						"header": [],
-						"url": {
-							"raw": "{{base_url}}{{base_path}}/api/v1/proxy/image/{{image_id}}",
-							"host": ["{{base_url}}{{base_path}}"],
-							"path": ["api", "v1", "proxy", "image", "{{image_id}}"]
-						},
-						"description": "Proxy a RAGFlow chunk image.\n\nThe `image_id` comes from the `image_url` field in reference results. Streams the response directly from RAGFlow with caching headers."
-					},
-					"response": []
-				},
-				{
-					"name": "Proxy: Get Document",
-					"request": {
-						"method": "GET",
-						"header": [],
-						"url": {
-							"raw": "{{base_url}}{{base_path}}/api/v1/proxy/document/{{document_id}}",
-							"host": ["{{base_url}}{{base_path}}"],
-							"path": ["api", "v1", "proxy", "document", "{{document_id}}"]
-						},
-						"description": "Proxy a RAGFlow document download.\n\nThe `document_id` comes from the `document_url` field in reference results. Forwards content-type and content-disposition headers from RAGFlow."
-					},
-					"response": []
-				}
-			]
-		},
-		{
-			"name": "Documents (Standalone)",
-			"description": "Upload documents to an existing RAGFlow dataset outside of an assessment session.",
-			"item": [
-				{
-					"name": "Upload Documents to Dataset",
-					"request": {
-						"method": "POST",
-						"header": [],
-						"body": {
-							"mode": "formdata",
-							"formdata": [
-								{
-									"key": "dataset_id",
-									"value": "{{dataset_id}}",
-									"description": "Existing RAGFlow dataset ID",
-									"type": "text"
-								},
-								{
-									"key": "files",
-									"description": "Documents to upload (PDF, PPTX, XLSX, DOCX, etc.)",
-									"type": "file",
-									"src": ""
-								},
-								{
-									"key": "parse",
-									"value": "true",
-									"description": "Trigger parsing after upload (default: true)",
-									"type": "text"
-								}
-							]
-						},
-						"url": {
-							"raw": "{{base_url}}{{base_path}}/api/v1/native/documents/upload",
-							"host": ["{{base_url}}{{base_path}}"],
-							"path": ["api", "v1", "native", "documents", "upload"]
-						},
-						"description": "Upload one or more documents to an existing RAGFlow dataset (not tied to an assessment session).\n\nOptionally triggers parsing immediately."
-					},
-					"response": [
-						{
-							"name": "Documents Uploaded",
-							"originalRequest": {
-								"method": "POST",
-								"url": {
-									"raw": "{{base_url}}{{base_path}}/api/v1/native/documents/upload",
-									"host": ["{{base_url}}{{base_path}}"],
-									"path": ["api", "v1", "native", "documents", "upload"]
-								}
-							},
-							"status": "OK",
-							"code": 200,
-							"body": "{\n  \"dataset_id\": \"ds_789\",\n  \"document_ids\": [\"doc_1\", \"doc_2\"],\n  \"parsing_triggered\": true\n}"
-						}
-					]
-				}
-			]
-		}
-	]
+  "info": {
+    "_postman_id": "ragflow-assessment-api",
+    "name": "AI Assessments API",
+    "description": "Current Postman collection for the AI Assessments app. Includes health/docs, LDAP/JWT auth, all assessment workflows, task/results APIs, proxy render endpoints, and native dataset/document management.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8000",
+      "description": "API base URL"
+    },
+    {
+      "key": "base_path",
+      "value": "",
+      "description": "Optional subpath prefix such as /assessment"
+    },
+    {
+      "key": "jwt_token",
+      "value": "",
+      "description": "Bearer access token"
+    },
+    {
+      "key": "refresh_token",
+      "value": "",
+      "description": "Refresh token"
+    },
+    {
+      "key": "username",
+      "value": "",
+      "description": "Saved from auth responses"
+    },
+    {
+      "key": "task_id",
+      "value": "",
+      "description": "Assessment task id"
+    },
+    {
+      "key": "dataset_id",
+      "value": "",
+      "description": "Dataset id"
+    },
+    {
+      "key": "dataset_ids",
+      "value": "",
+      "description": "Comma-separated dataset ids"
+    },
+    {
+      "key": "document_id",
+      "value": "",
+      "description": "Document id"
+    },
+    {
+      "key": "image_id",
+      "value": "",
+      "description": "Image id"
+    },
+    {
+      "key": "file_hash",
+      "value": "",
+      "description": "Document content hash"
+    }
+  ],
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{jwt_token}}",
+        "type": "string"
+      }
+    ]
+  },
+  "item": [
+    {
+      "name": "Health and Docs",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/health"
+            },
+            "description": "Public health endpoint.",
+            "header": [],
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "response": [
+            {
+              "name": "Healthy",
+              "originalRequest": {
+                "method": "GET",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/health"
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"status\": \"ok\",\n  \"ragflow_url\": \"http://localhost:9380\",\n  \"base_path\": \"/\",\n  \"auth_enabled\": true,\n  \"ldap_enabled\": true,\n  \"auth_type\": \"ldap\",\n  \"otel_enabled\": false,\n  \"otel_endpoint\": null,\n  \"log_file_enabled\": false,\n  \"log_dir\": null\n}"
+            }
+          ]
+        },
+        {
+          "name": "OpenAPI JSON",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/openapi.json"
+            },
+            "description": "FastAPI OpenAPI document.",
+            "header": [],
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "Swagger UI",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/docs"
+            },
+            "description": "FastAPI Swagger UI.",
+            "header": [],
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        },
+        {
+          "name": "ReDoc",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/redoc"
+            },
+            "description": "FastAPI ReDoc UI.",
+            "header": [],
+            "auth": {
+              "type": "noauth"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "LDAP Login",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/auth/token"
+            },
+            "description": "Authenticate against LDAP and receive access and refresh tokens.",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"alice\",\n  \"password\": \"secret\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code >= 200 && pm.response.code < 300) {",
+                  "  const d = pm.response.json();",
+                  "  if (d.access_token) pm.collectionVariables.set('jwt_token', d.access_token);",
+                  "  if (d.refresh_token) pm.collectionVariables.set('refresh_token', d.refresh_token);",
+                  "  if (d.username) pm.collectionVariables.set('username', d.username);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "Token Response",
+              "originalRequest": {
+                "method": "POST",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/api/v1/auth/token"
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"access_token\": \"eyJhbGciOiJIUzI1NiJ9.access\",\n  \"refresh_token\": \"eyJhbGciOiJIUzI1NiJ9.refresh\",\n  \"token_type\": \"bearer\",\n  \"expires_in\": 3600,\n  \"refresh_expires_in\": 86400,\n  \"username\": \"alice\",\n  \"roles\": [\n    \"admin\"\n  ],\n  \"groups\": [\n    \"AssessmentAdmins\"\n  ]\n}"
+            }
+          ]
+        },
+        {
+          "name": "Refresh Token",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/auth/refresh"
+            },
+            "description": "Exchange a refresh token for a new access/refresh pair.",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refresh_token\": \"{{refresh_token}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code >= 200 && pm.response.code < 300) {",
+                  "  const d = pm.response.json();",
+                  "  if (d.access_token) pm.collectionVariables.set('jwt_token', d.access_token);",
+                  "  if (d.refresh_token) pm.collectionVariables.set('refresh_token', d.refresh_token);",
+                  "  if (d.username) pm.collectionVariables.set('username', d.username);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "Refreshed",
+              "originalRequest": {
+                "method": "POST",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/api/v1/auth/refresh"
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"access_token\": \"eyJhbGciOiJIUzI1NiJ9.access\",\n  \"refresh_token\": \"eyJhbGciOiJIUzI1NiJ9.refresh\",\n  \"token_type\": \"bearer\",\n  \"expires_in\": 3600,\n  \"refresh_expires_in\": 86400,\n  \"username\": \"alice\",\n  \"roles\": [\n    \"admin\"\n  ],\n  \"groups\": [\n    \"AssessmentAdmins\"\n  ]\n}"
+            }
+          ]
+        },
+        {
+          "name": "Verify Access Token",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/auth/verify"
+            },
+            "description": "Validate the current access token.",
+            "header": []
+          },
+          "response": [
+            {
+              "name": "Verified",
+              "originalRequest": {
+                "method": "GET",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/api/v1/auth/verify"
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"valid\": true,\n  \"username\": \"alice\",\n  \"roles\": [\n    \"admin\"\n  ],\n  \"groups\": [\n    \"AssessmentAdmins\"\n  ],\n  \"expires_at\": 1773427200\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Option A: Single-call Workflow",
+      "item": [
+        {
+          "name": "Start Assessment",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/assessments"
+            },
+            "description": "Upload questions and evidence in one call.",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "questions_file",
+                  "type": "file",
+                  "src": "",
+                  "description": "Assessment questions workbook"
+                },
+                {
+                  "key": "evidence_files",
+                  "type": "file",
+                  "src": "",
+                  "description": "Add one entry per evidence file"
+                },
+                {
+                  "key": "dataset_name",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "reuse_exisiting_dataset",
+                  "type": "text",
+                  "value": "true"
+                },
+                {
+                  "key": "chat_name",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "dataset_options",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true,
+                  "description": "JSON string"
+                },
+                {
+                  "key": "chat_options",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true,
+                  "description": "JSON string"
+                },
+                {
+                  "key": "question_id_column",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "question_column",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "vendor_response_column",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "vendor_comment_column",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "process_vendor_response",
+                  "type": "text",
+                  "value": "true"
+                },
+                {
+                  "key": "only_cited_references",
+                  "type": "text",
+                  "value": "true"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 201 || pm.response.code === 202) {",
+                  "  const d = pm.response.json();",
+                  "  if (d.task_id) pm.collectionVariables.set('task_id', d.task_id);",
+                  "  if (d.dataset_id) pm.collectionVariables.set('dataset_id', d.dataset_id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "Accepted",
+              "originalRequest": {
+                "method": "POST",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/api/v1/assessments"
+                }
+              },
+              "status": "Accepted",
+              "code": 202,
+              "body": "{\n  \"task_id\": \"tsk_01HXYZ123456\",\n  \"state\": \"processing\",\n  \"pipeline_stage\": \"chat_processing\",\n  \"progress_message\": \"Processing question 3 of 25\",\n  \"total_questions\": 25,\n  \"questions_processed\": 3,\n  \"created_at\": \"2026-03-13T00:00:00Z\",\n  \"updated_at\": \"2026-03-13T00:01:42Z\",\n  \"error\": null,\n  \"created_by\": {\n    \"username\": \"alice\",\n    \"roles\": [\n      \"admin\"\n    ],\n    \"auth_type\": \"ldap\"\n  },\n  \"dataset_id\": \"ds_123\",\n  \"dataset_ids\": [\n    \"ds_123\"\n  ],\n  \"chat_id\": \"chat_123\",\n  \"session_id\": \"session_123\",\n  \"document_ids\": [\n    \"doc_123\",\n    \"doc_456\"\n  ],\n  \"document_statuses\": [\n    {\n      \"document_id\": \"doc_123\",\n      \"document_name\": \"policy.pdf\",\n      \"status\": \"success\",\n      \"progress\": 1.0,\n      \"message\": \"Parsed\"\n    }\n  ]\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Option B: Existing Dataset Workflow",
+      "item": [
+        {
+          "name": "Start Assessment From Dataset",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/assessments/from-dataset"
+            },
+            "description": "Reuse one or more existing dataset ids.",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "questions_file",
+                  "type": "file",
+                  "src": ""
+                },
+                {
+                  "key": "dataset_ids",
+                  "type": "text",
+                  "value": "{{dataset_ids}}"
+                },
+                {
+                  "key": "chat_name",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "dataset_options",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true,
+                  "description": "JSON string"
+                },
+                {
+                  "key": "chat_options",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true,
+                  "description": "JSON string"
+                },
+                {
+                  "key": "question_id_column",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "question_column",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "vendor_response_column",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "vendor_comment_column",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "process_vendor_response",
+                  "type": "text",
+                  "value": "true"
+                },
+                {
+                  "key": "only_cited_references",
+                  "type": "text",
+                  "value": "true"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 201 || pm.response.code === 202) {",
+                  "  const d = pm.response.json();",
+                  "  if (d.task_id) pm.collectionVariables.set('task_id', d.task_id);",
+                  "  if (d.dataset_id) pm.collectionVariables.set('dataset_id', d.dataset_id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "Accepted",
+              "originalRequest": {
+                "method": "POST",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/api/v1/assessments/from-dataset"
+                }
+              },
+              "status": "Accepted",
+              "code": 202,
+              "body": "{\n  \"task_id\": \"tsk_01HXYZ123456\",\n  \"state\": \"processing\",\n  \"pipeline_stage\": \"chat_processing\",\n  \"progress_message\": \"Processing question 3 of 25\",\n  \"total_questions\": 25,\n  \"questions_processed\": 3,\n  \"created_at\": \"2026-03-13T00:00:00Z\",\n  \"updated_at\": \"2026-03-13T00:01:42Z\",\n  \"error\": null,\n  \"created_by\": {\n    \"username\": \"alice\",\n    \"roles\": [\n      \"admin\"\n    ],\n    \"auth_type\": \"ldap\"\n  },\n  \"dataset_id\": \"ds_123\",\n  \"dataset_ids\": [\n    \"ds_123\"\n  ],\n  \"chat_id\": \"chat_123\",\n  \"session_id\": \"session_123\",\n  \"document_ids\": [\n    \"doc_123\",\n    \"doc_456\"\n  ],\n  \"document_statuses\": [\n    {\n      \"document_id\": \"doc_123\",\n      \"document_name\": \"policy.pdf\",\n      \"status\": \"success\",\n      \"progress\": 1.0,\n      \"message\": \"Parsed\"\n    }\n  ]\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Option C: Two-phase Workflow",
+      "item": [
+        {
+          "name": "Create Session",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/assessments/sessions"
+            },
+            "description": "Create a task and wait for document uploads.",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "questions_file",
+                  "type": "file",
+                  "src": ""
+                },
+                {
+                  "key": "dataset_name",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "reuse_exisiting_dataset",
+                  "type": "text",
+                  "value": "true"
+                },
+                {
+                  "key": "dataset_options",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true,
+                  "description": "JSON string"
+                },
+                {
+                  "key": "chat_options",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true,
+                  "description": "JSON string"
+                },
+                {
+                  "key": "question_id_column",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "question_column",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "vendor_response_column",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "vendor_comment_column",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 201 || pm.response.code === 202) {",
+                  "  const d = pm.response.json();",
+                  "  if (d.task_id) pm.collectionVariables.set('task_id', d.task_id);",
+                  "  if (d.dataset_id) pm.collectionVariables.set('dataset_id', d.dataset_id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "Created",
+              "originalRequest": {
+                "method": "POST",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/api/v1/assessments/sessions"
+                }
+              },
+              "status": "Created",
+              "code": 201,
+              "body": "{\n  \"task_id\": \"tsk_01HXYZ123456\",\n  \"dataset_id\": \"ds_123\",\n  \"state\": \"awaiting_documents\",\n  \"message\": \"Session created. Upload evidence documents then start the assessment.\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Upload Session Documents",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/assessments/sessions/{{task_id}}/documents"
+            },
+            "description": "Upload one or more evidence documents to an existing session.",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "files",
+                  "type": "file",
+                  "src": "",
+                  "description": "Add one entry per file"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code >= 200 && pm.response.code < 300) {",
+                  "  const d = pm.response.json();",
+                  "  if (d.dataset_id) pm.collectionVariables.set('dataset_id', d.dataset_id);",
+                  "  if (Array.isArray(d.uploaded_document_ids) && d.uploaded_document_ids.length) pm.collectionVariables.set('document_id', d.uploaded_document_ids[0]);",
+                  "  if (Array.isArray(d.document_ids) && d.document_ids.length) pm.collectionVariables.set('document_id', d.document_ids[0]);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "Uploaded",
+              "originalRequest": {
+                "method": "POST",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/api/v1/assessments/sessions/{{task_id}}/documents"
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"task_id\": \"tsk_01HXYZ123456\",\n  \"dataset_id\": \"ds_123\",\n  \"uploaded_document_ids\": [\n    \"doc_123\",\n    \"doc_456\"\n  ],\n  \"total_documents\": 2,\n  \"message\": \"Uploaded 2 document(s) to assessment session.\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Start Session Assessment",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/assessments/sessions/{{task_id}}/start"
+            },
+            "description": "Queue the session for parsing and assessment.",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "chat_name",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "dataset_options",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true,
+                  "description": "JSON string"
+                },
+                {
+                  "key": "chat_options",
+                  "type": "text",
+                  "value": "",
+                  "disabled": true,
+                  "description": "JSON string"
+                },
+                {
+                  "key": "process_vendor_response",
+                  "type": "text",
+                  "value": "true"
+                },
+                {
+                  "key": "only_cited_references",
+                  "type": "text",
+                  "value": "true"
+                }
+              ]
+            }
+          },
+          "response": [
+            {
+              "name": "Accepted",
+              "originalRequest": {
+                "method": "POST",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/api/v1/assessments/sessions/{{task_id}}/start"
+                }
+              },
+              "status": "Accepted",
+              "code": 202,
+              "body": "{\n  \"task_id\": \"tsk_01HXYZ123456\",\n  \"state\": \"processing\",\n  \"pipeline_stage\": \"chat_processing\",\n  \"progress_message\": \"Processing question 3 of 25\",\n  \"total_questions\": 25,\n  \"questions_processed\": 3,\n  \"created_at\": \"2026-03-13T00:00:00Z\",\n  \"updated_at\": \"2026-03-13T00:01:42Z\",\n  \"error\": null,\n  \"created_by\": {\n    \"username\": \"alice\",\n    \"roles\": [\n      \"admin\"\n    ],\n    \"auth_type\": \"ldap\"\n  },\n  \"dataset_id\": \"ds_123\",\n  \"dataset_ids\": [\n    \"ds_123\"\n  ],\n  \"chat_id\": \"chat_123\",\n  \"session_id\": \"session_123\",\n  \"document_ids\": [\n    \"doc_123\",\n    \"doc_456\"\n  ],\n  \"document_statuses\": [\n    {\n      \"document_id\": \"doc_123\",\n      \"document_name\": \"policy.pdf\",\n      \"status\": \"success\",\n      \"progress\": 1.0,\n      \"message\": \"Parsed\"\n    }\n  ]\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Tasks and Results",
+      "item": [
+        {
+          "name": "List Tasks",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/assessments?page=1&page_size=50"
+            },
+            "description": "Paginated list of all tasks.",
+            "header": []
+          },
+          "response": [
+            {
+              "name": "Tasks",
+              "originalRequest": {
+                "method": "GET",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/api/v1/assessments?page=1&page_size=50"
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"tasks\": [\n    {\n      \"task_id\": \"tsk_01HXYZ123456\",\n      \"state\": \"processing\",\n      \"pipeline_stage\": \"chat_processing\",\n      \"progress_message\": \"Processing question 3 of 25\",\n      \"total_questions\": 25,\n      \"questions_processed\": 3,\n      \"created_at\": \"2026-03-13T00:00:00Z\",\n      \"updated_at\": \"2026-03-13T00:01:42Z\",\n      \"error\": null,\n      \"created_by\": {\n        \"username\": \"alice\",\n        \"roles\": [\n          \"admin\"\n        ],\n        \"auth_type\": \"ldap\"\n      },\n      \"dataset_id\": \"ds_123\",\n      \"dataset_ids\": [\n        \"ds_123\"\n      ],\n      \"chat_id\": \"chat_123\",\n      \"session_id\": \"session_123\",\n      \"document_ids\": [\n        \"doc_123\",\n        \"doc_456\"\n      ],\n      \"document_statuses\": [\n        {\n          \"document_id\": \"doc_123\",\n          \"document_name\": \"policy.pdf\",\n          \"status\": \"success\",\n          \"progress\": 1.0,\n          \"message\": \"Parsed\"\n        }\n      ]\n    }\n  ],\n  \"total\": 1,\n  \"page\": 1,\n  \"page_size\": 50,\n  \"total_pages\": 1\n}"
+            }
+          ]
+        },
+        {
+          "name": "List Tasks By Dataset",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/assessments/by-dataset/{{dataset_id}}"
+            },
+            "description": "List tasks that reference a dataset id.",
+            "header": []
+          },
+          "response": [
+            {
+              "name": "Tasks By Dataset",
+              "originalRequest": {
+                "method": "GET",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/api/v1/assessments/by-dataset/{{dataset_id}}"
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"tasks\": [\n    {\n      \"task_id\": \"tsk_01HXYZ123456\",\n      \"state\": \"processing\",\n      \"pipeline_stage\": \"chat_processing\",\n      \"progress_message\": \"Processing question 3 of 25\",\n      \"total_questions\": 25,\n      \"questions_processed\": 3,\n      \"created_at\": \"2026-03-13T00:00:00Z\",\n      \"updated_at\": \"2026-03-13T00:01:42Z\",\n      \"error\": null,\n      \"created_by\": {\n        \"username\": \"alice\",\n        \"roles\": [\n          \"admin\"\n        ],\n        \"auth_type\": \"ldap\"\n      },\n      \"dataset_id\": \"ds_123\",\n      \"dataset_ids\": [\n        \"ds_123\"\n      ],\n      \"chat_id\": \"chat_123\",\n      \"session_id\": \"session_123\",\n      \"document_ids\": [\n        \"doc_123\",\n        \"doc_456\"\n      ],\n      \"document_statuses\": [\n        {\n          \"document_id\": \"doc_123\",\n          \"document_name\": \"policy.pdf\",\n          \"status\": \"success\",\n          \"progress\": 1.0,\n          \"message\": \"Parsed\"\n        }\n      ]\n    }\n  ],\n  \"total\": 1,\n  \"page\": 1,\n  \"page_size\": 1,\n  \"total_pages\": 1\n}"
+            }
+          ]
+        },
+        {
+          "name": "Get Task Status",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}"
+            },
+            "description": "Current status and pipeline progress for one task.",
+            "header": []
+          },
+          "response": [
+            {
+              "name": "Task",
+              "originalRequest": {
+                "method": "GET",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}"
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"task_id\": \"tsk_01HXYZ123456\",\n  \"state\": \"processing\",\n  \"pipeline_stage\": \"chat_processing\",\n  \"progress_message\": \"Processing question 3 of 25\",\n  \"total_questions\": 25,\n  \"questions_processed\": 3,\n  \"created_at\": \"2026-03-13T00:00:00Z\",\n  \"updated_at\": \"2026-03-13T00:01:42Z\",\n  \"error\": null,\n  \"created_by\": {\n    \"username\": \"alice\",\n    \"roles\": [\n      \"admin\"\n    ],\n    \"auth_type\": \"ldap\"\n  },\n  \"dataset_id\": \"ds_123\",\n  \"dataset_ids\": [\n    \"ds_123\"\n  ],\n  \"chat_id\": \"chat_123\",\n  \"session_id\": \"session_123\",\n  \"document_ids\": [\n    \"doc_123\",\n    \"doc_456\"\n  ],\n  \"document_statuses\": [\n    {\n      \"document_id\": \"doc_123\",\n      \"document_name\": \"policy.pdf\",\n      \"status\": \"success\",\n      \"progress\": 1.0,\n      \"message\": \"Parsed\"\n    }\n  ]\n}"
+            }
+          ]
+        },
+        {
+          "name": "Get Task Events",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}/events?page=1&page_size=100"
+            },
+            "description": "Audit/debug events for a task.",
+            "header": []
+          },
+          "response": [
+            {
+              "name": "Events",
+              "originalRequest": {
+                "method": "GET",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}/events?page=1&page_size=100"
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"task_id\": \"tsk_01HXYZ123456\",\n  \"events\": [\n    {\n      \"id\": 17,\n      \"task_id\": \"tsk_01HXYZ123456\",\n      \"event_type\": \"session_assessment_started\",\n      \"actor\": {\n        \"username\": \"alice\",\n        \"roles\": [\n          \"admin\"\n        ],\n        \"auth_type\": \"ldap\"\n      },\n      \"state\": \"processing\",\n      \"pipeline_stage\": \"chat_processing\",\n      \"message\": \"Assessment session queued for processing\",\n      \"error\": null,\n      \"payload\": {},\n      \"created_at\": \"2026-03-13T00:01:05Z\"\n    }\n  ],\n  \"total\": 1,\n  \"page\": 1,\n  \"page_size\": 100,\n  \"total_pages\": 1\n}"
+            }
+          ]
+        },
+        {
+          "name": "Get Results (JSON)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}/results?page=1&page_size=50"
+            },
+            "description": "Paginated results with packaged reference metadata and proxy/render links.",
+            "header": []
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code >= 200 && pm.response.code < 300) {",
+                  "  const d = pm.response.json();",
+                  "  const r = d.results?.[0]?.references?.[0];",
+                  "  if (r?.document?.document_id) pm.collectionVariables.set('document_id', r.document.document_id);",
+                  "  if (r?.document?.dataset_id) pm.collectionVariables.set('dataset_id', r.document.dataset_id);",
+                  "  if (r?.document?.image_id) pm.collectionVariables.set('image_id', r.document.image_id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "Results",
+              "originalRequest": {
+                "method": "GET",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}/results?page=1&page_size=50"
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"task_id\": \"tsk_01HXYZ123456\",\n  \"state\": \"completed\",\n  \"total_questions\": 25,\n  \"questions_processed\": 25,\n  \"results\": [\n    {\n      \"question_serial_no\": \"Q-1\",\n      \"question\": \"Is there evidence of an annual privacy review?\",\n      \"vendor_response\": \"Yes\",\n      \"vendor_comment\": \"See policy section 2.1 and the control spreadsheet.\",\n      \"ai_response\": \"Yes\",\n      \"details\": \"Evidence supports the presence of an annual privacy review process.\",\n      \"references\": [\n        {\n          \"reference_type\": \"text\",\n          \"document\": {\n            \"document_id\": \"doc_123\",\n            \"dataset_id\": \"ds_123\",\n            \"image_id\": null,\n            \"document_name\": \"privacy_policy.pdf\",\n            \"document_type\": \"pdf\",\n            \"media_family\": \"document\"\n          },\n          \"location\": {\n            \"kind\": \"page\",\n            \"value\": 3,\n            \"label\": \"Page 3\",\n            \"page_number\": 3,\n            \"highlight_box\": null\n          },\n          \"preview\": {\n            \"text_excerpt\": \"Section 2.1 defines the organization's approach to data privacy...\",\n            \"full_content\": \"Section 2.1 defines the organization's approach to data privacy and requires an annual review.\",\n            \"content_format\": \"text\",\n            \"html_content\": \"\",\n            \"table_html\": \"\",\n            \"has_inline_preview\": true\n          },\n          \"links\": {\n            \"document_url\": \"/api/v1/proxy/document/doc_123\",\n            \"rendered_document_url\": \"/api/v1/proxy/document/doc_123/render?filename=privacy_policy.pdf\",\n            \"image_url\": null,\n            \"source_url\": null\n          },\n          \"retrieval\": {\n            \"score\": 0.82,\n            \"vector_score\": 0.77,\n            \"term_score\": 0.69\n          },\n          \"source_metadata\": {\n            \"provider\": \"ragflow\",\n            \"provider_reference_type\": \"\",\n            \"extra_fields\": {\n              \"id\": \"chunk_001\"\n            }\n          }\n        },\n        {\n          \"reference_type\": \"table\",\n          \"document\": {\n            \"document_id\": \"doc_456\",\n            \"dataset_id\": \"ds_123\",\n            \"image_id\": null,\n            \"document_name\": \"Evidence_List.xlsx\",\n            \"document_type\": \"excel\",\n            \"media_family\": \"spreadsheet\"\n          },\n          \"location\": {\n            \"kind\": \"chunk\",\n            \"value\": 36,\n            \"label\": \"Chunk 36\",\n            \"page_number\": null,\n            \"highlight_box\": null\n          },\n          \"preview\": {\n            \"text_excerpt\": \"P07: Physical - Access Controls ...\",\n            \"full_content\": \"<table><tr><th>Control</th><th>Status</th></tr><tr><td>P07</td><td>Complete</td></tr></table>\",\n            \"content_format\": \"table_html\",\n            \"html_content\": \"\",\n            \"table_html\": \"<table><tr><th>Control</th><th>Status</th></tr><tr><td>P07</td><td>Complete</td></tr></table>\",\n            \"has_inline_preview\": true\n          },\n          \"links\": {\n            \"document_url\": \"/api/v1/proxy/document/doc_456\",\n            \"rendered_document_url\": \"/api/v1/proxy/document/doc_456/render?filename=Evidence_List.xlsx\",\n            \"image_url\": null,\n            \"source_url\": null\n          },\n          \"retrieval\": {\n            \"score\": 0.74,\n            \"vector_score\": 0.71,\n            \"term_score\": 0.63\n          },\n          \"source_metadata\": {\n            \"provider\": \"ragflow\",\n            \"provider_reference_type\": \"table\",\n            \"extra_fields\": {\n              \"id\": \"chunk_002\"\n            }\n          }\n        }\n      ]\n    }\n  ],\n  \"page\": 1,\n  \"page_size\": 50,\n  \"total_pages\": 1,\n  \"dataset_id\": \"ds_123\",\n  \"dataset_ids\": [\n    \"ds_123\"\n  ],\n  \"chat_id\": \"chat_123\",\n  \"session_id\": \"session_123\",\n  \"document_ids\": [\n    \"doc_123\",\n    \"doc_456\"\n  ],\n  \"document_statuses\": [\n    {\n      \"document_id\": \"doc_123\",\n      \"document_name\": \"privacy_policy.pdf\",\n      \"status\": \"success\",\n      \"progress\": 1.0,\n      \"message\": \"Parsed\"\n    },\n    {\n      \"document_id\": \"doc_456\",\n      \"document_name\": \"Evidence_List.xlsx\",\n      \"status\": \"success\",\n      \"progress\": 1.0,\n      \"message\": \"Parsed\"\n    }\n  ]\n}"
+            }
+          ]
+        },
+        {
+          "name": "Download Results Excel",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/assessments/{{task_id}}/results/excel"
+            },
+            "description": "Download results as XLSX.",
+            "header": []
+          }
+        },
+        {
+          "name": "Find Document By Hash",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/assessments/documents/by-hash/{{file_hash}}"
+            },
+            "description": "Locate existing uploaded documents by content hash.",
+            "header": []
+          },
+          "response": [
+            {
+              "name": "Lookup",
+              "originalRequest": {
+                "method": "GET",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/api/v1/assessments/documents/by-hash/{{file_hash}}"
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"matches\": [\n    {\n      \"task_id\": \"tsk_01HXYZ123456\",\n      \"document_id\": \"doc_123\",\n      \"dataset_id\": \"ds_123\"\n    }\n  ],\n  \"total\": 1\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Proxy Resources",
+      "item": [
+        {
+          "name": "Proxy Image",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/proxy/image/{{image_id}}"
+            },
+            "description": "Fetch an image chunk through the assessment service.",
+            "header": []
+          }
+        },
+        {
+          "name": "Proxy Document",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/proxy/document/{{document_id}}"
+            },
+            "description": "Fetch the original source document through the assessment service.",
+            "header": []
+          }
+        },
+        {
+          "name": "Render Document",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/proxy/document/{{document_id}}/render?filename=example.docx"
+            },
+            "description": "Render docx/xlsx/xlsm/pptx into HTML for browser display.",
+            "header": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "Native Dataset and Document Management",
+      "item": [
+        {
+          "name": "Upload Documents To Dataset",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/native/documents/upload"
+            },
+            "description": "Upload documents directly into an existing dataset and optionally trigger parsing.",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "dataset_id",
+                  "type": "text",
+                  "value": "{{dataset_id}}"
+                },
+                {
+                  "key": "files",
+                  "type": "file",
+                  "src": "",
+                  "description": "Add one entry per file"
+                },
+                {
+                  "key": "parse",
+                  "type": "text",
+                  "value": "true"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code >= 200 && pm.response.code < 300) {",
+                  "  const d = pm.response.json();",
+                  "  if (d.dataset_id) pm.collectionVariables.set('dataset_id', d.dataset_id);",
+                  "  if (Array.isArray(d.uploaded_document_ids) && d.uploaded_document_ids.length) pm.collectionVariables.set('document_id', d.uploaded_document_ids[0]);",
+                  "  if (Array.isArray(d.document_ids) && d.document_ids.length) pm.collectionVariables.set('document_id', d.document_ids[0]);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "Uploaded",
+              "originalRequest": {
+                "method": "POST",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/api/v1/native/documents/upload"
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"dataset_id\": \"ds_123\",\n  \"document_ids\": [\n    \"doc_123\",\n    \"doc_456\"\n  ],\n  \"parsing_triggered\": true\n}"
+            }
+          ]
+        },
+        {
+          "name": "List Datasets",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/native/datasets?page=1&page_size=100"
+            },
+            "description": "List datasets visible to the configured RAGFlow API key.",
+            "header": []
+          },
+          "response": [
+            {
+              "name": "Datasets",
+              "originalRequest": {
+                "method": "GET",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/api/v1/native/datasets?page=1&page_size=100"
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"items\": [\n    {\n      \"id\": \"ds_123\",\n      \"name\": \"assessment-dataset-001\",\n      \"description\": \"Evidence documents for privacy assessment\"\n    }\n  ],\n  \"total\": 1,\n  \"page\": 1,\n  \"page_size\": 100\n}"
+            }
+          ]
+        },
+        {
+          "name": "Delete Datasets",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/native/datasets"
+            },
+            "description": "Delete one or more datasets by id.",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"ids\": [\n    \"{{dataset_id}}\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "name": "Deleted",
+              "originalRequest": {
+                "method": "DELETE",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/api/v1/native/datasets"
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"message\": \"Datasets deleted\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "List Dataset Documents",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/native/datasets/{{dataset_id}}/documents?page=1&page_size=100"
+            },
+            "description": "List documents in a dataset with normalized parse status.",
+            "header": []
+          },
+          "response": [
+            {
+              "name": "Documents",
+              "originalRequest": {
+                "method": "GET",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/api/v1/native/datasets/{{dataset_id}}/documents?page=1&page_size=100"
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"items\": [\n    {\n      \"id\": \"doc_123\",\n      \"name\": \"privacy_policy.pdf\",\n      \"size\": 120483,\n      \"progress\": 1.0,\n      \"run\": \"DONE\",\n      \"status\": \"success\"\n    }\n  ],\n  \"total\": 1,\n  \"page\": 1,\n  \"page_size\": 100\n}"
+            }
+          ]
+        },
+        {
+          "name": "Delete Dataset Documents",
+          "request": {
+            "method": "DELETE",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/native/datasets/{{dataset_id}}/documents"
+            },
+            "description": "Delete one or more document ids from a dataset.",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"ids\": [\n    \"{{document_id}}\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [
+            {
+              "name": "Deleted",
+              "originalRequest": {
+                "method": "DELETE",
+                "url": {
+                  "raw": "{{base_url}}{{base_path}}/api/v1/native/datasets/{{dataset_id}}/documents"
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "body": "{\n  \"message\": \"Documents deleted\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Native Passthrough Example: Chats",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}{{base_path}}/api/v1/native/chats?page=1&page_size=20"
+            },
+            "description": "Example of the generic native passthrough to upstream RAGFlow /api/v1/* endpoints.",
+            "header": []
+          }
+        }
+      ]
+    }
+  ]
 }
