@@ -134,6 +134,39 @@ class ActorInfo(BaseModel):
     auth_type: str = ""
 
 
+class TaskStepMetrics(BaseModel):
+    attempts: int = 0
+    status: str = "pending"  # pending | running | completed | failed | skipped
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    duration_seconds: Optional[float] = None
+    total_duration_seconds: float = 0.0
+    error: Optional[str] = None
+
+
+class TaskQuestionMetrics(BaseModel):
+    question_count: int = 0
+    completed_count: int = 0
+    failed_count: int = 0
+    average_duration_seconds: Optional[float] = None
+    fastest_duration_seconds: Optional[float] = None
+    slowest_duration_seconds: Optional[float] = None
+    throughput_qps: Optional[float] = None
+
+
+class TaskMetrics(BaseModel):
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    total_duration_seconds: float = 0.0
+    dataset_setup: TaskStepMetrics = Field(default_factory=TaskStepMetrics)
+    document_upload: TaskStepMetrics = Field(default_factory=TaskStepMetrics)
+    document_parsing: TaskStepMetrics = Field(default_factory=TaskStepMetrics)
+    chat_setup: TaskStepMetrics = Field(default_factory=TaskStepMetrics)
+    question_processing: TaskStepMetrics = Field(default_factory=TaskStepMetrics)
+    finalization: TaskStepMetrics = Field(default_factory=TaskStepMetrics)
+    questions: TaskQuestionMetrics = Field(default_factory=TaskQuestionMetrics)
+
+
 class TaskStatus(BaseModel):
     task_id: str
     state: TaskState = TaskState.PENDING
@@ -147,6 +180,7 @@ class TaskStatus(BaseModel):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     error: Optional[str] = None
     created_by: Optional[ActorInfo] = None
+    metrics: TaskMetrics = Field(default_factory=TaskMetrics)
 
     # RAGFlow resource IDs (populated as the pipeline progresses)
     dataset_ids: list[str] = Field(default_factory=list)
@@ -178,6 +212,7 @@ class TaskResultResponse(BaseModel):
     page: int = 1
     page_size: int = 50
     total_pages: int = 1
+    metrics: TaskMetrics = Field(default_factory=TaskMetrics)
 
     # RAGFlow resource IDs
     dataset_ids: list[str] = Field(default_factory=list)

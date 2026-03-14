@@ -57,6 +57,18 @@ def test_ui_page_includes_icon_links_and_header_logo():
     assert "toggleAutoRefresh();" in response.text
     assert 'id="single-strict-parse"' in response.text
     assert 'id="sess-strict-parse"' in response.text
+    assert 'id="single-ev-label"' in response.text
+    assert 'id="single-ev-note"' in response.text
+    assert 'id="single-strict-parse-note"' in response.text
+    assert 'id="sess-start-note"' in response.text
+    assert 'id="sess-strict-parse-note"' in response.text
+    assert "function updateSingleVendorModeUi()" in response.text
+    assert "function updateSessionVendorModeUi()" in response.text
+    assert "updateSingleVendorModeUi();" in response.text
+    assert "updateSessionVendorModeUi();" in response.text
+    assert "Evidence Documents (optional)" in response.text
+    assert "Only applies when evidence documents are attached. With no evidence, vendor-only mode skips parsing." in response.text
+    assert "You can start with no uploaded evidence in vendor-response mode." in response.text
     assert "fail_on_document_parse_issue" in response.text
     assert "Refresh Token" not in response.text
     assert ">Verify<" not in response.text

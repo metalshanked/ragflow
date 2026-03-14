@@ -503,6 +503,53 @@ def test_start_assessment_passes_fail_on_document_parse_issue_true():
             assert args[10] is True
 
 
+def test_start_assessment_allows_no_evidence_when_processing_vendor_responses():
+    app = make_app()
+    with TestClient(app) as client:
+        with override_settings(jwt_secret_key=""):
+            mock_parse = MagicMock(return_value=[{"serial_no": 1, "question": "Q1"}])
+            mock_create_task = AsyncMock(
+                return_value=type(
+                    "_R",
+                    (),
+                    {
+                        "task_id": "task-123",
+                        "status": TaskStatus(task_id="task-123", state=TaskState.PENDING, total_questions=1),
+                    },
+                )()
+            )
+            mock_run = AsyncMock()
+
+            with patch("assessment.routers.parse_questions_excel", mock_parse), patch(
+                "assessment.routers.create_task", mock_create_task
+            ), patch("assessment.routers.run_assessment", mock_run):
+                resp = client.post(
+                    "/api/v1/assessments",
+                    files={"questions_file": ("q.xlsx", b"xlsx-bytes", "application/octet-stream")},
+                    data={"process_vendor_response": "true"},
+                )
+
+            assert resp.status_code == 202
+            args = mock_run.await_args.args
+            assert args[2] == []
+
+
+def test_start_assessment_requires_evidence_when_vendor_processing_disabled():
+    app = make_app()
+    with TestClient(app) as client:
+        with override_settings(jwt_secret_key=""):
+            mock_parse = MagicMock(return_value=[{"serial_no": 1, "question": "Q1"}])
+            with patch("assessment.routers.parse_questions_excel", mock_parse):
+                resp = client.post(
+                    "/api/v1/assessments",
+                    files={"questions_file": ("q.xlsx", b"xlsx-bytes", "application/octet-stream")},
+                    data={"process_vendor_response": "false"},
+                )
+
+            assert resp.status_code == 400
+            assert "evidence document" in resp.json()["detail"].lower()
+
+
 def test_create_session_endpoint_accepts_reuse_existing_dataset_false():
     app = make_app()
     with TestClient(app) as client:
@@ -556,5 +603,34 @@ def test_start_session_assessment_passes_fail_on_document_parse_issue_true():
                 )
 
             assert resp.status_code == 202
+            assert mock_claim.await_args.kwargs["allow_no_documents"] is False
             args = mock_run.await_args.args
             assert args[6] is True
+
+
+def test_start_session_assessment_allows_no_documents_when_processing_vendor_responses():
+    app = make_app()
+    with TestClient(app) as client:
+        with override_settings(jwt_secret_key=""):
+            record = TaskRecord(
+                task_id="task-1",
+                status=TaskStatus(task_id="task-1", state=TaskState.PARSING, total_questions=1),
+                ragflow=RagflowContext(dataset_id="ds-1", document_ids=[]),
+            )
+            mock_claim = AsyncMock(return_value=record)
+            mock_run = AsyncMock()
+            mock_task_event = AsyncMock()
+            mock_audit = AsyncMock()
+
+            with patch("assessment.routers.claim_session_start", mock_claim), patch(
+                "assessment.routers.run_assessment_for_session", mock_run
+            ), patch("assessment.routers._task_event", mock_task_event), patch(
+                "assessment.routers._audit", mock_audit
+            ):
+                resp = client.post(
+                    "/api/v1/assessments/sessions/task-1/start",
+                    data={"process_vendor_response": "true"},
+                )
+
+            assert resp.status_code == 202
+            assert mock_claim.await_args.kwargs["allow_no_documents"] is True

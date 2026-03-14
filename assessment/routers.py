@@ -394,8 +394,9 @@ async def start_assessment(
     questions_file: UploadFile = File(
         ..., description="Excel file with columns A=Question_Serial_No, B=Question"
     ),
-    evidence_files: list[UploadFile] = File(
-        ..., description="Evidence documents (PDF, PPTX, XLSX, DOCX, etc.)"
+    evidence_files: Optional[list[UploadFile]] = File(
+        None,
+        description="Evidence documents (PDF, PPTX, XLSX, DOCX, etc.). Optional when process_vendor_response=true.",
     ),
     dataset_name: Optional[str] = Form(None, description="Custom dataset name in RAGFlow"),
     reuse_exisiting_dataset: bool = Form(
@@ -466,10 +467,10 @@ async def start_assessment(
         raise HTTPException(status_code=400, detail="No questions found in the uploaded Excel file.")
 
     ev_files: list[tuple[str, bytes]] = []
-    for ef in evidence_files:
+    for ef in evidence_files or []:
         ev_bytes = await ef.read()
         ev_files.append((ef.filename or "document", ev_bytes))
-    if not ev_files:
+    if not ev_files and not process_vendor_response:
         raise HTTPException(status_code=400, detail="At least one evidence document is required.")
 
     actor = actor_from_request(request)
@@ -526,6 +527,7 @@ async def start_assessment(
         payload={
             "question_count": len(questions),
             "evidence_file_count": len(ev_files),
+            "vendor_only_without_evidence": bool(process_vendor_response and not ev_files),
             "dataset_name": dataset_name or "",
             "reuse_existing_dataset": reuse_exisiting_dataset,
             "fail_on_document_parse_issue": fail_on_document_parse_issue,
@@ -848,7 +850,10 @@ async def start_session_assessment(
     Returns immediately; poll ``GET /assessments/{task_id}`` for progress.
     """
     try:
-        record = await claim_session_start(task_id)
+        record = await claim_session_start(
+            task_id,
+            allow_no_documents=process_vendor_response,
+        )
     except ValueError as exc:
         msg = str(exc)
         if "not found" in msg.lower():

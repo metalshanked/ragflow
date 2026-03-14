@@ -276,8 +276,9 @@ button.link-card{width:100%;text-align:left;font:inherit}
     <p style="color:var(--muted);font-size:.88rem;margin:.4rem 0">Upload questions Excel + all evidence docs in one request.</p>
     <label>Questions Excel File *</label>
     <input type="file" id="single-q" accept=".xlsx,.xls" onchange="onSingleFieldChange()"/>
-    <label>Evidence Documents *</label>
+    <label id="single-ev-label">Evidence Documents *</label>
     <input type="file" id="single-ev" multiple onchange="onSingleFieldChange()"/>
+    <div id="single-ev-note" style="color:var(--muted);font-size:.82rem;margin-top:.25rem">Required unless vendor-response processing is enabled.</div>
     <div class="row">
       <div><label>Dataset Name (optional)</label><input type="text" id="single-ds" placeholder="Auto-generated if empty" oninput="onSingleFieldChange()"/></div>
       <div><label>Chat Name (optional)</label><input type="text" id="single-chat" placeholder="Auto-generated if empty" oninput="onSingleFieldChange()"/></div>
@@ -297,6 +298,7 @@ button.link-card{width:100%;text-align:left;font:inherit}
     </div>
     <label style="display:flex;align-items:center;gap:.5rem;margin-top:.5rem"><input type="checkbox" id="single-v-process" onchange="onSingleFieldChange()"/> Process vendor response &amp; comments</label>
     <label style="display:flex;align-items:center;gap:.5rem;margin-top:.5rem"><input type="checkbox" id="single-strict-parse" onchange="onSingleFieldChange()"/> Stop if any intended document fails to parse</label>
+    <div id="single-strict-parse-note" style="color:var(--muted);font-size:.82rem;margin-top:.2rem">Only applies to attached evidence documents.</div>
     <div class="btn-bar"><button class="btn btn-primary" id="btn-single" onclick="submitSingle()">&#128640; Start Assessment</button></div>
     <div id="single-result" class="hidden" style="margin-top:1rem"></div>
   </div>
@@ -372,7 +374,9 @@ button.link-card{width:100%;text-align:left;font:inherit}
         <div><label>Chat Options (JSON, optional)</label><textarea id="sess-start-chat-opts" placeholder='{"prompt": {"system": "..."}}' oninput="onSessStartFieldChange(); validateJsonInput(this)" rows="2"></textarea></div>
       </div>
       <label style="display:flex;align-items:center;gap:.5rem;margin-top:.5rem"><input type="checkbox" id="sess-v-process" onchange="onSessStartFieldChange()"/> Process vendor response &amp; comments</label>
+      <div id="sess-start-note" style="color:var(--muted);font-size:.82rem;margin-top:.2rem">Upload evidence before starting, unless vendor-response processing is enabled.</div>
       <label style="display:flex;align-items:center;gap:.5rem;margin-top:.5rem"><input type="checkbox" id="sess-strict-parse" onchange="onSessStartFieldChange()"/> Stop if any intended document fails to parse</label>
+      <div id="sess-strict-parse-note" style="color:var(--muted);font-size:.82rem;margin-top:.2rem">Only applies to uploaded evidence documents.</div>
       <div class="btn-bar"><button class="btn btn-primary" id="btn-sess-start" onclick="startSession()">&#128640; Start Assessment</button></div>
     </fieldset>
     <div id="sess-result" class="hidden" style="margin-top:1rem"></div>
@@ -866,11 +870,46 @@ function btnError(id){
 /* ------------------------------------------------------------------ */
 /* Field-change listeners                                              */
 /* ------------------------------------------------------------------ */
-function onSingleFieldChange(){ btnReset('btn-single'); }
+function _setText(id, text){
+  const el=document.getElementById(id);
+  if(el)el.textContent=text;
+}
+function updateSingleVendorModeUi(){
+  const processVendor=!!document.getElementById('single-v-process')?.checked;
+  _setText('single-ev-label', processVendor ? 'Evidence Documents (optional)' : 'Evidence Documents *');
+  _setText(
+    'single-ev-note',
+    processVendor
+      ? 'Optional in vendor-response mode. If no evidence is attached, the task evaluates vendor responses/comments only.'
+      : 'Required unless vendor-response processing is enabled.'
+  );
+  _setText(
+    'single-strict-parse-note',
+    processVendor
+      ? 'Only applies when evidence documents are attached. With no evidence, vendor-only mode skips parsing.'
+      : 'Only applies to attached evidence documents.'
+  );
+}
+function updateSessionVendorModeUi(){
+  const processVendor=!!document.getElementById('sess-v-process')?.checked;
+  _setText(
+    'sess-start-note',
+    processVendor
+      ? 'You can start with no uploaded evidence in vendor-response mode.'
+      : 'Upload evidence before starting, unless vendor-response processing is enabled.'
+  );
+  _setText(
+    'sess-strict-parse-note',
+    processVendor
+      ? 'Only applies when evidence documents have been uploaded. With no uploaded evidence, vendor-only mode skips parsing.'
+      : 'Only applies to uploaded evidence documents.'
+  );
+}
+function onSingleFieldChange(){ btnReset('btn-single'); updateSingleVendorModeUi(); }
 function onDatasetFieldChange(){ btnReset('btn-dataset'); }
 function onSessCreateFieldChange(){ btnReset('btn-sess-create'); }
 function onSessUploadFieldChange(){ btnReset('btn-sess-upload'); }
-function onSessStartFieldChange(){ btnReset('btn-sess-start'); }
+function onSessStartFieldChange(){ btnReset('btn-sess-start'); updateSessionVendorModeUi(); }
 function onUploadFieldChange(){ btnReset('btn-upload'); }
 function onRetryFieldChange(){ btnReset('btn-retry-start'); }
 
@@ -1510,8 +1549,9 @@ function downloadExcel(){
 async function submitSingle(){
   const qf=document.getElementById('single-q').files[0];
   const evf=document.getElementById('single-ev').files;
+  const processVendor=document.getElementById('single-v-process').checked;
   if(!qf){toast('Select a questions file','err');return;}
-  if(!evf.length){toast('Select evidence documents','err');return;}
+  if(!evf.length && !processVendor){toast('Select evidence documents or enable vendor-response processing','err');return;}
   btnLoading('btn-single','Starting\u2026');
   const fd=new FormData();
   fd.append('questions_file',qf);
@@ -1534,7 +1574,7 @@ async function submitSingle(){
   const vComCol=document.getElementById('single-v-com-col').value.trim();
   if(vResCol)fd.append('vendor_response_column',vResCol);
   if(vComCol)fd.append('vendor_comment_column',vComCol);
-  fd.append('process_vendor_response',document.getElementById('single-v-process').checked?'true':'false');
+  fd.append('process_vendor_response',processVendor?'true':'false');
   fd.append('fail_on_document_parse_issue',document.getElementById('single-strict-parse').checked?'true':'false');
   const ok=await postForm(API+'/assessments',fd,'single-result','btn-single');
   if(ok) btnDone('btn-single'); else btnError('btn-single');
@@ -1723,6 +1763,8 @@ function escAttr(s){return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').
 
 // Auto-check health on load
 initApiLinks();
+updateSingleVendorModeUi();
+updateSessionVendorModeUi();
 checkHealth();
 toggleAutoRefresh();
 document.addEventListener('visibilitychange', function(){

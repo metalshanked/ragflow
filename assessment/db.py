@@ -32,6 +32,7 @@ from .models import (
     RagflowContext,
     TaskRecord,
     TaskExecutionConfig,
+    TaskMetrics,
     TaskState,
     TaskStatus,
 )
@@ -70,6 +71,7 @@ class TaskRow(Base):
     # JSON-serialised blobs
     ragflow_json = Column(Text, nullable=False, default="{}")
     execution_json = Column(Text, nullable=False, default="{}")
+    metrics_json = Column(Text, nullable=False, default="{}")
     questions_json = Column(Text, nullable=False, default="[]")
     results_json = Column(Text, nullable=False, default="[]")
     document_statuses_json = Column(Text, nullable=False, default="[]")
@@ -157,6 +159,7 @@ def _schema_missing_columns(sync_conn: Any) -> dict[str, set[str]]:
             "created_by_roles_json",
             "created_by_auth_type",
             "execution_json",
+            "metrics_json",
         },
         "task_events": {"actor_username", "actor_roles_json", "actor_auth_type"},
         "audit_events": {
@@ -333,6 +336,7 @@ def _task_record_from_row(row: TaskRow) -> TaskRecord:
             row.created_by_roles_json,
             row.created_by_auth_type,
         ),
+        metrics=TaskMetrics(**json.loads(row.metrics_json or "{}")),
     )
     ragflow = RagflowContext(**json.loads(row.ragflow_json))
     execution = TaskExecutionConfig(**json.loads(row.execution_json or "{}"))
@@ -374,6 +378,7 @@ def _row_from_task_record(record: TaskRecord) -> dict[str, Any]:
         **_actor_columns(s.created_by),
         "ragflow_json": record.ragflow.model_dump_json(),
         "execution_json": record.execution.model_dump_json(),
+        "metrics_json": s.metrics.model_dump_json(),
         "questions_json": json.dumps(record.questions),
         "results_json": json.dumps([r.model_dump() for r in record.results], default=str),
         "document_statuses_json": json.dumps([ds.model_dump() for ds in record.document_statuses], default=str),

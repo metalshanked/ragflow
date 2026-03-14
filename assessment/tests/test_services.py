@@ -38,6 +38,7 @@ from assessment.services import (
     get_paginated_results,
     parse_questions_excel,
     run_assessment,
+    run_assessment_from_dataset,
     run_assessment_for_session,
 )
 
@@ -400,6 +401,21 @@ class TestCreateSessionReuse(unittest.TestCase):
         _, kwargs = mock_client.ensure_dataset.await_args
         self.assertFalse(kwargs["reuse_existing_dataset"])
 
+    @patch.object(_services_mod, "RagflowClient")
+    def test_create_session_captures_dataset_setup_metrics(self, MockClient):
+        mock_client = AsyncMock()
+        mock_client.ensure_dataset = AsyncMock(return_value="ds-3")
+        mock_client.close = AsyncMock()
+        MockClient.return_value = mock_client
+
+        response = _run(create_session([{"serial_no": 1, "question": "Q1"}], dataset_name="metrics-ds"))
+
+        saved_record = _mock_db_save.await_args_list[-1].args[0]
+        self.assertEqual(response.dataset_id, "ds-3")
+        self.assertEqual(saved_record.status.metrics.dataset_setup.attempts, 1)
+        self.assertEqual(saved_record.status.metrics.dataset_setup.status, "completed")
+        self.assertGreaterEqual(saved_record.status.metrics.total_duration_seconds, 0.0)
+
 
 class TestStrictDocumentParseFailures(unittest.TestCase):
     @patch.object(_services_mod, "_process_questions", new_callable=AsyncMock)
@@ -580,6 +596,20 @@ class TestGetPaginatedResults(unittest.TestCase):
         record = self._make_record(1)
         result = get_paginated_results(record, page=1, page_size=50)
         self.assertEqual(result["document_statuses"], [])
+
+    def test_metrics_are_included(self):
+        record = self._make_record(1)
+        record.status.metrics.dataset_setup.attempts = 1
+        record.status.metrics.dataset_setup.status = "completed"
+        record.status.metrics.dataset_setup.duration_seconds = 1.25
+        record.status.metrics.dataset_setup.total_duration_seconds = 1.25
+        record.status.metrics.total_duration_seconds = 1.25
+
+        result = get_paginated_results(record, page=1, page_size=50)
+
+        self.assertEqual(result["metrics"].dataset_setup.attempts, 1)
+        self.assertEqual(result["metrics"].dataset_setup.status, "completed")
+        self.assertEqual(result["metrics"].total_duration_seconds, 1.25)
 
 
 class TestAddDocumentsToSessionRetry(unittest.TestCase):
@@ -781,6 +811,204 @@ class TestRunAssessmentForSessionRetry(unittest.TestCase):
         self.assertEqual(kwargs["permission"], "team")
         self.assertEqual(kwargs["parser_config"]["auto_keywords"], 2)
         self.assertTrue(kwargs["parser_config"]["enable_metadata"])
+
+
+class TestTaskMetrics(unittest.TestCase):
+    @patch.object(_services_mod, "RagflowClient")
+    def test_single_call_pipeline_captures_step_metrics(self, MockClient):
+        from assessment.ragflow_client import RagflowClient as _RealClient
+
+        record = TaskRecord(
+            task_id="metrics-001",
+            status=TaskStatus(task_id="metrics-001", state=TaskState.PENDING, total_questions=1),
+            questions=[{"serial_no": 1, "question": "Q1"}],
+        )
+        _mock_db_get.reset_mock()
+        _mock_db_get.return_value = record
+        _mock_db_save.reset_mock()
+
+        mock_client = AsyncMock()
+        mock_client.ensure_dataset = AsyncMock(return_value="ds-1")
+        mock_client.upload_document = AsyncMock(return_value="doc-1")
+        mock_client.start_parsing = AsyncMock()
+        mock_client.wait_for_parsing = AsyncMock(
+            return_value=[
+                {
+                    "document_id": "doc-1",
+                    "document_name": "evidence.pdf",
+                    "status": "success",
+                    "progress": 1.0,
+                    "message": "ok",
+                }
+            ]
+        )
+        mock_client.ensure_chat = AsyncMock(return_value="chat-1")
+        mock_client.create_session = AsyncMock(return_value="sess-1")
+        mock_client.ask = AsyncMock(return_value={"answer": "Answer: Yes\nDetails: OK", "reference": {}})
+        mock_client.close = AsyncMock()
+        MockClient.return_value = mock_client
+        MockClient.parse_yes_no = _RealClient.parse_yes_no
+        MockClient.extract_references = _RealClient.extract_references
+        MockClient.get_cited_indices = _RealClient.get_cited_indices
+
+        _run(run_assessment("metrics-001", record.questions, [("evidence.pdf", b"pdf")]))
+
+        self.assertEqual(record.status.state, TaskState.COMPLETED)
+        self.assertEqual(record.status.metrics.dataset_setup.status, "completed")
+        self.assertEqual(record.status.metrics.document_upload.status, "completed")
+        self.assertEqual(record.status.metrics.document_parsing.status, "completed")
+        self.assertEqual(record.status.metrics.chat_setup.status, "completed")
+        self.assertEqual(record.status.metrics.question_processing.status, "completed")
+        self.assertEqual(record.status.metrics.finalization.status, "completed")
+        self.assertEqual(record.status.metrics.questions.question_count, 1)
+        self.assertEqual(record.status.metrics.questions.completed_count, 1)
+        self.assertEqual(record.status.metrics.questions.failed_count, 0)
+        self.assertGreaterEqual(record.status.metrics.total_duration_seconds, 0.0)
+
+    @patch.object(_services_mod, "RagflowClient")
+    def test_from_dataset_marks_skipped_document_steps(self, MockClient):
+        from assessment.ragflow_client import RagflowClient as _RealClient
+
+        record = TaskRecord(
+            task_id="metrics-dataset-001",
+            status=TaskStatus(task_id="metrics-dataset-001", state=TaskState.PENDING, total_questions=1),
+            questions=[{"serial_no": 1, "question": "Q1"}],
+        )
+        _mock_db_get.reset_mock()
+        _mock_db_get.return_value = record
+        _mock_db_save.reset_mock()
+
+        mock_client = AsyncMock()
+        mock_client.ensure_chat = AsyncMock(return_value="chat-1")
+        mock_client.create_session = AsyncMock(return_value="sess-1")
+        mock_client.ask = AsyncMock(return_value={"answer": "Answer: Yes\nDetails: OK", "reference": {}})
+        mock_client.close = AsyncMock()
+        MockClient.return_value = mock_client
+        MockClient.parse_yes_no = _RealClient.parse_yes_no
+        MockClient.extract_references = _RealClient.extract_references
+        MockClient.get_cited_indices = _RealClient.get_cited_indices
+
+        _run(run_assessment_from_dataset("metrics-dataset-001", ["ds-1"]))
+
+        self.assertEqual(record.status.state, TaskState.COMPLETED)
+        self.assertEqual(record.status.metrics.document_upload.status, "skipped")
+        self.assertEqual(record.status.metrics.document_parsing.status, "skipped")
+
+
+class TestVendorOnlyWithoutEvidence(unittest.TestCase):
+    @patch.object(_services_mod, "RagflowClient")
+    def test_single_call_without_evidence_uses_vendor_only_mode(self, MockClient):
+        from assessment.ragflow_client import RagflowClient as _RealClient
+
+        record = TaskRecord(
+            task_id="vendor-only-001",
+            status=TaskStatus(task_id="vendor-only-001", state=TaskState.PENDING, total_questions=1),
+            questions=[{"serial_no": 1, "question": "Q1", "vendor_response": "Yes", "vendor_comment": "Looks compliant"}],
+        )
+        _mock_db_get.reset_mock()
+        _mock_db_get.return_value = record
+
+        mock_client = AsyncMock()
+        mock_client.ensure_chat = AsyncMock(return_value="chat-1")
+        mock_client.create_session = AsyncMock(return_value="sess-1")
+        mock_client.ask = AsyncMock(return_value={"answer": "Answer: Yes\nDetails: OK", "reference": {}})
+        mock_client.close = AsyncMock()
+        MockClient.return_value = mock_client
+        MockClient.parse_yes_no = _RealClient.parse_yes_no
+        MockClient.extract_references = _RealClient.extract_references
+        MockClient.get_cited_indices = _RealClient.get_cited_indices
+
+        _run(
+            run_assessment(
+                "vendor-only-001",
+                record.questions,
+                [],
+                process_vendor_response=True,
+            )
+        )
+
+        self.assertEqual(record.status.state, TaskState.COMPLETED)
+        self.assertEqual(record.status.metrics.dataset_setup.status, "skipped")
+        self.assertEqual(record.status.metrics.document_upload.status, "skipped")
+        self.assertEqual(record.status.metrics.document_parsing.status, "skipped")
+        self.assertEqual(mock_client.ensure_chat.await_args.args[1], [])
+
+    @patch.object(_services_mod, "RagflowClient")
+    def test_single_call_all_parse_failures_fall_back_to_vendor_only_mode(self, MockClient):
+        from assessment.ragflow_client import RagflowClient as _RealClient
+
+        record = TaskRecord(
+            task_id="vendor-only-002",
+            status=TaskStatus(task_id="vendor-only-002", state=TaskState.PENDING, total_questions=1),
+            questions=[{"serial_no": 1, "question": "Q1", "vendor_response": "Yes", "vendor_comment": "Looks compliant"}],
+        )
+        _mock_db_get.reset_mock()
+        _mock_db_get.return_value = record
+
+        mock_client = AsyncMock()
+        mock_client.ensure_dataset = AsyncMock(return_value="ds-1")
+        mock_client.upload_document = AsyncMock(return_value="doc-1")
+        mock_client.start_parsing = AsyncMock()
+        mock_client.wait_for_parsing = AsyncMock(
+            return_value=[
+                {
+                    "document_id": "doc-1",
+                    "document_name": "bad.pdf",
+                    "status": "failed",
+                    "progress": 0.0,
+                    "message": "parser failed",
+                }
+            ]
+        )
+        mock_client.ensure_chat = AsyncMock(return_value="chat-1")
+        mock_client.create_session = AsyncMock(return_value="sess-1")
+        mock_client.ask = AsyncMock(return_value={"answer": "Answer: Yes\nDetails: OK", "reference": {}})
+        mock_client.close = AsyncMock()
+        MockClient.return_value = mock_client
+        MockClient.parse_yes_no = _RealClient.parse_yes_no
+        MockClient.extract_references = _RealClient.extract_references
+        MockClient.get_cited_indices = _RealClient.get_cited_indices
+
+        _run(
+            run_assessment(
+                "vendor-only-002",
+                record.questions,
+                [("bad.pdf", b"pdf")],
+                process_vendor_response=True,
+            )
+        )
+
+        self.assertEqual(record.status.state, TaskState.COMPLETED)
+        self.assertEqual(mock_client.ensure_chat.await_args.args[1], [])
+
+    @patch.object(_services_mod, "RagflowClient")
+    def test_session_start_without_documents_uses_vendor_only_mode(self, MockClient):
+        from assessment.ragflow_client import RagflowClient as _RealClient
+
+        record = TaskRecord(
+            task_id="vendor-only-sess-001",
+            status=TaskStatus(task_id="vendor-only-sess-001", state=TaskState.AWAITING_DOCUMENTS, total_questions=1),
+            ragflow=RagflowContext(dataset_id="ds-1", dataset_ids=["ds-1"], document_ids=[]),
+            questions=[{"serial_no": 1, "question": "Q1", "vendor_response": "Yes", "vendor_comment": "Looks compliant"}],
+        )
+        _mock_db_get.reset_mock()
+        _mock_db_get.return_value = record
+
+        mock_client = AsyncMock()
+        mock_client.ensure_chat = AsyncMock(return_value="chat-1")
+        mock_client.create_session = AsyncMock(return_value="sess-1")
+        mock_client.ask = AsyncMock(return_value={"answer": "Answer: Yes\nDetails: OK", "reference": {}})
+        mock_client.close = AsyncMock()
+        MockClient.return_value = mock_client
+        MockClient.parse_yes_no = _RealClient.parse_yes_no
+        MockClient.extract_references = _RealClient.extract_references
+        MockClient.get_cited_indices = _RealClient.get_cited_indices
+
+        _run(run_assessment_for_session("vendor-only-sess-001", process_vendor_response=True))
+
+        self.assertEqual(record.status.state, TaskState.COMPLETED)
+        self.assertEqual(record.status.metrics.document_parsing.status, "skipped")
+        self.assertEqual(mock_client.ensure_chat.await_args.args[1], [])
 
 
 class TestOnlyCitedReferences(unittest.TestCase):

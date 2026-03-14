@@ -569,7 +569,7 @@ Content-Type: multipart/form-data
 
 **Form fields:**
 - `questions_file` (file, required) – Excel with columns A = `Question_Serial_No`, B = `Question`
-- `evidence_files` (file[], required) – One or more evidence documents
+- `evidence_files` (file[], usually required) – One or more evidence documents. Optional when `process_vendor_response=true`; in that mode the task can evaluate from question/vendor response/vendor comment alone.
 - `dataset_name` (string, optional) – Custom RAGFlow dataset name
 - `chat_name` (string, optional) – Custom chat assistant name
 - `question_id_column` (string, optional) – Column for Question Serial No (letter e.g. `C` or 1-based number e.g. `3`). Defaults to server setting.
@@ -577,6 +577,7 @@ Content-Type: multipart/form-data
 - `vendor_response_column` (string, optional) – Column for Vendor response (letter e.g. `E` or 1-based number e.g. `5`). Defaults to server setting.
 - `vendor_comment_column` (string, optional) – Column for Vendor comments (letter e.g. `F` or 1-based number e.g. `6`). Defaults to server setting.
 - `process_vendor_response` (boolean, optional) – If true, verify vendor response and comments in determining results. Defaults to server setting.
+- When `process_vendor_response=true`, the single-call flow can run with no uploaded evidence files. The app skips dataset/parsing and evaluates from the question row plus vendor response/comment only.
 - `only_cited_references` (boolean, optional) – If true (default), only include references actually cited as `[ID:N]` in the LLM answer. Set to false to return all retrieved chunks. Defaults to server setting.
 - `fail_on_document_parse_issue` (boolean, optional) – If true, stop the task before Q&A when any intended uploaded/reused evidence document is not successfully parsed. Default: `false`.
 
@@ -694,6 +695,7 @@ Content-Type: multipart/form-data
 - `process_vendor_response` (boolean, optional) – If true, verify vendor response and comments in determining results. Defaults to server setting.
 - `only_cited_references` (boolean, optional) – If true (default), only include references actually cited as `[ID:N]` in the LLM answer. Set to false to return all retrieved chunks. Defaults to server setting.
 - `fail_on_document_parse_issue` (boolean, optional) – If true, stop the task before Q&A when any intended uploaded session document is not successfully parsed. Default: `false`.
+- When `process_vendor_response=true`, Phase 3 can start even if no evidence documents were uploaded yet. The app will evaluate from the question row plus vendor response/comment only.
 
 **Response** (202 Accepted):
 ```json
@@ -783,6 +785,12 @@ Possible per-document statuses:
 > documents via the two-phase upload endpoint and re-start the assessment. The existing dataset and
 > previously uploaded documents are preserved. See [Error Handling & Retry](#error-handling--retry).
 
+The `metrics` object is included in both task status and task results responses. It exposes:
+- `total_duration_seconds` â€“ Sum of measured task step durations stored for the task.
+- Per-step blocks for `dataset_setup`, `document_upload`, `document_parsing`, `chat_setup`, `question_processing`, and `finalization`.
+- Per-step `attempts`, so retries are visible without inspecting task events.
+- Question-processing analytics in `metrics.questions`, including average / fastest / slowest question duration and throughput when measurable.
+
 #### Get Task Events (Audit Trail)
 
 Retrieve task lifecycle/audit events (newest first).
@@ -855,6 +863,74 @@ GET /api/v1/assessments/{task_id}/results?page=1&page_size=50
       "reason": "RAGFlow returned non-JSON response for POST /api/v1/chats/..."
     }
   ],
+  "metrics": {
+    "started_at": "2026-03-13T20:01:00Z",
+    "completed_at": "2026-03-13T20:06:12Z",
+    "total_duration_seconds": 182.504411,
+    "dataset_setup": {
+      "attempts": 1,
+      "status": "completed",
+      "started_at": "2026-03-13T20:01:00Z",
+      "completed_at": "2026-03-13T20:01:01Z",
+      "duration_seconds": 0.882114,
+      "total_duration_seconds": 0.882114,
+      "error": null
+    },
+    "document_upload": {
+      "attempts": 1,
+      "status": "completed",
+      "started_at": "2026-03-13T20:01:01Z",
+      "completed_at": "2026-03-13T20:01:08Z",
+      "duration_seconds": 7.228311,
+      "total_duration_seconds": 7.228311,
+      "error": null
+    },
+    "document_parsing": {
+      "attempts": 1,
+      "status": "completed",
+      "started_at": "2026-03-13T20:01:08Z",
+      "completed_at": "2026-03-13T20:03:10Z",
+      "duration_seconds": 122.111949,
+      "total_duration_seconds": 122.111949,
+      "error": null
+    },
+    "chat_setup": {
+      "attempts": 1,
+      "status": "completed",
+      "started_at": "2026-03-13T20:03:10Z",
+      "completed_at": "2026-03-13T20:03:12Z",
+      "duration_seconds": 1.920551,
+      "total_duration_seconds": 1.920551,
+      "error": null
+    },
+    "question_processing": {
+      "attempts": 1,
+      "status": "completed",
+      "started_at": "2026-03-13T20:03:12Z",
+      "completed_at": "2026-03-13T20:06:11Z",
+      "duration_seconds": 178.940122,
+      "total_duration_seconds": 178.940122,
+      "error": null
+    },
+    "finalization": {
+      "attempts": 1,
+      "status": "completed",
+      "started_at": "2026-03-13T20:06:11Z",
+      "completed_at": "2026-03-13T20:06:12Z",
+      "duration_seconds": 0.421364,
+      "total_duration_seconds": 0.421364,
+      "error": null
+    },
+    "questions": {
+      "question_count": 25,
+      "completed_count": 23,
+      "failed_count": 2,
+      "average_duration_seconds": 7.083224,
+      "fastest_duration_seconds": 2.102993,
+      "slowest_duration_seconds": 14.991223,
+      "throughput_qps": 0.139711
+    }
+  },
   "results": [
     {
       "question_serial_no": 1,
