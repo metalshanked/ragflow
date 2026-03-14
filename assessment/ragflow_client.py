@@ -26,6 +26,11 @@ class TransientRagflowError(RuntimeError):
     """Raised when a transient upstream/network failure is likely retryable."""
 
 
+def _exc_message(exc: Exception) -> str:
+    message = str(exc).strip()
+    return message or exc.__class__.__name__
+
+
 class RagflowClient:
     """Thin async wrapper around the RAGFlow REST API."""
 
@@ -141,10 +146,11 @@ class RagflowClient:
                         break
                     except httpx.ConnectError as exc:
                         is_last = attempt >= max_attempts
-                        set_span_attributes(span, {"error.type": "connect_error", "error.message": str(exc)})
+                        detail = _exc_message(exc)
+                        set_span_attributes(span, {"error.type": "connect_error", "error.message": detail})
                         if is_last:
                             raise TransientRagflowError(
-                                f"Cannot connect to RAGFlow at {self.base_url}: {exc}"
+                                f"Cannot connect to RAGFlow at {self.base_url}: {detail}"
                             ) from exc
                         logger.warning(
                             "Retrying RAGFlow request after connect error attempt=%s/%s method=%s path=%s",
@@ -157,10 +163,11 @@ class RagflowClient:
                         continue
                     except httpx.TimeoutException as exc:
                         is_last = attempt >= max_attempts
-                        set_span_attributes(span, {"error.type": "timeout", "error.message": str(exc)})
+                        detail = _exc_message(exc)
+                        set_span_attributes(span, {"error.type": "timeout", "error.message": detail})
                         if is_last:
                             raise TransientRagflowError(
-                                f"Request to RAGFlow timed out ({method_upper} {url}): {exc}"
+                                f"Request to RAGFlow timed out ({method_upper} {url}): {detail}"
                             ) from exc
                         logger.warning(
                             "Retrying RAGFlow request after timeout attempt=%s/%s method=%s path=%s",
@@ -168,6 +175,31 @@ class RagflowClient:
                             max_attempts,
                             method_upper,
                             path,
+                        )
+                        await asyncio.sleep(settings.ragflow_retry_backoff_seconds * attempt)
+                        continue
+                    except httpx.RequestError as exc:
+                        is_last = attempt >= max_attempts
+                        detail = _exc_message(exc)
+                        set_span_attributes(
+                            span,
+                            {
+                                "error.type": exc.__class__.__name__.lower(),
+                                "error.message": detail,
+                            },
+                        )
+                        if is_last:
+                            raise TransientRagflowError(
+                                f"RAGFlow request failed during transport ({method_upper} {url}): "
+                                f"{exc.__class__.__name__}: {detail}"
+                            ) from exc
+                        logger.warning(
+                            "Retrying RAGFlow request after transport error attempt=%s/%s method=%s path=%s error=%s",
+                            attempt,
+                            max_attempts,
+                            method_upper,
+                            path,
+                            exc.__class__.__name__,
                         )
                         await asyncio.sleep(settings.ragflow_retry_backoff_seconds * attempt)
                         continue

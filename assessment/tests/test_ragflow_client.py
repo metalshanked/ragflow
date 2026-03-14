@@ -51,7 +51,7 @@ if "httpx" not in sys.modules:
     sys.modules["httpx"] = _httpx
 
 with patch.dict("sys.modules", {"assessment.config": MagicMock(settings=_fake_settings)}):
-    from assessment.ragflow_client import RagflowClient
+    from assessment.ragflow_client import RagflowClient, TransientRagflowError
 
 
 def _run(coro):
@@ -206,6 +206,41 @@ class TestRagflowBugWorkarounds(unittest.TestCase):
 
         self.assertEqual(payload["data"]["id"], "ds-1")
         self.assertEqual(fake_http_client.request.await_count, 2)
+
+    def test_request_retries_read_error_as_transient_transport_error(self):
+        """Read-side transport failures should retry automatically."""
+        client = self._make_client()
+        request = httpx.Request("GET", "http://test:9380/api/v1/datasets")
+        response = httpx.Response(200, json={"code": 0, "data": {"id": "ds-1"}}, request=request)
+        fake_http_client = AsyncMock()
+        fake_http_client.request = AsyncMock(
+            side_effect=[
+                httpx.ReadError("", request=request),
+                response,
+            ]
+        )
+        client._get_client = AsyncMock(return_value=fake_http_client)
+
+        payload = _run(client._request("GET", "/api/v1/datasets"))
+
+        self.assertEqual(payload["data"]["id"], "ds-1")
+        self.assertEqual(fake_http_client.request.await_count, 2)
+
+    def test_request_surfaces_informative_read_error_message(self):
+        """Transport failures with empty detail should still expose the exception type."""
+        client = self._make_client()
+        request = httpx.Request("POST", "http://test:9380/api/v1/chats/chat-1/completions")
+        fake_http_client = AsyncMock()
+        fake_http_client.request = AsyncMock(
+            side_effect=httpx.ReadError("", request=request)
+        )
+        client._get_client = AsyncMock(return_value=fake_http_client)
+
+        with self.assertRaises(TransientRagflowError) as cm:
+            _run(client._request("POST", "/api/v1/chats/chat-1/completions"))
+
+        self.assertIn("transport", str(cm.exception).lower())
+        self.assertIn("ReadError", str(cm.exception))
 
 
 class TestWaitForParsing(unittest.TestCase):

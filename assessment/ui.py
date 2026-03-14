@@ -911,7 +911,11 @@ function onSessCreateFieldChange(){ btnReset('btn-sess-create'); }
 function onSessUploadFieldChange(){ btnReset('btn-sess-upload'); }
 function onSessStartFieldChange(){ btnReset('btn-sess-start'); updateSessionVendorModeUi(); }
 function onUploadFieldChange(){ btnReset('btn-upload'); }
-function onRetryFieldChange(){ btnReset('btn-retry-start'); }
+function onRetryFieldChange(){
+  btnReset('btn-retry-start');
+  btnReset('btn-retry-task');
+  btnReset('btn-retry-failed-questions');
+}
 
 /* ------------------------------------------------------------------ */
 /* Auto-refresh                                                        */
@@ -1413,6 +1417,20 @@ async function refreshDetail(){
       html+='<div id="retry-result" class="hidden" style="margin-top:.5rem"></div>';
       html+='</div>';
     }
+    if(s.state==='failed' || s.state==='completed'){
+      html+='<div style="margin-top:1rem;padding:1rem;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg)">';
+      html+='<h4 style="margin-bottom:.5rem">&#128260; Manual Retry</h4>';
+      html+='<p style="font-size:.88rem;color:var(--muted);margin-bottom:.5rem">Full retry reruns the stored task workflow. Failed-question retry reruns only the questions that previously failed.</p>';
+      html+='<label style="display:flex;align-items:center;gap:.5rem;margin:.5rem 0"><input type="checkbox" id="retry-v-process-manual" onchange="onRetryFieldChange()"/> Process vendor response &amp; comments</label>';
+      html+='<div class="btn-bar" style="display:flex;gap:.5rem;flex-wrap:wrap">';
+      html+='<button class="btn btn-primary btn-sm" id="btn-retry-task" onclick="retryTaskFull()">Retry Task</button>';
+      if((s.questions_failed||0)>0){
+        html+='<button class="btn btn-outline btn-sm" id="btn-retry-failed-questions" onclick="retryFailedQuestions()">Retry Failed Questions</button>';
+      }
+      html+='</div>';
+      html+='<div id="retry-api-result" class="hidden" style="margin-top:.5rem"></div>';
+      html+='</div>';
+    }
     document.getElementById('detail-body').innerHTML=html;
     await loadResults();
   }catch(e){document.getElementById('detail-body').innerHTML='<p style="color:var(--danger)">'+escHtml(e.message)+'</p>';}
@@ -1757,6 +1775,24 @@ async function retryStartAssessment(){
   fd.append('process_vendor_response',document.getElementById('retry-v-process').checked?'true':'false');
   const ok=await postForm(API+'/assessments/sessions/'+_detailTaskId+'/start',fd,'retry-result','btn-retry-start');
   if(ok){btnDone('btn-retry-start');toast('Assessment re-started!','ok');await refreshDetail();}else{btnError('btn-retry-start');}
+}
+async function retryTaskFull(){
+  if(!_detailTaskId)return;
+  btnLoading('btn-retry-task','Retrying\u2026');
+  const fd=new FormData();
+  const processEl=document.getElementById('retry-v-process-manual');
+  if(processEl)fd.append('process_vendor_response',processEl.checked?'true':'false');
+  const ok=await postForm(API+'/assessments/'+_detailTaskId+'/retry',fd,'retry-api-result','btn-retry-task');
+  if(ok){btnDone('btn-retry-task');toast('Task retry queued','ok');await refreshDetail();}else{btnError('btn-retry-task');}
+}
+async function retryFailedQuestions(){
+  if(!_detailTaskId)return;
+  btnLoading('btn-retry-failed-questions','Retrying\u2026');
+  const fd=new FormData();
+  const processEl=document.getElementById('retry-v-process-manual');
+  if(processEl)fd.append('process_vendor_response',processEl.checked?'true':'false');
+  const ok=await postForm(API+'/assessments/'+_detailTaskId+'/retry-failed-questions',fd,'retry-api-result','btn-retry-failed-questions');
+  if(ok){btnDone('btn-retry-failed-questions');toast('Failed-question retry queued','ok');await refreshDetail();}else{btnError('btn-retry-failed-questions');}
 }
 function escHtml(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML;}
 function escAttr(s){return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}

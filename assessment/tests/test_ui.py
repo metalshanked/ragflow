@@ -48,6 +48,10 @@ def test_ui_page_includes_icon_links_and_header_logo():
     assert "async function deleteTask(taskId)" in response.text
     assert "async function _fetchProtectedResource" in response.text
     assert "function _supportsServerRenderedDocument" in response.text
+    assert "async function retryTaskFull()" in response.text
+    assert "async function retryFailedQuestions()" in response.text
+    assert 'id="retry-api-result"' in response.text
+    assert "retry-failed-questions" in response.text
     assert 'Download</a></div>' in response.text
     assert "renderedDocumentUrl: links.rendered_document_url || null" in response.text
     assert "function _documentDownloadHref" in response.text
